@@ -224,93 +224,6 @@ _DIRECTION_MAP = {
 }
 
 
-def _build_playbook(outlook: str, context: dict, regime_label: str | None) -> dict:
-    """Deterministic instrument playbook recommendation.
-
-    Returns a primary recommendation plus alternatives with concise reasons.
-    """
-    iv_rank = context.get("iv_rank")
-    atr_pct = context.get("atr_pct")
-    days_to_earnings = context.get("days_to_earnings")
-    change_pct = context.get("change_pct")
-
-    primary = {
-        "instrument": "plan_order (stock entry)",
-        "why": "Default path for liquid names with no special options edge.",
-    }
-    alternatives: list[dict[str, str]] = []
-    cautions: list[str] = []
-
-    if days_to_earnings is not None and days_to_earnings <= 7:
-        primary = {
-            "instrument": "defined-risk options (debit spread / long option)",
-            "why": f"Earnings in {days_to_earnings}d increases gap risk; cap downside.",
-        }
-        cautions.append("Avoid open-ended risk structures into earnings events.")
-
-    if iv_rank is not None and iv_rank >= 50:
-        if outlook in ("neutral", "mildly_bullish", ""):
-            primary = {
-                "instrument": "premium-selling structures (iron_condor / covered_call / CSP)",
-                "why": f"IV rank {iv_rank:.1f} suggests rich premium; selling volatility may have better expectancy.",
-            }
-        else:
-            alternatives.append({
-                "instrument": "credit/defined-risk spreads",
-                "why": f"IV rank {iv_rank:.1f} is elevated; consider selling premium with risk caps.",
-            })
-
-    if iv_rank is not None and iv_rank <= 20:
-        if outlook in ("bullish", "bearish", "volatile"):
-            primary = {
-                "instrument": "premium-buying structures (long options / debit spreads)",
-                "why": f"IV rank {iv_rank:.1f} implies cheaper premium for directional/volatility bets.",
-            }
-        else:
-            alternatives.append({
-                "instrument": "long optionality",
-                "why": f"Low IV rank {iv_rank:.1f} makes optionality relatively cheap.",
-            })
-
-    if atr_pct is not None and atr_pct >= 3:
-        alternatives.append({
-            "instrument": "defined-risk spreads",
-            "why": f"ATR {atr_pct:.1f}% indicates higher realized volatility; cap risk and widen assumptions.",
-        })
-        cautions.append("Use wider stop/trail assumptions for stock entries.")
-
-    if regime_label in ("LIQUIDATION", "CREDIT STRESS", "RISK-OFF", "SELLING", "DOLLAR SQUEEZE"):
-        alternatives.append({
-            "instrument": "protective puts or bear put spreads",
-            "why": f"Regime {regime_label} favors hedging longs with puts or defined-risk bearish spreads (no short stock in cash account).",
-        })
-        if outlook in ("bearish",):
-            primary = {
-                "instrument": "long put or bear put spread",
-                "why": f"Cash-only account in {regime_label} regime — use long puts or bear put spreads for bearish conviction.",
-            }
-    elif regime_label in ("RISK-ON",):
-        alternatives.append({
-            "instrument": "bullish momentum structures",
-            "why": "Risk-on regime supports long-beta and momentum continuation setups.",
-        })
-
-    if change_pct is not None and abs(change_pct) > 8:
-        cautions.append("Large intraday move; avoid chasing with market orders.")
-
-    if not alternatives:
-        alternatives.append({
-            "instrument": "enter_option(long_call/long_put)",
-            "why": "Use when you want convexity with predefined max loss.",
-        })
-
-    return {
-        "primary": primary,
-        "alternatives": alternatives[:3],
-        "cautions": cautions,
-    }
-
-
 async def handle_instrument_selector(executor, params: dict) -> Any:
     """Return all available instruments, optionally filtered by outlook.
     
@@ -447,8 +360,6 @@ async def handle_instrument_selector(executor, params: dict) -> Any:
             "Stock entries must be BUY side only."
         )
 
-    result["playbook"] = _build_playbook(outlook, context, regime_label)
-    
     result["note"] = "Use plan_order for stock entries (auto-selects order type + stop). Use enter_option for options (auto-selects contract). Use direct tools (vertical_spread, etc.) when you want explicit control."
     
     return result

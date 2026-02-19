@@ -35,9 +35,6 @@ plan_order: {symbol, side, quantity, urgency?='normal', intent?='entry', execute
 === OPTION ENTRY GATEWAY ===
 enter_option: {symbol, strategy, quantity?=1, dte_target?=30, delta_target?=auto, max_spread_pct?=15, execute?=false} -> contract selection + execution
 
-=== SESSION PREPARATION ===
-prepare_session: {screens?=['momentum','gainers','volume_surge'], symbol_count?|top_n?=3, scan_limit?|limit?=15, iv_dte_min?, iv_dte_max?, iv_strike_pct?} -> session briefing with ranked candidates (pass iv_dte_min/iv_dte_max to get IV enrichment)
-
 === ACCOUNT STATE ===
 positions: {} -> all positions with qty, avg_cost, unrealized_pnl
 account: {} -> net_liq, available_funds, cash, pnl (CASH-ONLY, no margin)
@@ -353,86 +350,6 @@ class ToolExecutor:
                          f"This is a CASH-ONLY account - no margin."
             }
         return None
-
-    def _enrich_symbol(self, symbol: str, price: float = 0,
-                       iv_dte_min: int = None, iv_dte_max: int = None,
-                       iv_strike_pct: float = None) -> dict:
-        """Enrich a screen result with ATR, IV, earnings, short interest.
-        
-        IV params are passed through from the agent via prepare_session.
-        If not provided, IV enrichment is skipped.
-        Uses ThreadPoolExecutor to fetch all data concurrently.
-        """
-        from concurrent.futures import ThreadPoolExecutor, as_completed
-
-        extra = {}
-
-        def _fetch_atr():
-            try:
-                atr = self.data_provider.get_atr(symbol)
-                if atr:
-                    result = {"atr": round(atr.value, 2)}
-                    if price and price > 0:
-                        result["atr_pct"] = round(atr.value / price * 100, 2)
-                    return result
-            except Exception:
-                pass
-            return {}
-
-        def _fetch_earnings():
-            try:
-                earnings = self.data_provider.get_earnings_info(symbol)
-                if earnings and earnings.days_until_earnings is not None:
-                    return {"days_to_earnings": earnings.days_until_earnings}
-            except Exception:
-                pass
-            return {}
-
-        def _fetch_iv():
-            if iv_dte_min is None or iv_dte_max is None:
-                return {}
-            try:
-                iv = self.data_provider.get_iv_info(
-                    symbol, dte_min=iv_dte_min, dte_max=iv_dte_max,
-                    strike_pct=iv_strike_pct
-                )
-                if iv and iv.iv_current:
-                    result = {"iv": round(iv.iv_current, 1)}
-                    if iv.iv_rank is not None:
-                        result["iv_rank"] = round(iv.iv_rank, 1)
-                    return result
-            except Exception:
-                pass
-            return {}
-
-        def _fetch_fundamentals():
-            try:
-                ext = self.data_provider.get_extended_fundamentals(symbol)
-                if ext:
-                    result = {}
-                    if ext.short_percent_float is not None:
-                        result["short_float_pct"] = round(ext.short_percent_float * 100, 2)
-                    if ext.beta is not None:
-                        result["beta"] = round(ext.beta, 2)
-                    return result
-            except Exception:
-                pass
-            return {}
-
-        with ThreadPoolExecutor(max_workers=4) as pool:
-            futures = [
-                pool.submit(_fetch_atr),
-                pool.submit(_fetch_earnings),
-                pool.submit(_fetch_iv),
-                pool.submit(_fetch_fundamentals),
-            ]
-            for fut in as_completed(futures):
-                try:
-                    extra.update(fut.result())
-                except Exception:
-                    pass
-
-        return extra
 
     def _plan_order(
         self,
@@ -1385,43 +1302,6 @@ class ToolExecutor:
             return pending
         except Exception:
             return []
-
-    def _prepare_session(self, screens: list = None, top_n: int = 3, limit: int = 15,
-                         iv_dte_min: int = None, iv_dte_max: int = None,
-                         iv_strike_pct: float = None) -> dict:
-        """
-        One-call session preparation: market hours, account status,
-        run screens, deduplicate, deep-dive top candidates.
-        Advisory only — no trade execution.
-
-        IV enrichment only runs if agent passes iv_dte_min + iv_dte_max.
-        """
-        session_info = self.market_hours_provider.get_session_info()
-        session = session_info.get("session", "unknown")
-        time_et = session_info.get("current_time_et", "")
-        next_trans = session_info.get("next_transition", "")
-
-        # Query broker directly for positions and account values
-        portfolio_items = self.gateway.get_cached_portfolio() if self.gateway else []
-        positions_data = [item for item in portfolio_items if item.position != 0]
-
-        total_unrealized = sum(item.unrealizedPNL for item in positions_data)
-
-        cash = self.gateway.cash_value if self.gateway else 0
-        net_liq = self.gateway.net_liquidation if self.gateway else 0
-        cash_pct = round(cash / net_liq * 100, 1) if net_liq > 0 else 0
-
-        if screens is None:
-            screens = ["momentum", "gainers", "volume_surge"]  # fallback; handler picks regime-aware defaults
-
-        # Screener library removed in minimal build — Grok uses tools_research directly
-        # Returning empty to let the agent use quote/candles/fundamentals instead
-        return {
-            "session": "regular",
-            "account": {"cash": cash, "net_liq": net_liq, "cash_pct": cash_pct},
-            "recommendation": "Use quote, candles, fundamentals, and screen tools to find setups.",
-            "candidates": [],
-        }
 
     def _order_fingerprint(self, action: str, params: dict) -> str:
         """Build a dedup fingerprint for an order action."""

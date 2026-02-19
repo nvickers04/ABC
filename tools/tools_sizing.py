@@ -6,44 +6,6 @@ from typing import Any
 logger = logging.getLogger(__name__)
 
 
-def _build_portfolio_context(state, net_liq: float) -> dict:
-    """Build objective portfolio-level facts for the agent (no recommendations)."""
-    positions = list(state._positions.values())
-    if not positions:
-        return {"total_positions": 0}
-
-    import statistics
-    hold_hours = [p.hold_time_hours for p in positions if p.hold_time_hours is not None]
-    pnl_hrs = [p.pnl_per_hour for p in positions if p.pnl_per_hour is not None]
-    eff_list = [p.efficiency for p in positions if p.efficiency is not None]
-
-    context = {
-        "total_positions": len(positions),
-    }
-
-    if hold_hours:
-        median_hrs = statistics.median(hold_hours)
-        context["median_hold_hours"] = round(median_hrs, 1)
-
-        # Capital in longest 25%
-        positions_sorted = sorted(positions, key=lambda p: p.hold_time_hours or 0, reverse=True)
-        num_longest = max(1, int(len(positions) * 0.25))
-        longest_25pct = positions_sorted[:num_longest]
-        long_cap = sum(abs(p.market_value) for p in longest_25pct)
-        long_pct = round(long_cap / net_liq * 100, 1) if net_liq > 0 else 0
-        context["capital_longest_25pct"] = round(long_cap, 2)
-        context["capital_longest_25pct_pct_nl"] = long_pct
-
-    if pnl_hrs:
-        median_pnl_hr = statistics.median(pnl_hrs)
-        context["median_pnl_per_hour"] = round(median_pnl_hr, 2)
-
-    if eff_list:
-        context["median_efficiency_pct_hr"] = round(statistics.median(eff_list), 2)
-
-    return context
-
-
 async def handle_calculate_size(executor, params: dict) -> Any:
     """
     Calculate optimal position size based on account risk, concentration limits,
@@ -135,13 +97,12 @@ async def handle_calculate_size(executor, params: dict) -> Any:
     entry_price = ask if side == 'BUY' else bid
     concentration_shares = int(max_position_dollars / entry_price) if entry_price > 0 else 0
 
-    # Check existing position in same symbol
+    # Check existing position in same symbol via gateway
     existing_value = 0.0
-    with state._lock:
-        for key, pos in state._positions.items():
-            underlying = state._underlying_from_key(key)
-            if underlying == symbol:
-                existing_value += abs(pos.market_value)
+    portfolio = executor.gateway.get_cached_portfolio() if executor.gateway else []
+    for item in portfolio:
+        if item.contract.symbol.upper() == symbol and item.position != 0:
+            existing_value += abs(item.marketValue)
     remaining_capacity = max(0, max_position_dollars - existing_value)
     concentration_shares_adj = int(remaining_capacity / entry_price) if entry_price > 0 else 0
 
@@ -158,17 +119,8 @@ async def handle_calculate_size(executor, params: dict) -> Any:
         )
 
     # --- 3. Cash constraint (CASH-ONLY account — applies to BUY) ---
-    # Use available_funds (AvailableFunds) — NOT buying_power (includes margin)
-    available_funds = state._available_funds
-    if state._broker:
-        try:
-            if hasattr(state._broker, 'available_funds') and state._broker.available_funds > 0:
-                available_funds = state._broker.available_funds
-        except Exception:
-            pass
-    # Fallback to cash if available_funds not yet populated
-    if available_funds <= 0:
-        available_funds = cash
+    # Use available cash from gateway
+    available_funds = cash
 
     if side == 'BUY':
         # Reserve 5% cash buffer — CASH ONLY, no margin
@@ -255,7 +207,6 @@ async def handle_calculate_size(executor, params: dict) -> Any:
             "cash": round(cash, 2),
             "existing_exposure_in_symbol": round(existing_value, 2),
         },
-        "portfolio_context": _build_portfolio_context(state, net_liq),
     }
 
 

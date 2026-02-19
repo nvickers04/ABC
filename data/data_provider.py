@@ -121,32 +121,6 @@ class EarningsInfo:
     source: str
 
 
-@dataclass
-class MarketMover:
-    """A stock in a market movers list (gainers/losers/actives)."""
-    symbol: str
-    name: str
-    price: float
-    change: float
-    change_pct: float
-    volume: Optional[int] = None
-    source: str = 'unknown'
-
-
-@dataclass
-class ScreenerResult:
-    """Result from stock screener."""
-    symbol: str
-    name: str
-    price: float
-    market_cap: Optional[float] = None
-    sector: Optional[str] = None
-    industry: Optional[str] = None
-    volume: Optional[int] = None
-    change_pct: Optional[float] = None
-    beta: Optional[float] = None
-    source: str = 'unknown'
-
 
 @dataclass
 class OptionContract:
@@ -494,27 +468,6 @@ class DataProvider:
     def _set_cached(self, key: str, value: Any):
         """Set cached value with timestamp."""
         self._cache[key] = (value, datetime.now())
-
-    def _log_fetch(
-        self,
-        symbol: str,
-        data_type: str,
-        source: str,
-        latency_ms: float,
-        cache_hit: bool = False,
-        success: bool = True,
-        error: str = None
-    ):
-        """Log a data fetch for observability."""
-        pass  # Structured logging removed
-
-    def _log_fallback(self, symbol: str, data_type: str, primary: str, fallback: str, reason: str):
-        """Log a fallback event."""
-        pass  # Structured logging removed
-
-    def _log_screening(self, screen_type: str, source: str, count: int, latency_ms: float):
-        """Log a screening operation."""
-        pass  # Structured logging removed
 
     # ==================== QUOTES ====================
 
@@ -1387,100 +1340,6 @@ class DataProvider:
     # All screening is handled by src.layer2_data.screener_library
     # which provides:
     # - Finviz as primary source
-    # =========================================================================
-    # TECHNICAL SCREENING (built-in, no external screener dependency)
-    # =========================================================================
-
-    def screen_technical(
-        self,
-        symbols: List[str],
-        top_n: int = 30
-    ) -> List[Dict[str, Any]]:
-        """
-        Screen symbols by technical opportunity score.
-
-        Performs bulk download and scores symbols by momentum, volume, volatility,
-        and proximity to 52-week highs.
-
-        Args:
-            symbols: List of symbols to screen (can be 1000s)
-            top_n: Number of top candidates to return
-
-        Returns:
-            List of dicts with symbol and score, sorted by score descending
-        """
-        import time
-        import yfinance as yf
-        import numpy as np
-
-        start = time.time()
-        logger.info(f"Technical screening {len(symbols)} symbols...")
-
-        try:
-            # Batch download data (yfinance is efficient with multiple symbols)
-            data = yf.download(
-                symbols, period='3mo', interval='1d', group_by='ticker',
-                progress=False, threads=True, auto_adjust=True
-            )
-
-            scored = []
-            for symbol in symbols:
-                try:
-                    if len(symbols) == 1:
-                        df = data
-                    else:
-                        df = data[symbol] if symbol in data.columns.get_level_values(0) else None
-
-                    if df is None or len(df) < 50:
-                        continue
-
-                    close = df['Close'].values
-                    volume = df['Volume'].values
-
-                    # Momentum (20-day return)
-                    momentum = (close[-1] / close[-20] - 1) * 100 if len(close) >= 20 else 0
-
-                    # Volume spike (vs 20-day avg)
-                    vol_spike = volume[-1] / np.mean(volume[-20:]) if len(volume) >= 20 else 1
-
-                    # Volatility (20-day std) - with zero protection
-                    volatility = 0
-                    if len(close) >= 21:
-                        prev_close = close[-21:-1]
-                        if len(prev_close) > 0 and np.all(prev_close != 0):
-                            volatility = np.std(close[-20:] / prev_close - 1)
-
-                    # Breakout (near 52-week high)
-                    high_52w = np.max(close[-252:]) if len(close) >= 252 else np.max(close)
-                    breakout_pct = (close[-1] / high_52w) * 100
-
-                    # Composite score: momentum + volume + breakout - volatility penalty
-                    score = (
-                        abs(momentum) * 2 +           # Favor strong trends
-                        min(vol_spike - 1, 2) * 10 +  # Favor volume spikes
-                        (breakout_pct - 95) * 2 -     # Favor near highs
-                        volatility * 50                # Penalize high volatility
-                    )
-
-                    scored.append({'symbol': symbol, 'score': float(score)})
-
-                except Exception as e:
-                    logger.debug(f"Scan failed for {symbol}: {e}")
-                    continue
-
-            # Sort by score descending
-            scored.sort(key=lambda x: x['score'], reverse=True)
-
-            latency = (time.time() - start) * 1000
-            self._log_screening('technical', 'yfinance', len(scored), latency)
-            logger.info(f"Technical screen complete: {len(scored)} scoreable, returning top {min(top_n, len(scored))}")
-
-            return scored[:top_n]
-
-        except Exception as e:
-            logger.warning(f"Technical screening failed: {e}")
-            return []
-
 
 # ============================================================
 # SINGLETON ACCESS

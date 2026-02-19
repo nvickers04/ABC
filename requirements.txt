@@ -1,0 +1,29 @@
+# ABC Minimal Grok 4.2 Trader — Requirements
+# pip install -r requirements.txt
+
+# LLM (Grok via xAI OpenAI-compatible API)
+openai>=1.0.0,<2.0
+
+# Interactive Brokers
+ib-insync>=0.9.86,<1.0
+
+# Data & Config
+numpy>=2.1.1,<3.0
+pandas>=2.2.3,<3.0
+pyyaml>=6.0.2,<7.0
+python-dotenv>=1.0.0,<2.0
+
+# HTTP (market data client)
+httpx>=0.27.0,<1.0
+aiohttp>=3.9.0,<4.0
+
+# Async helpers
+nest-asyncio>=1.6.0,<2.0
+
+# Trading calendar
+exchange-calendars>=4.5,<5.0
+
+# Market data (research tools)
+yfinance>=0.2.44,<1.0
+newsapi-python>=0.2.7,<1.0
+fredapi>=0.5.2,<1.0

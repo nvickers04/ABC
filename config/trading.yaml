@@ -1,0 +1,131 @@
+# Trading System Configuration
+# Loaded by agent and infrastructure components
+
+# === Agent Settings ===
+agent:
+  # LLM temperature settings (0.0 = deterministic, 1.0 = creative)
+  temperature:
+    default: 0.7        # General reasoning
+    trading: 0.3         # Order placement decisions (lower = more conservative)
+    research: 0.7        # Market research and analysis
+
+  # Circuit breaker - pauses agent on repeated failures
+  circuit_breaker:
+    max_consecutive_failures: 5    # Consecutive tool errors before pause
+    max_failures_per_cycle: 8      # Total errors in one cycle before pause
+    recovery_seconds: 60           # How long to pause after circuit breaker trips
+
+  # Session continuity
+  # memory_lines removed — agent now queries trades on-demand via review_trades tool
+  # Legacy agent_memory.txt still written for human readability
+
+# === Market Hours (US Eastern Time) ===
+market_hours:
+  exchange: NYSE
+  premarket_start: "04:00"
+  regular_open: "09:30"
+  regular_close: "16:00"
+  postmarket_end: "20:00"
+
+# === Risk Limits ===
+risk_limits:
+  max_daily_loss_pct: 15.0         # Flatten all positions + halt if daily loss >= 15%
+  max_daily_llm_cost_usd: 50.0    # Halt if LLM spend exceeds $50/day
+  max_turns_per_cycle: 30          # Force cycle end after 30 turns
+  max_unique_symbols: 15           # Max unique ticker symbols across all positions
+  cash_only: true                  # STRICT: No short selling, no margin. BUY-only entries.
+
+# === Exit Manager (server-side position protection) ===
+# Rules engine that runs every cycle. No LLM in the loop.
+exit_manager:
+  enabled: true
+  hard_stop_pct: 8.0               # Force-close any position losing > 8%
+  orphan_stop_timeout_sec: 180     # Auto-place stop if position unprotected > 3 min
+  emergency_stop_pct: 5.0          # Distance for auto-placed emergency stops
+  breakeven_trigger_pct: 6.0       # Move stop to breakeven when profit hits this (wide enough to survive normal ATR noise)
+  profit_lock_ladder:               # At each trigger, lock gains at lock level
+    - { trigger: 10.0, lock: 5.0 }
+    - { trigger: 15.0, lock: 10.0 }
+    - { trigger: 20.0, lock: 15.0 }
+  skip_long_options: true           # Long options = defined risk, LLM manages exits
+
+# === Broker Gateway ===
+# Adapter selection + capability flags.
+# Safety invariant: if you can open a position, you must be able to close it.
+# Capabilities are validated ONCE at startup — not every order.
+broker:
+  adapter: ibkr                    # Which gateway adapter to load
+
+  capabilities:
+    # --- Equity: opening new positions ---
+    opening_equity:
+      market_order: false
+      limit_order: false
+      adaptive_algo: true
+      midprice_peg: true
+      relative_peg: true
+      vwap_algo: true
+      twap_algo: true
+      iceberg: true
+      snap_mid: true
+      moo: true
+      loo: true
+      fok: true
+      ioc: true
+      bracket_order: true
+
+    # --- Equity: closing / exiting positions ---
+    closing_equity:
+      market_order: true
+      limit_order: true
+      moc: true
+      loc: true
+      adaptive_algo: true
+      flatten_all: true
+      flatten_limits: true
+
+    # --- Protective orders (stops, trailing, OCA) ---
+    protective:
+      stop_order: true
+      stop_limit: true
+      trailing_stop: true
+      trailing_stop_limit: true
+      oca_pair: true
+      gtd_order: true
+
+    # --- Options: opening strategies ---
+    opening_options:
+      single_leg: true
+      vertical_spread: true
+      iron_condor: true
+      iron_butterfly: true
+      straddle: true
+      strangle: true
+      butterfly: true
+      calendar_spread: true
+      diagonal_spread: true
+      covered_call: true
+      cash_secured_put: true
+      protective_put: true
+      collar: true
+      ratio_spread: true
+      jade_lizard: true
+
+    # --- Options: closing positions ---
+    closing_options:
+      close_option: true
+
+    # --- Options: management (rolling, adjusting) ---
+    management_options:
+      roll_option: true
+
+    # --- Query capabilities ---
+    query:
+      positions: true
+      account_summary: true
+      open_orders: true
+      executions: true
+      realtime_data: true
+      option_chain: true
+      option_greeks: true
+      position_greeks: true

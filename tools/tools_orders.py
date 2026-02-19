@@ -35,7 +35,7 @@ async def _run_order(
         check_side:     Check PDT/cash on BUY side (False for direction-based)
         estimate_cash:  Callable returning estimated cost (float) or None
         extra_validate: Callable returning error dict or None
-        refresh:        Refresh LiveState after order
+        refresh:        Refresh state after order
     """
     if not executor.gateway:
         return {"error": "broker not connected"}

@@ -193,10 +193,9 @@ class ToolExecutor:
         "strangle":         (0.25, 21, 45),
     }
 
-    def __init__(self, gateway, data_provider, live_state=None, market_hours_provider=None):
+    def __init__(self, gateway, data_provider, market_hours_provider=None):
         self.gateway = gateway
         self.data_provider = data_provider
-        self.live_state = live_state
         self.market_hours_provider = market_hours_provider
         self._protective_order_actions = {"stop_order", "stop_limit", "trailing_stop", "trailing_stop_limit"}
         self._deferred_stops = []
@@ -207,10 +206,6 @@ class ToolExecutor:
         # Load cash_only flag from env
         self.cash_only = os.environ.get("CASH_ONLY", "true").lower() == "true"
 
-        if self.live_state is None:
-            from data.live_state import get_live_state
-            self.live_state = get_live_state()
-
         if self.market_hours_provider is None:
             from data.market_hours import get_market_hours_provider
             self.market_hours_provider = get_market_hours_provider()
@@ -218,9 +213,9 @@ class ToolExecutor:
         # Deferred stops removed in minimal build
 
     async def _refresh_state(self):
-        """Refresh LiveState after order placement to prevent stale reads."""
+        """Refresh positions/account from broker after order placement."""
         try:
-            await self.live_state.refresh_after_order()
+            await self.gateway.refresh_positions()
         except Exception as e:
             logger.debug(f"State refresh failed: {e}")
 
@@ -231,17 +226,20 @@ class ToolExecutor:
         ``None`` the full position size is used.  Returns a result dict.
         """
         symbol = symbol.upper()
-        pos = self.live_state._positions.get(symbol)
+        pos = await self.gateway.get_position(symbol)
         if pos is None:
             return {"error": f"No open position for {symbol}"}
 
-        qty = quantity if quantity is not None else abs(int(pos.quantity))
+        pos_qty = pos.get("quantity", 0)
+        qty = quantity if quantity is not None else abs(int(pos_qty))
         if qty <= 0:
             return {"error": f"Invalid quantity {qty} for {symbol}"}
 
+        is_long = pos_qty > 0
+        is_option = pos.get("sec_type") == "OPT"
+
         # 1. Cancel protective stops for this symbol
         try:
-            # Use underlying for stop cancellation (options key may differ)
             underlying = symbol.split("_")[0]
             await self.gateway.cancel_stops(underlying)
         except Exception as e:
@@ -249,8 +247,7 @@ class ToolExecutor:
 
         # 2. Place closing order
         try:
-            if pos.is_option:
-                # Use the gateway's close_option_position (handles contract lookup)
+            if is_option:
                 parts = symbol.split("_")  # SYMBOL_RIGHT_STRIKE_EXPIRY
                 close_params: dict = {"symbol": parts[0]}
                 if len(parts) >= 4:
@@ -261,7 +258,7 @@ class ToolExecutor:
                 close_params["reason"] = reason or "close_position"
                 result = await self.gateway.close_option_position(**close_params)
             else:
-                side = "SELL" if pos.is_long else "BUY"
+                side = "SELL" if is_long else "BUY"
                 result = await self.gateway.place_market_order(symbol, side, qty)
         except Exception as e:
             logger.error(f"_close_position: close order failed for {symbol}: {e}")
@@ -274,7 +271,7 @@ class ToolExecutor:
             "success": True,
             "symbol": symbol,
             "quantity": qty,
-            "side": "SELL" if pos.is_long else "BUY",
+            "side": "SELL" if is_long else "BUY",
             "reason": reason,
             "result": result,
         }
@@ -308,11 +305,12 @@ class ToolExecutor:
         if side.upper() != "SELL":
             return None  # BUY always OK in cash-only
         # SELL is only allowed if we hold a long position in this symbol.
-        # This prevents naked shorts regardless of what intent label the
-        # agent passes ("entry", "rotation", "trim", etc.).
-        pos = self.live_state._positions.get(symbol.upper()) if symbol else None
-        if pos and pos.is_long:
-            return None  # selling shares we own — allowed
+        # Check cached portfolio synchronously to avoid async in this guard.
+        portfolio = self.gateway.get_cached_portfolio() if self.gateway else []
+        for item in portfolio:
+            if (item.contract.symbol.upper() == (symbol or "").upper()
+                    and item.position > 0):
+                return None  # selling shares we own — allowed
         return {
             "error": f"CASH-ONLY BLOCKED: Cannot SELL {symbol} — no long position held. "
                      f"Cash accounts cannot open short stock positions. "
@@ -1365,16 +1363,28 @@ class ToolExecutor:
         Helps prevent the agent from re-ordering symbols it already has
         pending orders for.
         """
-        orphans = self.live_state.get_orphan_orders()
-        entry_types = {'LMT', 'MKT', 'MIDPRICE', 'REL', 'MOC', 'MOO', 'LOC', 'LOO'}
-        pending = [o for o in orphans
-                   if o.order_type in entry_types or o.sec_type in ('OPT', 'BAG')]
-        return [
-            {"symbol": o.symbol, "order_id": o.order_id,
-             "action": o.action, "quantity": int(o.quantity),
-             "order_type": o.order_type, "limit_price": o.limit_price}
-            for o in pending
-        ]
+        # Get open orders that don't correspond to any position (orphan entries)
+        try:
+            orders = self.gateway.get_cached_trades() if self.gateway else []
+            positions = self.gateway.get_cached_portfolio() if self.gateway else []
+            pos_symbols = {item.contract.symbol.upper() for item in positions if item.position != 0}
+            entry_types = {'LMT', 'MKT', 'MIDPRICE', 'REL', 'MOC', 'MOO', 'LOC', 'LOO'}
+            pending = []
+            for t in orders:
+                sym = t.contract.symbol.upper()
+                otype = t.order.orderType
+                if sym not in pos_symbols and otype in entry_types:
+                    pending.append({
+                        "symbol": sym,
+                        "order_id": t.order.orderId,
+                        "action": t.order.action,
+                        "quantity": int(t.order.totalQuantity),
+                        "order_type": otype,
+                        "limit_price": t.order.lmtPrice if t.order.lmtPrice < 1e300 else None,
+                    })
+            return pending
+        except Exception:
+            return []
 
     def _prepare_session(self, screens: list = None, top_n: int = 3, limit: int = 15,
                          iv_dte_min: int = None, iv_dte_max: int = None,
@@ -1391,30 +1401,14 @@ class ToolExecutor:
         time_et = session_info.get("current_time_et", "")
         next_trans = session_info.get("next_transition", "")
 
-        state = self.live_state
-        with state._lock:
-            positions = list(state._positions.values())
-            orders = list(state._orders.values())
+        # Query broker directly for positions and account values
+        portfolio_items = self.gateway.get_cached_portfolio() if self.gateway else []
+        positions_data = [item for item in portfolio_items if item.position != 0]
 
-        total_unrealized = sum(p.unrealized_pnl for p in positions)
-        unprotected = 0
-        for p in positions:
-            pos_orders = state.get_orders_for(p.symbol)
-            if p.is_long and not any(o.action == "SELL" for o in pos_orders):
-                unprotected += 1
-            elif p.is_short and not any(o.action == "BUY" for o in pos_orders):
-                unprotected += 1
+        total_unrealized = sum(item.unrealizedPNL for item in positions_data)
 
-        cash = state._cash
-        net_liq = state._net_liq
-        if self.gateway:
-            try:
-                if hasattr(self.gateway, 'cash_value') and self.gateway.cash_value > 0:
-                    cash = self.gateway.cash_value
-                if hasattr(self.gateway, 'net_liquidation') and self.gateway.net_liquidation > 0:
-                    net_liq = self.gateway.net_liquidation
-            except Exception:
-                pass
+        cash = self.gateway.cash_value if self.gateway else 0
+        net_liq = self.gateway.net_liquidation if self.gateway else 0
         cash_pct = round(cash / net_liq * 100, 1) if net_liq > 0 else 0
 
         if screens is None:
@@ -1576,10 +1570,16 @@ class ToolExecutor:
             # Auto-detect intent: if selling a LONG or buying a SHORT, it's an exit
             intent = params.get("intent", None)
             if intent is None:
-                pos = self.live_state._positions.get(symbol.upper()) if symbol else None
-                if pos and side == "SELL" and pos.is_long:
+                # Check cached portfolio synchronously for intent detection
+                _portfolio = self.gateway.get_cached_portfolio() if self.gateway else []
+                _pos_match = None
+                for _item in _portfolio:
+                    if _item.contract.symbol.upper() == symbol.upper() and _item.position != 0:
+                        _pos_match = _item
+                        break
+                if _pos_match and side == "SELL" and _pos_match.position > 0:
                     intent = "exit"
-                elif pos and side == "BUY" and pos.is_short:
+                elif _pos_match and side == "BUY" and _pos_match.position < 0:
                     intent = "exit"
                 else:
                     intent = "entry"

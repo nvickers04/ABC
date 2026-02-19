@@ -38,15 +38,11 @@ def _make_leg_key(symbol: str, right: str, strike: float, expiration: str) -> st
 
 def _register_spread_if_success(result: dict, underlying: str, strategy: str,
                                  leg_keys: list):
-    """Register a spread group in LiveState after a successful placement."""
+    """Register a spread group after a successful placement (no-op without LiveState)."""
     if not result or not result.get("success"):
         return
-    try:
-        from data.live_state import get_live_state
-        order_id = result.get("order_id")
-        get_live_state().register_spread(underlying, strategy, leg_keys, order_id)
-    except Exception as e:
-        logger.warning(f"Failed to register spread group: {e}")
+    # Spread group tracking removed with LiveState deletion
+    logger.debug(f"Spread placed: {strategy} on {underlying}, legs={leg_keys}")
 
 
 # =========================================================================
@@ -460,25 +456,9 @@ async def handle_close_option(executor, params: dict) -> Any:
     if not all([symbol, expiration, strike, right]):
         return {"error": "Required: symbol, expiration, strike, right"}
     
-    # Warn if this leg belongs to a spread
-    if not force:
-        position_key = _make_leg_key(symbol, right.upper(), float(strike), expiration)
-        try:
-            from data.live_state import get_live_state
-            group = get_live_state().get_spread_for_leg(position_key)
-            if group:
-                other_legs = [k for k in group.legs if k != position_key]
-                return {
-                    "warning": (
-                        f"This option is leg of a {group.strategy} spread ({group.group_id}). "
-                        f"Closing it alone will destroy the spread risk profile and leave "
-                        f"these legs orphaned: {other_legs}. "
-                        f"To close the entire spread, close ALL legs. "
-                        f"To force close this single leg anyway, pass force=true."
-                    )
-                }
-        except Exception as e:
-            logger.debug(f"Spread check failed: {e}")
+    # Warn if this leg belongs to a spread (spread tracking removed with LiveState)
+    # With no spread registry, we skip the orphan-leg warning.
+    # The agent should still manage spreads carefully.
     
     result = await executor.gateway.close_option_position(
         symbol, expiration, float(strike), right.upper(),

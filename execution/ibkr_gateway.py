@@ -3,7 +3,6 @@ IBKR Gateway — Adapter implementing the Broker Gateway for Interactive Brokers
 
 Wraps the existing IBKRConnector (which uses ib_insync) and adds:
   - Capability checking before every broker method call
-  - LiveState event wiring
   - State refresh coordination
 
 This is the ONLY file that Layer 2 indirectly uses to reach IBKR.
@@ -98,36 +97,6 @@ class IBKRGateway:
 
     def get_cached_trades(self) -> list:
         return self._connector.get_cached_trades() if self._connector else []
-
-    # =====================================================================
-    # LIVE STATE WIRING
-    # =====================================================================
-
-    async def wire_live_state(self) -> None:
-        """
-        Wire LiveState to broker events.
-
-        Delegates to the existing wire_to_broker() in live_state.py,
-        passing the raw connector.  LiveState event handlers still
-        receive ib_insync objects for now — a future pass can abstract
-        those into generic event types.
-        """
-        from data.live_state import wire_to_broker
-        await wire_to_broker(self._connector)
-
-    # =====================================================================
-    # STATE REFRESH
-    # =====================================================================
-
-    async def refresh_state(self) -> None:
-        """
-        Force-refresh LiveState from broker after an order placement.
-
-        Delegates to LiveState.refresh_after_order() which polls the
-        broker for fresh account/portfolio/order data.
-        """
-        from data.live_state import get_live_state
-        await get_live_state().refresh_after_order()
 
     # =====================================================================
     # TRUTHINESS — handler guards: `if not executor.gateway: ...`

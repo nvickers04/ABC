@@ -66,9 +66,11 @@ async def handle_calculate_size(executor, params: dict) -> Any:
 
     # STRICT cash-only guardrail: block sizing for short entries
     if executor.cash_only and side == "SELL":
-        ls = executor.live_state
-        pos = ls._positions.get(symbol)
-        is_closing_long = pos and pos.is_long
+        portfolio = executor.gateway.get_cached_portfolio() if executor.gateway else []
+        is_closing_long = any(
+            item.contract.symbol.upper() == symbol and item.position > 0
+            for item in portfolio
+        )
         if not is_closing_long:
             return {
                 "error": f"CASH-ONLY BLOCKED: Cannot size short entry for {symbol}. "
@@ -81,20 +83,10 @@ async def handle_calculate_size(executor, params: dict) -> Any:
     stop_distance_pct = params.get("stop_distance_pct")
 
     # --- Gather data ---
-    from data.live_state import get_live_state
-    state = get_live_state()
 
-    # Account values
-    net_liq = state._net_liq
-    cash = state._cash
-    if state._broker:
-        try:
-            if hasattr(state._broker, 'net_liquidation') and state._broker.net_liquidation > 0:
-                net_liq = state._broker.net_liquidation
-            if hasattr(state._broker, 'cash_value') and state._broker.cash_value != 0:
-                cash = state._broker.cash_value
-        except Exception:
-            pass
+    # Account values — query gateway directly
+    net_liq = executor.gateway.net_liquidation if executor.gateway else 0
+    cash = executor.gateway.cash_value if executor.gateway else 0
 
     if net_liq <= 0:
         return {"error": "Cannot size: net liquidation is $0 or unknown"}
@@ -188,10 +180,13 @@ async def handle_calculate_size(executor, params: dict) -> Any:
         )
     else:
         # Check if this is a short ENTRY (no existing position) vs closing a long
-        from data.live_state import get_live_state
-        ls = get_live_state()
-        existing_pos = ls._positions.get(symbol)
-        is_short_entry = existing_pos is None or existing_pos.is_long
+        portfolio = executor.gateway.get_cached_portfolio() if executor.gateway else []
+        existing_pos = None
+        for item in portfolio:
+            if item.contract.symbol.upper() == symbol and item.position != 0:
+                existing_pos = item
+                break
+        is_short_entry = existing_pos is None or existing_pos.position > 0
         if is_short_entry:
             # Short entry requires cash collateral — treat like BUY for sizing
             available_cash = max(0, available_funds * 0.95)

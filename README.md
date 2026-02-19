@@ -1,21 +1,22 @@
 # ABC — Grok 4.20 Autonomous Trader
 
-Configurable risk, dynamic liquidity, overnight holds OK.  
-Pure model autonomy + thin tools + iron-clad risk.
+Cash-only, configurable risk, dynamic liquidity, overnight holds OK.  
+Pure model autonomy + thin tools + iron-clad risk. No margin, no shorts.
 
 ## Architecture
 
 ```
 Grok (ReAct Brain)  →  Tools (thin wrappers)  →  IBKR Execution
      ↑                                              │
-     └──────────── state + tool results ←───────────┘
+     └──────────── broker queries ←─────────────┘
 ```
 
 - **5-minute cycles** — Grok observes state, calls tools, decides WAIT or TRADE
+- **Cash-only** — uses CashBalance / AvailableFunds, no margin, no short selling
+- **Direct broker queries** — no caching layer, always fresh data from IBKR
 - **temperature=0.0, seed=42** — deterministic, reproducible
-- **Configurable risk** — `RISK_PER_TRADE` in `.env` (default 1.0%)
+- **Configurable risk** — `RISK_PER_TRADE` in `.env` (default 1.0% of cash)
 - **No auto-close** — Grok decides hold time (intraday, overnight, multi-day)
-- **No screening layer** — Grok uses raw data tools to find opportunities itself
 
 ## Structure
 
@@ -25,7 +26,7 @@ Grok (ReAct Brain)  →  Tools (thin wrappers)  →  IBKR Execution
 │   ├── grok_llm.py # xAI API wrapper
 │   └── config.py   # System prompt + risk constants (reads .env)
 ├── tools/          # Thin tool wrappers (account, orders, research, options, etc.)
-├── data/           # Market data client, data provider, cost tracker, live state
+├── data/           # Market data client, data provider, cost tracker, broker gateway
 ├── execution/      # IBKR core, orders, options, queries
 ├── __main__.py     # Entry point
 ├── .env.template   # Copy to .env and fill in
@@ -70,11 +71,13 @@ python __main__.py --account live
 | `IBKR_PORT` | IBKR port — 7497=paper, 7496=live |
 | `IBKR_CLIENT_ID` | Client ID (default: 1) |
 | `PAPER_MODE` | `True` (default) or `False` for live |
-| `RISK_PER_TRADE` | % of portfolio equity per trade (default: 1.0) |
+| `RISK_PER_TRADE` | % of cash balance per trade (default: 1.0) |
+| `CASH_ONLY` | `true` (default) — enforce cash-only, no shorts |
 
 ## Risk Rules
 
-- Max **RISK_PER_TRADE%** portfolio equity risk per trade (default 1.0%, configurable in `.env`)
+- Max **RISK_PER_TRADE%** of cash balance risk per trade (default 1.0%, configurable in `.env`)
+- **Cash-only** — no margin, no short selling (use long puts for bearish views)
 - Min **3:1** reward-to-risk ratio
 - Min **75%** confidence required
 - **15%** daily loss → emergency flatten

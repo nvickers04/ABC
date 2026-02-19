@@ -38,7 +38,6 @@ from core.config import (
 )
 from core.grok_llm import get_grok_llm
 from data.cost_tracker import get_cost_tracker
-from data.live_state import get_live_state
 from data.data_provider import get_data_provider
 from data.broker_gateway import create_gateway, BrokerConfigError
 from data.market_hours import get_market_hours_provider
@@ -171,12 +170,11 @@ class TradingAgent:
     No orchestration, no registries, no rigid strategies.
     """
 
-    def __init__(self, gateway, tools: ToolExecutor, live_state=None, grok=None):
+    def __init__(self, gateway, tools: ToolExecutor, grok=None):
         self.grok = grok or get_grok_llm()
         self.gateway = gateway
         self.cost_tracker = get_cost_tracker()
         self.tools = tools
-        self.live_state = live_state or get_live_state()
 
         # Circuit breaker
         self._consecutive_failures = 0
@@ -188,30 +186,38 @@ class TradingAgent:
         self._cycle_id = 0
         self._last_cycle_summary = ""
         self._halted = False
-        self._start_of_day_net_liq: Optional[float] = None
+        self._start_of_day_cash: Optional[float] = None
 
         logger.info("TradingAgent initialized (minimal ReAct mode)")
 
-    def _capture_start_of_day_net_liq(self):
-        """Capture net liquidation at session start for daily loss tracking."""
-        if self._start_of_day_net_liq is not None:
+    async def _get_cash(self) -> float:
+        """Get current cash balance from broker."""
+        try:
+            summary = await self.gateway.get_account_summary()
+            return summary.get("totalcashvalue", 0) or summary.get("availablefunds", 0) or 0
+        except Exception:
+            return self.gateway.cash_value if self.gateway else 0
+
+    def _capture_start_of_day_cash(self):
+        """Capture cash at session start for daily loss tracking."""
+        if self._start_of_day_cash is not None:
             return
-        net_liq = self.live_state._net_liq
-        if net_liq > 0:
-            self._start_of_day_net_liq = net_liq
+        cash = self.gateway.cash_value if self.gateway else 0
+        if cash > 0:
+            self._start_of_day_cash = cash
             logger.info(
-                f"Start-of-day Net Liq: ${net_liq:,.2f} "
-                f"(loss limit: -{MAX_DAILY_LOSS_PCT}% = ${net_liq * MAX_DAILY_LOSS_PCT / 100:,.2f})"
+                f"Start-of-day Cash: ${cash:,.2f} "
+                f"(loss limit: -{MAX_DAILY_LOSS_PCT}% = ${cash * MAX_DAILY_LOSS_PCT / 100:,.2f})"
             )
 
     def _check_daily_loss(self) -> Optional[float]:
         """Check if daily loss limit breached. Returns loss % if breached."""
-        if not self._start_of_day_net_liq or self._start_of_day_net_liq <= 0:
+        if not self._start_of_day_cash or self._start_of_day_cash <= 0:
             return None
-        current = self.live_state._net_liq
+        current = self.gateway.cash_value if self.gateway else 0
         if current <= 0:
             return None
-        loss_pct = (self._start_of_day_net_liq - current) / self._start_of_day_net_liq * 100
+        loss_pct = (self._start_of_day_cash - current) / self._start_of_day_cash * 100
         return loss_pct if loss_pct >= MAX_DAILY_LOSS_PCT else None
 
     async def _emergency_flatten(self, reason: str):
@@ -228,6 +234,78 @@ class TradingAgent:
         summary = self.cost_tracker.get_budget_summary()
         return summary.today_llm_cost >= MAX_DAILY_LLM_COST
 
+    async def _build_state_context(self) -> str:
+        """Query broker directly and build a state context string for the agent."""
+        lines = ["═══ ACCOUNT STATE ═══"]
+        try:
+            summary = await self.gateway.get_account_summary()
+            cash = summary.get("totalcashvalue", 0)
+            avail = summary.get("availablefunds", 0)
+            net_liq = summary.get("netliquidation", 0)
+            daily_pnl = summary.get("dailypnl", "N/A")
+            unreal = summary.get("unrealizedpnl", "N/A")
+            real = summary.get("realizedpnl", "N/A")
+            lines.append(f"Cash: ${cash:,.2f}  |  Available: ${avail:,.2f}  |  NetLiq: ${net_liq:,.2f}")
+            lines.append(f"Daily P&L: {daily_pnl}  |  Unrealized: {unreal}  |  Realized: {real}")
+        except Exception as e:
+            lines.append(f"Account query error: {e}")
+
+        lines.append("")
+        lines.append("═══ POSITIONS ═══")
+        try:
+            positions = await self.gateway.get_positions()
+            if not positions:
+                lines.append("No open positions.")
+            else:
+                for p in positions:
+                    sym = p.get("symbol", "?")
+                    qty = p.get("quantity", 0)
+                    avg = p.get("avg_cost", 0)
+                    mkt = p.get("market_price", 0)
+                    pnl = p.get("unrealized_pnl", 0)
+                    sec = p.get("sec_type", "STK")
+                    if sec == "OPT":
+                        strike = p.get("strike", "")
+                        right = p.get("right", "")
+                        exp = p.get("expiration", "")
+                        lines.append(
+                            f"  {sym} {right}{strike} {exp}: {qty} @ ${avg:.2f} "
+                            f"| mkt ${mkt:.2f} | P&L ${pnl:+,.2f}"
+                        )
+                    else:
+                        lines.append(
+                            f"  {sym}: {qty} shares @ ${avg:.2f} "
+                            f"| mkt ${mkt:.2f} | P&L ${pnl:+,.2f}"
+                        )
+        except Exception as e:
+            lines.append(f"Position query error: {e}")
+
+        lines.append("")
+        lines.append("═══ OPEN ORDERS ═══")
+        try:
+            orders = await self.gateway.get_open_orders()
+            if not orders:
+                lines.append("No open orders.")
+            else:
+                for o in orders:
+                    sym = o.get("symbol", "?")
+                    action = o.get("action", "?")
+                    qty = o.get("quantity", 0)
+                    otype = o.get("order_type", "?")
+                    lmt = o.get("lmt_price")
+                    aux = o.get("aux_price")
+                    oid = o.get("order_id", "?")
+                    price_str = ""
+                    if lmt:
+                        price_str = f"lmt ${lmt:.2f}"
+                    if aux:
+                        price_str += f" aux ${aux:.2f}"
+                    lines.append(f"  #{oid} {action} {qty} {sym} {otype} {price_str}")
+        except Exception as e:
+            lines.append(f"Order query error: {e}")
+
+        return "\n".join(lines)
+
     async def run_cycle(self) -> int:
         """
         Run one cycle of the ReAct loop.
@@ -237,14 +315,8 @@ class TradingAgent:
         self._cycle_failures = 0
         self._cycle_id += 1
 
-        # Refresh option greeks
-        try:
-            await self.live_state.refresh_option_greeks()
-        except Exception as e:
-            logger.debug(f"Greek refresh skipped: {e}")
-
-        # Get live state
-        live_state_text = self.live_state.format_for_agent()
+        # Build state context from broker
+        state_text = await self._build_state_context()
 
         # Check daily loss
         loss_pct = self._check_daily_loss()
@@ -271,7 +343,7 @@ class TradingAgent:
         if self._last_cycle_summary:
             continuity = f"\nLAST CYCLE: {self._last_cycle_summary}\n"
 
-        context = f"""{live_state_text}
+        context = f"""{state_text}
 {cost_line}
 Time: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
 {continuity}
@@ -434,8 +506,8 @@ Be extremely conservative. Assess positions and research opportunities. What is 
                         logger.warning(f"Circuit breaker: {self._cycle_failures} failures this cycle")
                         return 60
 
-                    # Refresh live state
-                    live_state_text = self.live_state.format_for_agent()
+                    # Refresh state from broker
+                    state_text = await self._build_state_context()
 
                     conf = _extract_confidence(action_data)
                     conf_note = ""
@@ -447,7 +519,7 @@ Be extremely conservative. Assess positions and research opportunities. What is 
                         "role": "user",
                         "content": (
                             f"TOOL RESULT:\n{last_result}\n{conf_note}\n\n"
-                            f"{live_state_text}\n\nWhat's your next action? Be conservative."
+                            f"{state_text}\n\nWhat's your next action? Be conservative."
                         ),
                     })
 
@@ -475,24 +547,19 @@ async def run_agent():
         logger.error(f"Broker connection failed: {e}")
         return
 
-    # Wire live state to broker events
-    await gateway.wire_live_state()
-
     # Build tools and agent
     data_provider = get_data_provider()
-    live_state = get_live_state()
     market_hours = get_market_hours_provider()
 
     tools = ToolExecutor(
         gateway,
         data_provider,
-        live_state=live_state,
         market_hours_provider=market_hours,
     )
-    agent = TradingAgent(gateway, tools, live_state=live_state)
+    agent = TradingAgent(gateway, tools)
 
     logger.info("Agent started (paper mode recommended)")
-    agent._capture_start_of_day_net_liq()
+    agent._capture_start_of_day_cash()
 
     # ── Main loop ───────────────────────────────────────────────
     cycle = 0
@@ -509,8 +576,8 @@ async def run_agent():
                 pass
             continue
 
-        if agent._start_of_day_net_liq is None:
-            agent._capture_start_of_day_net_liq()
+        if agent._start_of_day_cash is None:
+            agent._capture_start_of_day_cash()
 
         # No auto-shutdown — Grok decides hold time (overnight OK)
         # Only halt if agent is explicitly halted (daily loss, LLM cost)

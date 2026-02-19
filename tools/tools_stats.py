@@ -8,7 +8,7 @@ from typing import Any
 
 logger = logging.getLogger(__name__)
 
-# No daily_store persistence — stats are derived from in-memory live_state
+# No daily_store persistence — stats are derived from broker queries
 def _no_op_read(*args, **kwargs):
     return []
 
@@ -259,35 +259,26 @@ async def handle_stats(executor, params: dict) -> Any:
     result["trade_stats"] = _compute_trade_stats(decisions)
     result["confidence"] = _compute_confidence_calibration(decisions)
 
-    # 2. P&L from LiveState
+    # 2. P&L from broker
     try:
-        from data.live_state import get_live_state
-        state = get_live_state()
-        with state._lock:
-            positions = list(state._positions.values())
-            orders = list(state._orders.values())
-            daily_pnl = state._daily_pnl
-            realized_pnl = state._realized_pnl
-            unrealized_pnl = state._unrealized_pnl
-            cash = state._cash
-            net_liq = state._net_liq
+        gateway = executor.gateway
+        summary = await gateway.get_account_summary()
+        positions_list = await gateway.get_positions()
+        orders_list = await gateway.get_open_orders()
+
+        daily_pnl = summary.get("dailypnl", 0)
+        realized_pnl = summary.get("realizedpnl", 0)
+        unrealized_pnl = summary.get("unrealizedpnl", 0)
+        cash = summary.get("totalcashvalue", 0)
+        net_liq = summary.get("netliquidation", 0)
 
         # Position health
-        winners = sum(1 for p in positions if p.unrealized_pnl > 0)
-        losers = sum(1 for p in positions if p.unrealized_pnl < 0)
-        flat = sum(1 for p in positions if p.unrealized_pnl == 0)
+        winners = sum(1 for p in positions_list if p.get("unrealized_pnl", 0) > 0)
+        losers = sum(1 for p in positions_list if p.get("unrealized_pnl", 0) < 0)
+        flat = sum(1 for p in positions_list if p.get("unrealized_pnl", 0) == 0)
 
-        # Unprotected positions
-        unprotected = 0
-        for p in positions:
-            pos_orders = state.get_orders_for(p.symbol)
-            if p.is_long and not any(o.action == "SELL" for o in pos_orders):
-                unprotected += 1
-            elif p.is_short and not any(o.action == "BUY" for o in pos_orders):
-                unprotected += 1
-
-        best_pos = max(positions, key=lambda p: p.unrealized_pnl) if positions else None
-        worst_pos = min(positions, key=lambda p: p.unrealized_pnl) if positions else None
+        best_pos = max(positions_list, key=lambda p: p.get("unrealized_pnl", 0)) if positions_list else None
+        worst_pos = min(positions_list, key=lambda p: p.get("unrealized_pnl", 0)) if positions_list else None
 
         result["pnl"] = {
             "daily_pnl": round(daily_pnl, 2),
@@ -295,20 +286,19 @@ async def handle_stats(executor, params: dict) -> Any:
             "unrealized_pnl": round(unrealized_pnl, 2),
         }
         result["positions"] = {
-            "total": len(positions),
+            "total": len(positions_list),
             "winners": winners,
             "losers": losers,
             "flat": flat,
             "win_rate_pct": round(winners / (winners + losers) * 100, 1) if (winners + losers) > 0 else 0,
-            "unprotected": unprotected,
-            "open_orders": len(orders),
+            "open_orders": len(orders_list),
             "best": {
-                "symbol": best_pos.symbol,
-                "pnl": round(best_pos.unrealized_pnl, 2),
+                "symbol": best_pos.get("symbol", "?"),
+                "pnl": round(best_pos.get("unrealized_pnl", 0), 2),
             } if best_pos else None,
             "worst": {
-                "symbol": worst_pos.symbol,
-                "pnl": round(worst_pos.unrealized_pnl, 2),
+                "symbol": worst_pos.get("symbol", "?"),
+                "pnl": round(worst_pos.get("unrealized_pnl", 0), 2),
             } if worst_pos else None,
         }
         result["account"] = {
@@ -317,15 +307,8 @@ async def handle_stats(executor, params: dict) -> Any:
             "cash_pct": round(cash / net_liq * 100, 1) if net_liq > 0 else 0,
         }
 
-        # 2b. Profit protection metrics
-        try:
-            from data.profit_metrics import compute_session_metrics
-            closed_trades = list(state._closed_trades_today)
-            result["profit_protection"] = compute_session_metrics(
-                closed_trades, state._hwm_tracker, state._equity_tracker,
-            )
-        except Exception as e:
-            result["profit_protection"] = {"error": str(e)}
+        # 2b. Profit protection metrics (simplified — no LiveState)
+        result["profit_protection"] = {"note": "Profit metrics not available without LiveState"}
     except Exception as e:
         result["pnl"] = {"error": str(e)}
         result["positions"] = {"error": str(e)}
@@ -397,31 +380,25 @@ async def handle_review_trades(executor, params: dict) -> Any:
     sort_by = params.get("sort", "efficiency")
     symbol_filter = params.get("symbol")
     
-    # Get closed trades from in-memory live_state (no disk persistence)
+    # Get closed trades from broker executions (no disk persistence)
     all_trades = []
     try:
-        from data.live_state import get_live_state
-        ls = get_live_state()
-        for record in getattr(ls, '_closed_trades_today', []):
-            record = dict(record)  # copy
-            record["date"] = date.today().isoformat()
-            if "efficiency" not in record:
-                hh = record.get("hold_hours")
-                pp = record.get("pnl_pct")
-                if hh and hh > 0.017 and pp is not None:
-                    record["efficiency"] = round(pp / hh, 2)
-                else:
-                    record["efficiency"] = None
-            if "pnl_per_hour" not in record:
-                hh = record.get("hold_hours")
-                pnl = record.get("pnl")
-                if hh and hh > 0.017 and pnl is not None:
-                    record["pnl_per_hour"] = round(pnl / hh, 2)
-                else:
-                    record["pnl_per_hour"] = None
+        fills = await executor.gateway.get_recent_executions()
+        # Group fills into simple trade records
+        for fill in fills:
+            record = {
+                "symbol": fill.get("symbol", "?"),
+                "side": fill.get("side", "?"),
+                "shares": fill.get("shares", 0),
+                "price": fill.get("price", 0),
+                "pnl": fill.get("commission", 0) * -1,  # approximate
+                "date": fill.get("time", date.today().isoformat()),
+                "efficiency": None,
+                "pnl_per_hour": None,
+            }
             all_trades.append(record)
     except Exception as e:
-        logger.debug(f"Failed to load closed trades: {e}")
+        logger.debug(f"Failed to load executions: {e}")
     
     if not all_trades:
         return {"message": f"No closed trades found in the last {days_back} days", "trades": []}
@@ -622,13 +599,8 @@ def compute_reliability_stats() -> dict:
     # --- Deferred stop queue depth ---
     deferred_depth = 0
 
-    # --- Farm health ---
+    # --- Farm health (not available without LiveState) ---
     farm_health = {}
-    try:
-        from data.live_state import get_live_state
-        farm_health = get_live_state().farm_health
-    except Exception:
-        pass
 
     return {
         "stop_attempts": stop_attempts,

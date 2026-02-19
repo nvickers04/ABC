@@ -355,15 +355,8 @@ async def handle_instrument_selector(executor, params: dict) -> Any:
         except Exception:
             pass
 
-    # Get regime for context
+    # Get regime for context (simplified — no LiveState regime tracker)
     regime_label = None
-    try:
-        from data.live_state import get_live_state
-        ls = get_live_state()
-        ls._refresh_regime_cache()
-        regime_label, _, regime_desc = ls._classify_regime()
-    except Exception:
-        pass
 
     # Build output
     result = {

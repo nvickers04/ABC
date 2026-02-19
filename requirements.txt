@@ -1,4 +1,4 @@
-# ABC Minimal Grok 4.2 Trader — Requirements
+# ABC Grok 4.20 Trader — Requirements
 # pip install -r requirements.txt
 
 # LLM (Grok via xAI OpenAI-compatible API)

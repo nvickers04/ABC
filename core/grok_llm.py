@@ -7,8 +7,6 @@ The agent loop in agent.py calls self.grok.client directly.
 Usage:
     llm = get_grok_llm()
     response = await llm.client.chat.completions.create(...)
-
-Built for Grok 4.2 — dynamic liquidity, overnight holds OK, 0.5% risk max.
 """
 
 import logging
@@ -19,7 +17,7 @@ from openai import AsyncOpenAI
 
 logger = logging.getLogger(__name__)
 
-# model="grok-4-1-fast-reasoning" → change to exact Grok 4.2 name when available in console
+# model="grok-4-1-fast-reasoning" → change to exact Grok 4.20 name when available in console
 DEFAULT_MODEL = "grok-4-1-fast-reasoning"
 
 

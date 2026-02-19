@@ -120,6 +120,7 @@ review_trades: {days?=3, sort?='efficiency', symbol?} -> closed trades with effi
 import asyncio
 import json
 import logging
+import os
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -203,18 +204,8 @@ class ToolExecutor:
         # Order action names for structured trade logging
         self._order_actions = _ORDER_ACTIONS
 
-        # Load cash_only flag from config
-        self.cash_only = False
-        try:
-            from pathlib import Path
-            import yaml
-            _cfg_path = Path("config/trading.yaml")
-            if _cfg_path.exists():
-                with open(_cfg_path, "r") as _f:
-                    _cfg = yaml.safe_load(_f) or {}
-                self.cash_only = bool(_cfg.get("risk_limits", {}).get("cash_only", False))
-        except Exception:
-            pass
+        # Load cash_only flag from env
+        self.cash_only = os.environ.get("CASH_ONLY", "true").lower() == "true"
 
         if self.live_state is None:
             from data.live_state import get_live_state

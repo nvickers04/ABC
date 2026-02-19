@@ -1,5 +1,5 @@
 """
-Minimal Grok 4.2 Trader — Entry Point
+Grok 4.20 Trader — Entry Point
 
 Usage:
     python __main__.py                  # Run agent (paper trading)
@@ -7,7 +7,7 @@ Usage:
     python __main__.py --verbose        # Debug logging
     python __main__.py --account live   # Live trading (use with caution)
 
-Built for Grok 4.2 — Alpha Arena winning style (pure autonomy, max WAIT, 0.5% risk)
+Built for Grok 4.20 — dynamic liquidity, overnight holds OK, configurable risk.
 """
 
 import asyncio
@@ -66,11 +66,6 @@ def validate_startup():
     if not grok_key:
         errors.append("Missing GROK_API_KEY or XAI_API_KEY")
 
-    # Check config files
-    for path in ["config/trading.yaml"]:
-        if not Path(path).exists():
-            errors.append(f"Missing config: {path}")
-
     if errors:
         for err in errors:
             logger.error(f"Startup: {err}")
@@ -99,7 +94,7 @@ async def test_grok():
 
 def main():
     """Main entry point."""
-    parser = argparse.ArgumentParser(description="Minimal Grok 4.2 Trader")
+    parser = argparse.ArgumentParser(description="Grok 4.20 Trader")
     parser.add_argument("--test", action="store_true", help="Test Grok connection")
     parser.add_argument("--verbose", action="store_true", help="Enable DEBUG logging")
     parser.add_argument(
@@ -122,7 +117,7 @@ def main():
 
     validate_startup()
 
-    print(f"\nStarting Minimal Grok 4.2 Trader (account={args.account})...")
+    print(f"\nStarting Grok 4.20 Trader (account={args.account})...")
     print("Press Ctrl+C to stop\n")
 
     from core.agent import run_agent

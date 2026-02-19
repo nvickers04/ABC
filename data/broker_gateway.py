@@ -2,7 +2,7 @@
 Broker Gateway — Capability-configurable broker abstraction.
 
 Separates Layer 2 (tools/state) from Layer 1 (broker implementation).
-Capabilities are declared in config/trading.yaml and validated at startup.
+Capabilities use sensible defaults; settings come from .env.
 
 Safety invariant: if you can open a position, you can close it.
 Validation runs ONCE at startup, not every loop.
@@ -33,7 +33,7 @@ class CapabilityUnavailableError(Exception):
         self.group = group
         super().__init__(
             f"Capability '{capability}' is not available in '{group}' "
-            f"for this broker configuration. Check config/trading.yaml broker.capabilities."
+            f"for this broker configuration."
         )
 
 
@@ -44,7 +44,7 @@ class CapabilityUnavailableError(Exception):
 @dataclass
 class BrokerCapabilities:
     """
-    Broker capability flags loaded from config/trading.yaml.
+    Broker capability flags (sensible defaults).
 
     Organized into groups:
       - opening_equity:  Order types for entering equity positions

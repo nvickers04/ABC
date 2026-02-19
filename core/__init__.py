@@ -1,1 +1,1 @@
-# core/ — Minimal Grok 4.2 ReAct trading brain
+# core/ — Grok 4.20 ReAct trading brain

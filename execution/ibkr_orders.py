@@ -238,15 +238,16 @@ class IBKROrdersMixin:
             limit_price = entry_price
 
             # ═══════════════════════════════════════════════
-            #  HARD RISK GUARD — 0.5% max risk per trade
+            #  HARD RISK GUARD — configurable via RISK_PER_TRADE
             # ═══════════════════════════════════════════════
+            from core.config import RISK_PER_TRADE
             await self._update_account_values()
             risk_per_share = abs(entry_price - stop_price)
             risk_dollars = risk_per_share * quantity
-            max_risk = 0.005 * self.net_liquidation  # 0.5% of equity
+            max_risk = RISK_PER_TRADE * self.net_liquidation
             if self.net_liquidation > 0 and risk_dollars > max_risk:
                 msg = (f"RISK GUARD BLOCKED: {symbol} risk ${risk_dollars:,.2f} "
-                       f"> 0.5% of equity ${max_risk:,.2f} "
+                       f"> {RISK_PER_TRADE*100}% of equity ${max_risk:,.2f} "
                        f"(NLV=${self.net_liquidation:,.2f})")
                 logger.error(msg)
                 return {

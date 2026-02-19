@@ -8,24 +8,14 @@ import logging
 from datetime import datetime, time, timezone, timedelta
 from typing import Dict, Any, Optional
 from enum import Enum
-from pathlib import Path
 
-import yaml
 import exchange_calendars as ecals
 
 logger = logging.getLogger(__name__)
 
 
 def _load_market_hours_config() -> dict:
-    """Load market hours from config/trading.yaml."""
-    cfg_path = Path("config/trading.yaml")
-    if cfg_path.exists():
-        try:
-            with open(cfg_path, "r") as f:
-                cfg = yaml.safe_load(f) or {}
-            return cfg.get("market_hours", {})
-        except Exception as e:
-            logger.warning(f"Failed to load market_hours config: {e}")
+    """Return empty dict — market hours use exchange_calendars defaults."""
     return {}
 
 

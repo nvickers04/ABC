@@ -1,8 +1,6 @@
 """
 Minimal ReAct Agent Loop — THE ONLY BRAIN
 
-Built for Grok 4.2 — Alpha Arena winning style (pure autonomy, max WAIT, 0.5% risk)
-
 Architecture: Grok drives the loop. We provide tools and context.
 Grok chains actions until it signals 'done' to refresh context.
 No orchestration, no registries, no rigid strategies.
@@ -12,7 +10,7 @@ DESIGN PHILOSOPHY:
 - Pure model autonomy — Grok decides what to research, when to trade, when to wait
 - Dynamic liquidity — Grok filters for liquid names, decides hold time (overnight OK)
 - Thin tools — wrappers around broker + market data, nothing more
-- Iron-clad risk — 0.5% max risk per trade enforced in code, not just prompt
+- Configurable risk — RISK_PER_TRADE from .env, enforced in code + prompt
 - Paranoid defaults — temperature=0.0, seed=42, WAIT is the default outcome
 - No automatic EOD close — Grok holds winners if edge remains
 """
@@ -27,10 +25,9 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, Optional
 
-import yaml
-
 from core.config import (
     SYSTEM_PROMPT,
+    RISK_PER_TRADE,
     CYCLE_SLEEP_SECONDS,
     MAX_TURNS_PER_CYCLE,
     MAX_DAILY_LOSS_PCT,
@@ -48,8 +45,6 @@ from data.market_hours import get_market_hours_provider
 from tools.tools_executor import ToolExecutor, get_valid_actions
 
 logger = logging.getLogger(__name__)
-
-CONFIG_FILE = Path("config/trading.yaml")
 
 
 # ── JSON Parsing Helpers ────────────────────────────────────────
@@ -123,32 +118,6 @@ def _now_et() -> datetime:
     except Exception:
         from datetime import timezone, timedelta
         return datetime.now(timezone(timedelta(hours=-5)))
-
-
-def load_trading_config() -> dict:
-    """Load trading config from YAML with defaults."""
-    defaults = {
-        "agent": {
-            "temperature": {"default": 0.0, "trading": 0.0, "research": 0.0},
-            "circuit_breaker": {
-                "max_consecutive_failures": 5,
-                "max_failures_per_cycle": 8,
-                "recovery_seconds": 60,
-            },
-        }
-    }
-    if CONFIG_FILE.exists():
-        try:
-            with open(CONFIG_FILE, "r") as f:
-                loaded = yaml.safe_load(f) or {}
-            for section in defaults:
-                if section in loaded and isinstance(loaded[section], dict):
-                    for key in loaded[section]:
-                        defaults[section][key] = loaded[section][key]
-            return defaults
-        except Exception as e:
-            logger.warning(f"Failed to load {CONFIG_FILE}: {e}, using defaults")
-    return defaults
 
 
 # ── Confidence Validation ───────────────────────────────────────
@@ -490,24 +459,15 @@ Be extremely conservative. Assess positions and research opportunities. What is 
 # ── Entry Point ─────────────────────────────────────────────────
 
 async def run_agent():
-    """Main entry point for the minimal Grok 4.2 trading agent."""
+    """Main entry point for the autonomous trading agent."""
     logger.info("=" * 60)
-    logger.info("MINIMAL GROK 4.2 TRADER — Pure ReAct (Alpha Arena style)")
+    logger.info("GROK 4.20 TRADER — Pure ReAct")
+    logger.info(f"Risk per trade: {RISK_PER_TRADE*100:.1f}%")
     logger.info("=" * 60)
-
-    # Load config
-    raw_config = {}
-    if CONFIG_FILE.exists():
-        try:
-            with open(CONFIG_FILE, "r") as f:
-                raw_config = yaml.safe_load(f) or {}
-        except Exception as e:
-            logger.error(f"Failed to load config: {e}")
-            return
 
     # Connect broker
     try:
-        gateway = await create_gateway(raw_config)
+        gateway = await create_gateway({})
     except BrokerConfigError as e:
         logger.error(f"Broker config error: {e}")
         return
@@ -592,5 +552,5 @@ if __name__ == "__main__":
     )
     logging.getLogger("ib_insync.wrapper").setLevel(logging.WARNING)
     logging.getLogger("ib_insync.ib").setLevel(logging.WARNING)
-    print("Minimal Grok 4.2 Trader started (paper mode recommended)")
+    print("Grok 4.20 Trader started (paper mode recommended)")
     asyncio.run(run_agent())

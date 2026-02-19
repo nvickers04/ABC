@@ -1,5 +1,7 @@
 # ABC — Grok 4.20 Autonomous Trader
 
+**Ultra-lean version — Grok does ALL screening, analysis, and decisions.**
+
 Cash-only, configurable risk, dynamic liquidity, overnight holds OK.  
 Pure model autonomy + thin tools + iron-clad risk. No margin, no shorts.
 

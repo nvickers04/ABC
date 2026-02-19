@@ -23,7 +23,5 @@ nest-asyncio>=1.6.0,<2.0
 # Trading calendar
 exchange-calendars>=4.5,<5.0
 
-# Market data (research tools)
+# Market data (research tools — yfinance for fundamentals/analyst/insider data)
 yfinance>=0.2.44,<1.0
-newsapi-python>=0.2.7,<1.0
-fredapi>=0.5.2,<1.0

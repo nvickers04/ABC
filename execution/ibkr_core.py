@@ -441,6 +441,10 @@ class IBKRConnector(IBKROrdersMixin, IBKROptionsMixin, IBKRQueriesMixin):
                         self._connected = True
                         self.client_id = current_client_id  # Store the working client ID
 
+                        # Force live (real-time) market data — paper accounts have it free
+                        self.ib.reqMarketDataType(1)
+                        logger.info("Market data type set to LIVE (1)")
+
                         # Get account ID
                         accounts = self.ib.managedAccounts()
                         if accounts:
@@ -838,13 +842,13 @@ class IBKRConnector(IBKROrdersMixin, IBKROptionsMixin, IBKRQueriesMixin):
 
     # ========== REAL-TIME STREAMING ==========
 
-    async def subscribe_market_data(self, symbol: str, delayed: bool = True) -> Optional[Any]:
+    async def subscribe_market_data(self, symbol: str, delayed: bool = False) -> Optional[Any]:
         """
         Subscribe to real-time market data.
 
         Args:
             symbol: Stock symbol
-            delayed: If True, request delayed data (free). If False, request live (requires subscription).
+            delayed: If True, request delayed data (free). If False (default), request live data.
 
         Returns:
             Ticker object for accessing bid/ask/last, or None on error

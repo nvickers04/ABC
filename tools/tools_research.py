@@ -8,16 +8,26 @@ from typing import Any
 logger = logging.getLogger(__name__)
 
 
+# VIX-like symbols that need special handling
+_VIX_ALIASES = {"VIX", "^VIX", "$VIX", "VIX9D"}
+
+
 async def handle_quote(executor, params: dict) -> Any:
     symbol = params.get("symbol")
     if not symbol:
         return {"error": "symbol required"}
     try:
+        # VIX fallback: MarketData.app doesn't support VIX directly.
+        # Try UVXY as a VIX proxy, or estimate from SPY options IV.
+        if symbol.upper().replace("^", "").replace("$", "") in {"VIX", "VIX9D"}:
+            return await _vix_fallback(executor)
+
         quote = executor.data_provider.get_quote(symbol)
         if quote:
             result = asdict(quote)
             # Tag realtime vs delayed so agent knows data quality
-            is_realtime = quote.source in ('marketdata', 'ibkr')
+            src = quote.source or ''
+            is_realtime = src.startswith('marketdata') or src.startswith('ibkr')
             result["is_realtime"] = is_realtime
             if not is_realtime:
                 result["data_warning"] = "DELAYED DATA — prices may be 15+ minutes old. Do not use for entry timing."
@@ -25,6 +35,37 @@ async def handle_quote(executor, params: dict) -> Any:
         return {"error": f"No quote for {symbol}"}
     except Exception as e:
         return {"error": str(e)}
+
+
+async def _vix_fallback(executor) -> dict:
+    """Estimate VIX from SPY option IV or UVXY price as proxy."""
+    # Try UVXY as VIX proxy
+    try:
+        uvxy = executor.data_provider.get_quote("UVXY")
+        if uvxy:
+            result = asdict(uvxy)
+            result["note"] = "UVXY used as VIX proxy (VIX not directly available)"
+            result["symbol"] = "VIX (via UVXY)"
+            return result
+    except Exception:
+        pass
+
+    # Fallback: estimate from SPY ATM options IV
+    try:
+        from data.marketdata_client import get_marketdata_client
+        client = get_marketdata_client()
+        iv_data = await client.get_iv_rank("SPY", dte_min=20, dte_max=40)
+        if iv_data and iv_data.get("iv_current"):
+            return {
+                "symbol": "VIX (estimated from SPY IV)",
+                "last": round(iv_data["iv_current"], 1),
+                "note": "Estimated from SPY ATM call IV. Not true VIX.",
+                "source": "spy_iv_estimate",
+            }
+    except Exception:
+        pass
+
+    return {"error": "VIX unavailable. Use UVXY quote or SPY option IV as proxy."}
 
 
 async def handle_candles(executor, params: dict) -> Any:

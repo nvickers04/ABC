@@ -35,6 +35,9 @@ from core.config import (
     LLM_TEMPERATURE,
     LLM_SEED,
     LLM_MAX_TOKENS,
+    PAPER_AGGRESSIVE,
+    MIN_RR_RATIO,
+    MIN_CONFIDENCE_PCT,
 )
 from core.grok_llm import get_grok_llm
 from data.cost_tracker import get_cost_tracker
@@ -187,8 +190,15 @@ class TradingAgent:
         self._last_cycle_summary = ""
         self._halted = False
         self._start_of_day_cash: Optional[float] = None
+        self._market_snapshots: list[str] = []  # Rolling 5-cycle summaries
 
         logger.info("TradingAgent initialized (minimal ReAct mode)")
+
+    def _append_snapshot(self, summary: str):
+        """Append a cycle snapshot, keeping last 5."""
+        self._market_snapshots.append(f"[{datetime.now().strftime('%H:%M')}] {summary}")
+        if len(self._market_snapshots) > 5:
+            self._market_snapshots = self._market_snapshots[-5:]
 
     async def _get_cash(self) -> float:
         """Get current cash balance from broker."""
@@ -342,12 +352,34 @@ class TradingAgent:
         continuity = ""
         if self._last_cycle_summary:
             continuity = f"\nLAST CYCLE: {self._last_cycle_summary}\n"
+        if self._market_snapshots:
+            continuity += "RECENT SNAPSHOTS:\n" + "\n".join(self._market_snapshots[-5:]) + "\n"
+
+        # Auto-inject market scan at cycle start
+        scan_text = ""
+        try:
+            from tools.tools_scan import handle_market_scan
+            scan_result = await handle_market_scan(self.tools, {})
+            if scan_result and "movers" in scan_result:
+                movers = scan_result["movers"]
+                lines_scan = ["\n═══ MARKET SCAN (top movers) ═══"]
+                for m in movers[:20]:
+                    lines_scan.append(
+                        f"  {m['symbol']:6s} ${m['last']:<9} {m['change_pct']:+.2f}%  vol:{m['volume']:>12,}"
+                    )
+                if len(movers) > 20:
+                    lines_scan.append(f"  ... and {len(movers) - 20} more symbols scanned")
+                scan_text = "\n".join(lines_scan)
+                logger.info(f"Scan: {len(movers)} symbols, top mover: {movers[0]['symbol']} {movers[0]['change_pct']:+.2f}%")
+        except Exception as e:
+            logger.debug(f"Market scan failed: {e}")
 
         context = f"""{state_text}
+{scan_text}
 {cost_line}
 Time: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
 {continuity}
-Be extremely conservative. Assess positions and research opportunities. What is your next action?"""
+You have account state + market scan above. Find a trade. What is your next action?"""
 
         messages = [
             {"role": "system", "content": SYSTEM_PROMPT},
@@ -356,6 +388,7 @@ Be extremely conservative. Assess positions and research opportunities. What is 
 
         # ── Inner ReAct loop ────────────────────────────────────
         turn = 0
+        consecutive_thinks = 0
         cycle_actions = []
 
         while True:
@@ -371,7 +404,7 @@ Be extremely conservative. Assess positions and research opportunities. What is 
                 await self._emergency_flatten(f"Daily loss mid-cycle: -{loss_pct:.1f}%")
                 return 999999
 
-            logger.info(f"Cycle {self._cycle_id} turn {turn}...")
+            logger.info(f"Cycle {self._cycle_id} turn {turn}")
 
             try:
                 response = await self.grok.client.chat.completions.create(
@@ -384,7 +417,6 @@ Be extremely conservative. Assess positions and research opportunities. What is 
                 )
 
                 raw = response.choices[0].message.content
-                logger.info(f"Grok: {raw[:300]}...")
 
                 # Log cost
                 usage = response.usage
@@ -394,22 +426,31 @@ Be extremely conservative. Assess positions and research opportunities. What is 
                     tokens_out=usage.completion_tokens,
                     purpose="agent_loop",
                 )
+                cost_summary = self.cost_tracker.get_budget_summary()
+                logger.info(f"LLM {usage.prompt_tokens}+{usage.completion_tokens} tok | ${cost_summary.today_llm_cost:.4f} today")
 
                 # ── Check for FINAL_DECISION in raw text ────────
-                if "FINAL_DECISION: WAIT" in (raw or ""):
-                    logger.info(f"[WAIT] {raw[-300:]}")
+                if "FINAL_DECISION: WAIT" in (raw or "") or '"decision": "WAIT"' in (raw or "").replace("'", '"'):
+                    reason = raw.split("WAIT")[-1].strip(" |\n\r")[:200] if "FINAL_DECISION: WAIT" in (raw or "") else ""
+                    logger.info(f"Decision: WAIT | {reason}")
                     messages.append({"role": "assistant", "content": raw})
-                    self._last_cycle_summary = f"Cycle {self._cycle_id}: WAIT"
+                    self._last_cycle_summary = f"Cycle {self._cycle_id}: WAIT — {reason[:80]}"
+                    self._append_snapshot(f"C{self._cycle_id}: WAIT")
                     return CYCLE_SLEEP_SECONDS
 
-                if "FINAL_DECISION: TRADE" in (raw or ""):
-                    logger.info(f"[TRADE SIGNAL] {raw}")
-                    # The trade details are in the FINAL_DECISION line —
-                    # but actual execution happens via tool calls within the cycle.
-                    # If we reach here, log it and let the next cycle handle execution.
+                if "FINAL_DECISION: TRADE" in (raw or "") or '"decision": "TRADE"' in (raw or "").replace("'", '"'):
+                    logger.info(f"Decision: TRADE | {raw[-300:]}")
                     messages.append({"role": "assistant", "content": raw})
-                    self._last_cycle_summary = f"Cycle {self._cycle_id}: TRADE SIGNAL"
-                    return 15  # Quick restart to execute
+                    # Don't return — tell Grok to execute the trade NOW
+                    messages.append({
+                        "role": "user",
+                        "content": (
+                            "TRADE APPROVED. Now EXECUTE it. Use bracket_order, market_order, "
+                            "limit_order, or an options strategy tool to place the actual order. "
+                            "Do NOT just signal — place the trade now."
+                        ),
+                    })
+                    continue
 
                 # ── Parse JSON actions ──────────────────────────
                 json_objects = _parse_json_objects(raw or "")
@@ -428,6 +469,39 @@ Be extremely conservative. Assess positions and research opportunities. What is 
 
                 for action_data in json_objects:
                     action = action_data.get("action", "")
+
+                    # Handle new structured FINAL_DECISION action
+                    if action == "FINAL_DECISION" or action == "final_decision":
+                        decision = action_data.get("decision", "WAIT").upper()
+                        reason = action_data.get("reason", "")[:200]
+                        if decision == "TRADE":
+                            ticker = action_data.get("ticker", "?")
+                            size = action_data.get("size", 0)
+                            stop = action_data.get("stop", 0)
+                            target = action_data.get("target", 0)
+                            tactic = action_data.get("tactic", "")
+                            logger.info(f"Decision: TRADE {ticker} x{size} stop={stop} tgt={target} | {tactic}")
+                            messages.append({"role": "assistant", "content": raw})
+                            # Don't return — tell Grok to execute NOW
+                            messages.append({
+                                "role": "user",
+                                "content": (
+                                    f"TRADE APPROVED for {ticker}. Now EXECUTE it immediately. "
+                                    f"Use bracket_order (preferred — sets entry + stop + target), "
+                                    f"market_order, limit_order, or an options strategy tool. "
+                                    f"Your plan: {size} shares, stop ${stop}, target ${target}. "
+                                    f"Place the order NOW — do not re-analyze."
+                                ),
+                            })
+                            self._last_cycle_summary = f"Cycle {self._cycle_id}: TRADE {ticker}"
+                            self._append_snapshot(f"C{self._cycle_id}: TRADE {ticker}")
+                            continue
+                        else:
+                            logger.info(f"Decision: WAIT | {reason}")
+                            messages.append({"role": "assistant", "content": raw})
+                            self._last_cycle_summary = f"Cycle {self._cycle_id}: WAIT — {reason[:80]}"
+                            self._append_snapshot(f"C{self._cycle_id}: WAIT")
+                            return CYCLE_SLEEP_SECONDS
 
                     # Validate confidence
                     conf_ok, conf_err = _validate_confidence(action_data)
@@ -456,16 +530,25 @@ Be extremely conservative. Assess positions and research opportunities. What is 
 
                     # ── Meta-actions ────────────────────────────
                     if action == "wait":
-                        logger.info(f"Agent wants to WAIT: {action_data.get('reasoning', '')[:200]}")
-                        # In this minimal version, WAIT is respected — the agent IS allowed to wait.
-                        # Alpha Arena philosophy: doing nothing is often the best trade.
+                        logger.info(f"Decision: WAIT | {action_data.get('reasoning', '')[:200]}")
                         messages.append({"role": "assistant", "content": raw})
                         self._last_cycle_summary = f"Cycle {self._cycle_id}: WAIT"
+                        self._append_snapshot(f"C{self._cycle_id}: WAIT")
                         return CYCLE_SLEEP_SECONDS
 
                     elif action == "think":
                         thought = action_data.get("thought", "")
-                        logger.info(f"Thinking: {thought[:200]}")
+                        logger.debug(f"Think: {thought[:200]}")
+                        consecutive_thinks += 1
+                        messages.append({"role": "assistant", "content": raw})
+                        if consecutive_thinks >= 3:
+                            logger.info(f"Think-loop nudge after {consecutive_thinks} thinks")
+                            messages.append({
+                                "role": "user",
+                                "content": "You have been thinking for multiple turns without new data. "
+                                           "Issue your FINAL_DECISION now as JSON: "
+                                           '{"action": "FINAL_DECISION", "decision": "WAIT"|"TRADE", ...}'
+                            })
                         continue
 
                     elif action == "feedback":
@@ -475,19 +558,22 @@ Be extremely conservative. Assess positions and research opportunities. What is 
 
                     elif action == "done":
                         reasoning = action_data.get("reasoning", "")
-                        logger.info(f"Cycle done: {reasoning[:300]}")
+                        logger.info(f"Decision: DONE | {reasoning[:200]}")
                         cycle_actions.append("done")
                         self._last_cycle_summary = (
                             f"Cycle {self._cycle_id}: {len(cycle_actions)} actions — "
                             + ", ".join(cycle_actions[-5:])
                         )
+                        self._append_snapshot(f"C{self._cycle_id}: DONE")
                         return CYCLE_SLEEP_SECONDS
 
                     else:
                         # ── Execute ONE real tool action ────────
+                        consecutive_thinks = 0
                         last_result = await self.tools.execute(action, action_data)
-                        logger.info(f"Tool result: {str(last_result)[:200]}")
-                        cycle_actions.append(f"{action}({action_data.get('symbol', '')})")
+                        sym = action_data.get('symbol', '')
+                        logger.info(f"Tool: {action}({sym}) -> {str(last_result)[:150]}")
+                        cycle_actions.append(f"{action}({sym})")
                         break
 
                 # Feed result back
@@ -519,7 +605,7 @@ Be extremely conservative. Assess positions and research opportunities. What is 
                         "role": "user",
                         "content": (
                             f"TOOL RESULT:\n{last_result}\n{conf_note}\n\n"
-                            f"{state_text}\n\nWhat's your next action? Be conservative."
+                            f"{state_text}\n\nWhat's your next action?"
                         ),
                     })
 
@@ -534,7 +620,9 @@ async def run_agent():
     """Main entry point for the autonomous trading agent."""
     logger.info("=" * 60)
     logger.info("GROK 4.20 TRADER — Pure ReAct")
-    logger.info(f"Risk per trade: {RISK_PER_TRADE*100:.1f}%")
+    logger.info(f"Risk per trade: {RISK_PER_TRADE*100:.1f}%  |  Min R:R: {MIN_RR_RATIO}:1  |  Min conf: {MIN_CONFIDENCE_PCT}%")
+    if PAPER_AGGRESSIVE:
+        logger.info(">>> SUPER AGGRESSIVE PAPER MODE ACTIVE <<<")
     logger.info("=" * 60)
 
     # Connect broker
@@ -596,7 +684,7 @@ async def run_agent():
             pass
 
         cycle += 1
-        logger.info(f"\n{'='*40}\nCYCLE {cycle}\n{'='*40}")
+        logger.info(f"{'='*40} CYCLE {cycle} {'='*40}")
 
         try:
             wait_seconds = await agent.run_cycle()
@@ -617,7 +705,8 @@ if __name__ == "__main__":
         level=logging.INFO,
         format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
     )
-    logging.getLogger("ib_insync.wrapper").setLevel(logging.WARNING)
-    logging.getLogger("ib_insync.ib").setLevel(logging.WARNING)
+    for lib in ("httpx", "httpcore", "openai", "ib_insync.wrapper",
+                "ib_insync.ib", "ib_insync.client"):
+        logging.getLogger(lib).setLevel(logging.WARNING)
     print("Grok 4.20 Trader started (paper mode recommended)")
     asyncio.run(run_agent())

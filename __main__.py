@@ -46,9 +46,10 @@ def setup_logging(verbose: bool = False):
     file_handler.setFormatter(logging.Formatter(fmt))
     root.addHandler(file_handler)
 
-    # Suppress noisy IBKR logs
-    logging.getLogger("ib_insync.wrapper").setLevel(logging.WARNING)
-    logging.getLogger("ib_insync.ib").setLevel(logging.WARNING)
+    # Silence noisy libraries
+    for lib in ("httpx", "httpcore", "openai", "ib_insync.wrapper",
+               "ib_insync.ib", "ib_insync.client"):
+        logging.getLogger(lib).setLevel(logging.WARNING)
 
 
 logger = logging.getLogger(__name__)
@@ -57,7 +58,7 @@ logger = logging.getLogger(__name__)
 def validate_startup():
     """Validate critical secrets before launch."""
     from dotenv import load_dotenv
-    load_dotenv()
+    load_dotenv(override=True)  # override=True so .env always wins over stale shell vars
 
     errors = []
 

@@ -77,7 +77,7 @@ class MarketDataClient:
             if self.api_key:
                 self._http_client = httpx.AsyncClient(
                     base_url=API_BASE,
-                    headers={"Authorization": f"Token {self.api_key}"},
+                    headers={"Authorization": f"Bearer {self.api_key}"},
                     timeout=30.0,
                     limits=httpx.Limits(
                         max_connections=20,

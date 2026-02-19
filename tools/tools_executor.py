@@ -8,6 +8,7 @@ AVAILABLE TOOLS (for agent prompt):
 
 === RESEARCH ===
 quote: {symbol} -> price, bid, ask, volume, change_pct
+market_scan: {symbols?} -> top movers from liquid watchlist (auto-injected at cycle start)
 candles: {symbol, days?=30, resolution?='D'} -> OHLCV data (resolution: D=daily, H=hourly, 5=5min, 15=15min, 1=1min)
 fundamentals: {symbol} -> sector, industry, market_cap, pe_ratio, earnings_date
 earnings: {symbol} -> next_earnings_date, days_until_earnings
@@ -118,6 +119,7 @@ import asyncio
 import json
 import logging
 import os
+import re
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -144,6 +146,7 @@ from tools.tools_options import HANDLERS as _OPTIONS, _normalize_expiration
 from tools.tools_stats import HANDLERS as _STATS
 from tools.tools_sizing import HANDLERS as _SIZING
 from tools.tools_instruments import HANDLERS as _INSTRUMENTS
+from tools.tools_scan import HANDLERS as _SCAN
 
 _REGISTRY: dict[str, Any] = {}
 _REGISTRY.update(_RESEARCH)
@@ -153,6 +156,50 @@ _REGISTRY.update(_OPTIONS)
 _REGISTRY.update(_STATS)
 _REGISTRY.update(_SIZING)
 _REGISTRY.update(_INSTRUMENTS)
+_REGISTRY.update(_SCAN)
+
+# ── Tool Aliases (common LLM misspellings) ───────────────────
+_ALIASES: dict[str, str] = {
+    "options_chain": "option_chain",
+    "options": "option_chain",
+    "get_options": "option_chain",
+    "get_option_chain": "option_chain",
+    "get_quote": "quote",
+    "get_candles": "candles",
+    "get_atr": "atr",
+    "get_account": "account",
+    "get_positions": "positions",
+    "scan": "market_scan",
+    "get_news": "news",
+    "fundamentals_extended": "extended_fundamentals",
+    "buy_stock": "market_order",
+    "sell_stock": "market_order",
+    "close": "close_position",
+    "bull_call_spread": "vertical_spread",
+    "bear_put_spread": "vertical_spread",
+    "bear_call_spread": "vertical_spread",
+    "bull_put_spread": "vertical_spread",
+    "call_spread": "vertical_spread",
+    "put_spread": "vertical_spread",
+    "debit_spread": "vertical_spread",
+    "credit_spread": "vertical_spread",
+}
+
+# OCC symbol pattern: e.g. SMCI260220C00031000 or AAPL260321P00250000
+_OCC_RE = re.compile(r'^([A-Z]{1,6})(\d{6})([CP])(\d{8})$')
+
+def _parse_occ_symbol(sym: str) -> dict | None:
+    """Parse an OCC option symbol into components, or None if not OCC."""
+    m = _OCC_RE.match((sym or "").upper().strip())
+    if not m:
+        return None
+    underlying, date_str, right_char, strike_raw = m.groups()
+    # date_str = YYMMDD -> YYYYMMDD
+    expiration = f"20{date_str}"
+    # strike_raw = 00031000 -> 31.0  (8 digits, last 3 are decimal)
+    strike = int(strike_raw) / 1000.0
+    right = "C" if right_char == "C" else "P"
+    return {"underlying": underlying, "expiration": expiration, "strike": strike, "right": right}
 
 # Inline order action names (replaces deleted tool_registry dependency)
 _ORDER_ACTIONS = {
@@ -1405,6 +1452,9 @@ class ToolExecutor:
     async def execute(self, action: str, params: dict) -> 'ToolResult':
         """Execute a tool and return structured ToolResult."""
         try:
+            # Resolve aliases before validation
+            action = _ALIASES.get(action, action)
+
             # Basic validation: check action exists in registry
             if action not in _REGISTRY and action not in ("wait", "think", "feedback", "done"):
                 err = {"error": f"Unknown action: {action}", "valid_actions": get_valid_actions()[:25]}
@@ -1482,6 +1532,12 @@ class ToolExecutor:
                     params[key] = val
             action = "plan_order"
 
+        # Normalize side: BUY_TO_OPEN/BUY_TO_CLOSE → BUY, SELL_TO_OPEN/SELL_TO_CLOSE → SELL
+        _side_raw = params.get("side", "")
+        if isinstance(_side_raw, str) and ("_TO_" in _side_raw.upper()):
+            _norm = _side_raw.upper().split("_")[0]  # BUY or SELL
+            params["side"] = _norm
+
         # STRICT cash-only guardrail at dispatch level — catches direct order
         # calls (market_order, limit_order, etc.) that bypass plan_order.
         if self.cash_only and action in self._order_actions:
@@ -1499,6 +1555,35 @@ class ToolExecutor:
             _ev = params.get(_ek)
             if _ev:
                 params[_ek] = _normalize_expiration(str(_ev))
+
+        # ── OCC symbol redirect ─────────────────────────────────
+        # If LLM passes an OCC options symbol (e.g. SMCI260220C00031000) to a
+        # stock order tool, parse it and redirect to buy_option / close_option.
+        if action in ("limit_order", "market_order", "plan_order"):
+            _sym = (params.get("symbol") or "")
+            _occ = _parse_occ_symbol(_sym)
+            if _occ:
+                side = params.get("side", "BUY").upper().replace("_TO_OPEN", "").replace("_TO_CLOSE", "")
+                qty = params.get("quantity", 1)
+                logger.info(f"OCC redirect: {action}({_sym}) → buy_option({_occ['underlying']}, {_occ['expiration']}, {_occ['strike']}, {_occ['right']})")
+                if side == "SELL":
+                    action = "close_option"
+                    params = {
+                        "symbol": _occ["underlying"],
+                        "expiration": _occ["expiration"],
+                        "strike": _occ["strike"],
+                        "right": _occ["right"],
+                        "quantity": int(qty),
+                    }
+                else:
+                    action = "buy_option"
+                    params = {
+                        "symbol": _occ["underlying"],
+                        "expiration": _occ["expiration"],
+                        "strike": _occ["strike"],
+                        "right": _occ["right"],
+                        "quantity": int(qty),
+                    }
 
         handler = _REGISTRY.get(action)
         if handler is None:

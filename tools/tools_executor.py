@@ -452,6 +452,10 @@ class ToolExecutor:
         "collar", "calendar_spread", "diagonal_spread", "butterfly",
         "ratio_spread", "jade_lizard", "multi_leg", "enter_option",
         "option_chain", "option_greeks", "position_greeks",
+        # Position management tools — these modify/protect existing positions,
+        # never open naked shorts. Trailing stops and OCA always need an existing position.
+        "trailing_stop", "trailing_stop_limit", "oca_order",
+        "modify_stop", "flatten_limits",
     }
 
     def _check_cash_only(self, side: str, symbol: str, intent: str = "entry") -> dict | None:

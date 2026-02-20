@@ -58,7 +58,13 @@ logger = logging.getLogger(__name__)
 # ── JSON Parsing Helpers ────────────────────────────────────────
 
 def _try_repair_json(raw: str) -> list[dict[str, Any]]:
-    """Best-effort repair for almost-valid model JSON output."""
+    """Best-effort repair for almost-valid model JSON output.
+    
+    Handles:
+    - Code fence wrappers
+    - Smart quotes / trailing commas
+    - Truncated JSON (missing closing braces/brackets from token limit)
+    """
     text = (raw or "").strip()
     if not text:
         return []
@@ -71,6 +77,10 @@ def _try_repair_json(raw: str) -> list[dict[str, Any]]:
     last = text.rfind("}")
     if first != -1 and last != -1 and last > first:
         text = text[first : last + 1]
+    elif first != -1 and (last == -1 or last <= first):
+        # Truncated JSON — close all open braces/brackets
+        text = text[first:]
+        text = _close_truncated_json(text)
 
     text = text.replace("\u201c", '"').replace("\u201d", '"').replace("\u2019", "'")
     text = re.sub(r",\s*([}\]])", r"\1", text)
@@ -86,6 +96,25 @@ def _try_repair_json(raw: str) -> list[dict[str, Any]]:
         return [obj] if isinstance(obj, dict) else [i for i in obj if isinstance(i, dict)]
     except Exception:
         return []
+
+
+def _close_truncated_json(text: str) -> str:
+    """Close truncated JSON by balancing braces/brackets and fixing dangling strings."""
+    # Strip trailing partial tokens (incomplete key/value after last comma or colon)
+    # Remove trailing partial string value (e.g., `"key": "some truncated text`)
+    text = re.sub(r',\s*"[^"]*$', '', text)  # trailing key without value
+    text = re.sub(r':\s*"[^"]*$', ': ""', text)  # truncated string value → empty
+    text = re.sub(r':\s*$', ': null', text)  # hanging colon
+    text = re.sub(r',\s*$', '', text)  # trailing comma
+
+    # Count open/close braces and brackets
+    open_braces = text.count('{') - text.count('}')
+    open_brackets = text.count('[') - text.count(']')
+
+    # Close in reverse order (brackets first since they're usually nested inside objects)
+    text += ']' * max(0, open_brackets)
+    text += '}' * max(0, open_braces)
+    return text
 
 
 def _parse_json_objects(raw: str) -> list[dict]:

@@ -53,6 +53,11 @@ class IBKROptionsMixin:
         options = [Option(symbol, expiration, strike, right, 'SMART')
                    for strike, right in strikes_and_rights]
         await self.ib.qualifyContractsAsync(*options)
+        # Validate all legs resolved — conId=0 means contract doesn't exist
+        bad = [f"{o.strike}{o.right} {o.lastTradeDateOrContractMonth}" for o in options if o.conId == 0]
+        if bad:
+            raise ValueError(f"Contract(s) not found at IBKR: {', '.join(bad)}. "
+                           f"Check expiration dates — the strike/expiry may not exist.")
         return options
 
     def _build_combo(self, symbol: str, legs: List[Tuple[int, int, str]]) -> Contract:
@@ -166,6 +171,9 @@ class IBKROptionsMixin:
         try:
             opt = Option(symbol, expiration, strike, right, 'SMART')
             await self.ib.qualifyContractsAsync(opt)
+            if opt.conId == 0:
+                return {'error': f'Contract not found: {symbol} {strike}{right} {expiration}. '
+                                 f'Check that expiration date exists for this symbol.'}
 
             order = Order()
             order.action = action
@@ -398,6 +406,17 @@ class IBKROptionsMixin:
             far_opt = Option(symbol, far_expiration, strike, right, 'SMART')
             await self.ib.qualifyContractsAsync(near_opt, far_opt)
 
+            # Validate both legs resolved
+            bad = []
+            if near_opt.conId == 0:
+                bad.append(f"near leg {strike}{right} {near_expiration}")
+            if far_opt.conId == 0:
+                bad.append(f"far leg {strike}{right} {far_expiration}")
+            if bad:
+                return {'error': f"Contract not found: {', '.join(bad)}. "
+                                 f"Check expiration dates exist for {symbol}.",
+                        'symbol': symbol}
+
             combo = self._build_combo(symbol, [
                 (near_opt.conId, 1, 'SELL'),
                 (far_opt.conId, 1, 'BUY'),
@@ -446,6 +465,18 @@ class IBKROptionsMixin:
             near_opt = Option(symbol, near_expiration, near_strike, right, 'SMART')
             far_opt = Option(symbol, far_expiration, far_strike, right, 'SMART')
             await self.ib.qualifyContractsAsync(near_opt, far_opt)
+
+            # Validate both legs resolved
+            bad = []
+            if near_opt.conId == 0:
+                bad.append(f"near leg {near_strike}{right} {near_expiration}")
+            if far_opt.conId == 0:
+                bad.append(f"far leg {far_strike}{right} {far_expiration}")
+            if bad:
+                return {'error': f"Contract not found: {', '.join(bad)}. "
+                                 f"Check expiration dates exist for {symbol}. "
+                                 f"Use options_chain to find valid expirations first.",
+                        'symbol': symbol}
 
             combo = self._build_combo(symbol, [
                 (near_opt.conId, 1, 'SELL'),
@@ -798,6 +829,9 @@ class IBKROptionsMixin:
                 'SMART'
             )
             await self.ib.qualifyContractsAsync(new_contract)
+            if new_contract.conId == 0:
+                return {'error': f'Roll target not found: {symbol} {new_strike}{current_contract.right} '
+                                 f'{new_expiration}. Check that expiration exists.'}
 
             # Build roll as combo order (close current + open new)
             combo = self._build_combo(symbol, [

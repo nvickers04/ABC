@@ -90,6 +90,7 @@ POSITION MANAGEMENT:
 - If a position has no stop or target, SET ONE immediately using a trailing stop or limit order.
 - Monitor open P&L — cut losers early, let winners ride. Adjust stops as price moves in your favor.
 - Closing or adjusting an existing position counts as a valid TRADE decision.
+- Designed for future multi-agent: always manage existing positions FIRST before scanning for new trades.
 
 TRADING STYLE:
 - Be opportunistic. Call market_scan() every cycle to survey 40+ tickers.

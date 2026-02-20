@@ -1,6 +1,11 @@
 """
 Minimal ReAct Agent Loop — THE ONLY BRAIN
 
+# When Grok 4.20 multi-agent API arrives, this loop becomes the Orchestrator.
+# PositionMonitor agent will inject get_positions() summary every cycle.
+# ExecutionAgent will handle order routing. ResearchAgent will scan markets.
+# For now: single-agent ReAct loop handles everything.
+
 Architecture: Grok drives the loop. We provide tools and context.
 Grok chains actions until it signals 'done' to refresh context.
 No orchestration, no registries, no rigid strategies.
@@ -262,7 +267,7 @@ class TradingAgent:
             lines.append(f"Account query error: {e}")
 
         lines.append("")
-        lines.append("═══ POSITIONS ═══")
+        lines.append("═══ OPEN POSITIONS (MANAGE FIRST — REAL UNREALIZED PNL SHOWN) ═══")
         try:
             positions = await self.gateway.get_positions()
             if not positions:
@@ -275,18 +280,27 @@ class TradingAgent:
                     mkt = p.get("market_price", 0)
                     pnl = p.get("unrealized_pnl", 0)
                     sec = p.get("sec_type", "STK")
+                    pnl_pct = ((mkt - avg) / avg * 100) if avg > 0 else 0
                     if sec == "OPT":
                         strike = p.get("strike", "")
                         right = p.get("right", "")
                         exp = p.get("expiration", "")
+                        # Compute DTE
+                        dte = "?"
+                        try:
+                            from datetime import datetime as _dt
+                            exp_date = _dt.strptime(str(exp)[:8], "%Y%m%d").date()
+                            dte = (exp_date - _dt.now().date()).days
+                        except Exception:
+                            pass
                         lines.append(
-                            f"  {sym} {right}{strike} {exp}: {qty} @ ${avg:.2f} "
-                            f"| mkt ${mkt:.2f} | P&L ${pnl:+,.2f}"
+                            f"  {sym} {right}{strike} exp={exp} DTE={dte}: {qty} @ ${avg:.2f} "
+                            f"| mkt ${mkt:.2f} | P&L ${pnl:+,.2f} ({pnl_pct:+.1f}%)"
                         )
                     else:
                         lines.append(
                             f"  {sym}: {qty} shares @ ${avg:.2f} "
-                            f"| mkt ${mkt:.2f} | P&L ${pnl:+,.2f}"
+                            f"| mkt ${mkt:.2f} | P&L ${pnl:+,.2f} ({pnl_pct:+.1f}%)"
                         )
         except Exception as e:
             lines.append(f"Position query error: {e}")

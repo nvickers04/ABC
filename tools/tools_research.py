@@ -146,6 +146,8 @@ async def handle_candles(executor, params: dict) -> Any:
                 "resolution": valid_resolutions[resolution],
                 "bars": n,
                 "is_realtime": True,
+                "data_warning": None,
+                "timestamp": datetime.datetime.utcnow().strftime('%Y-%m-%dT%H:%M:%SZ'),
                 "candles": candle_list
             }
         return {"error": f"No candle data for {symbol}"}
@@ -191,6 +193,9 @@ async def handle_atr(executor, params: dict) -> Any:
             quote = executor.data_provider.get_quote(symbol)
             if quote and quote.last and quote.last > 0:
                 data["atr_pct"] = round(result.value / quote.last * 100, 2)
+            data["is_realtime"] = True
+            data["data_warning"] = None
+            data["timestamp"] = datetime.datetime.utcnow().strftime('%Y-%m-%dT%H:%M:%SZ')
             return data
         return {"error": f"No ATR data for {symbol}"}
     except Exception as e:

@@ -68,6 +68,24 @@ async def handle_buy_option(executor, params: dict) -> Any:
     result = await executor.gateway.buy_option(symbol, expiration, float(strike), right.upper(), int(quantity))
     logger.info(f"BUY OPTION RESULT: {symbol} -> {result}")
     await executor._refresh_state()
+    # In aggressive_paper mode: suggest upgrading to a spread
+    from core.config import PAPER_AGGRESSIVE
+    if PAPER_AGGRESSIVE and isinstance(result, dict) and result.get("success"):
+        r = right.upper()
+        if r == "C":
+            result["aggressive_suggestion"] = (
+                f"PAPER TEST: Consider upgrading to a vertical_spread "
+                f"(bull call spread) for defined risk. "
+                f"Use: vertical_spread symbol={symbol}, expiration={expiration}, "
+                f"long_strike={strike}, short_strike={float(strike)+5}, right=C"
+            )
+        elif r == "P":
+            result["aggressive_suggestion"] = (
+                f"PAPER TEST: Consider upgrading to a vertical_spread "
+                f"(bear put spread) for defined risk. "
+                f"Use: vertical_spread symbol={symbol}, expiration={expiration}, "
+                f"long_strike={strike}, short_strike={float(strike)-5}, right=P"
+            )
     return result
 
 
@@ -655,7 +673,10 @@ async def handle_option_chain(executor, params: dict) -> Any:
         "symbol": symbol,
         "count": len(contracts_out),
         "contracts": contracts_out,
-        "source": chain.source
+        "source": chain.source,
+        "is_realtime": True,
+        "data_warning": None,
+        "timestamp": __import__('datetime').datetime.utcnow().strftime('%Y-%m-%dT%H:%M:%SZ'),
     }
 
 

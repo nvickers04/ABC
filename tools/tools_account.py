@@ -42,20 +42,36 @@ async def handle_positions(executor, params: dict) -> Any:
         mkt = p.get("market_price", 0)
         mkt_val = p.get("market_value", 0)
         upnl = p.get("unrealized_pnl", 0)
+        sec = p.get("sec_type", "STK")
         pnl_pct = ((mkt - avg) / avg * 100) if avg > 0 and qty > 0 else (
             (avg - mkt) / avg * 100 if avg > 0 and qty < 0 else 0
         )
-        result.append({
+        entry = {
             "symbol": p.get("symbol"),
             "quantity": qty,
             "avg_cost": round(avg, 4),
-            "market_price": round(mkt, 4),
+            "current_price": round(mkt, 4),
             "market_value": round(mkt_val, 2),
             "unrealized_pnl": round(upnl, 2),
-            "pnl_pct": round(pnl_pct, 2),
+            "pct_change": round(pnl_pct, 2),
             "direction": "LONG" if qty > 0 else "SHORT",
-            "sec_type": p.get("sec_type", "STK"),
-        })
+            "sec_type": sec,
+        }
+        # Add options-specific fields
+        if sec == "OPT":
+            exp = p.get("expiration", "")
+            entry["strike"] = p.get("strike")
+            entry["right"] = p.get("right")
+            entry["expiration"] = exp
+            entry["multiplier"] = p.get("multiplier", 100)
+            # Compute DTE
+            try:
+                from datetime import datetime as _dt
+                exp_date = _dt.strptime(str(exp)[:8], "%Y%m%d").date()
+                entry["dte"] = (exp_date - _dt.now().date()).days
+            except Exception:
+                entry["dte"] = None
+        result.append(entry)
     return {"positions": result, "count": len(result)}
 
 

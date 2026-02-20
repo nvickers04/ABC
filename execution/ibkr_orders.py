@@ -577,7 +577,12 @@ class IBKROrdersMixin:
             return {'error': 'Must provide trail_amount or trail_percent'}
 
         action = 'SELL' if direction == 'LONG' else 'BUY'
-        order_attrs = {'trailingPercent': trail_percent * 100} if trail_percent else {}
+        order_attrs = {}
+        if trail_percent:
+            # Normalize: if < 1, assume decimal (0.08 = 8%); otherwise already a %
+            pct = trail_percent * 100 if trail_percent < 1 else trail_percent
+            pct = max(0.1, min(pct, 99.0))  # IBKR requires (0, 100)
+            order_attrs['trailingPercent'] = pct
 
         return await self._place_order(
             symbol, action, quantity, IBKROrderType.TRAIL.value, tif='GTC',
@@ -769,7 +774,10 @@ class IBKROrdersMixin:
         action = 'SELL' if direction == 'LONG' else 'BUY'
         order_attrs = {'lmtPriceOffset': limit_offset}
         if trail_percent:
-            order_attrs['trailingPercent'] = trail_percent * 100
+            # Normalize: if < 1, assume decimal (0.08 = 8%); otherwise already a %
+            pct = trail_percent * 100 if trail_percent < 1 else trail_percent
+            pct = max(0.1, min(pct, 99.0))  # IBKR requires (0, 100)
+            order_attrs['trailingPercent'] = pct
 
         return await self._place_order(
             symbol, action, quantity, 'TRAIL LIMIT', tif='GTC',

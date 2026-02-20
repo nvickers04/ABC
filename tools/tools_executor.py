@@ -8,7 +8,7 @@ AVAILABLE TOOLS (for agent prompt):
 
 === RESEARCH ===
 quote: {symbol} -> price, bid, ask, volume, change_pct
-market_scan: {symbols?} -> top movers from liquid watchlist (auto-injected at cycle start)
+market_scan: {symbols?} -> top movers from liquid watchlist
 candles: {symbol, days?=30, resolution?='D'} -> OHLCV data (resolution: D=daily, H=hourly, 5=5min, 15=15min, 1=1min)
 fundamentals: {symbol} -> sector, industry, market_cap, pe_ratio, earnings_date
 earnings: {symbol} -> next_earnings_date, days_until_earnings

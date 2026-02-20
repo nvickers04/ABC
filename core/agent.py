@@ -355,31 +355,11 @@ class TradingAgent:
         if self._market_snapshots:
             continuity += "RECENT SNAPSHOTS:\n" + "\n".join(self._market_snapshots[-5:]) + "\n"
 
-        # Auto-inject market scan at cycle start
-        scan_text = ""
-        try:
-            from tools.tools_scan import handle_market_scan
-            scan_result = await handle_market_scan(self.tools, {})
-            if scan_result and "movers" in scan_result:
-                movers = scan_result["movers"]
-                lines_scan = ["\n═══ MARKET SCAN (top movers) ═══"]
-                for m in movers[:20]:
-                    lines_scan.append(
-                        f"  {m['symbol']:6s} ${m['last']:<9} {m['change_pct']:+.2f}%  vol:{m['volume']:>12,}"
-                    )
-                if len(movers) > 20:
-                    lines_scan.append(f"  ... and {len(movers) - 20} more symbols scanned")
-                scan_text = "\n".join(lines_scan)
-                logger.info(f"Scan: {len(movers)} symbols, top mover: {movers[0]['symbol']} {movers[0]['change_pct']:+.2f}%")
-        except Exception as e:
-            logger.debug(f"Market scan failed: {e}")
-
         context = f"""{state_text}
-{scan_text}
 {cost_line}
 Time: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
 {continuity}
-You have account state + market scan above. Find a trade. What is your next action?"""
+You have account state above. Call market_scan() then find a trade. What is your next action?"""
 
         messages = [
             {"role": "system", "content": SYSTEM_PROMPT},

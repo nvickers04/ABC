@@ -1,10 +1,6 @@
 # ABC — TODO
 
 ## Next
-- [ ] Remove market_scan auto-injection (Grok calls it manually when needed)
-- [ ] Add position management nudge to prompt (monitor open positions, set stops/targets)
-- [ ] Add Telegram/Discord alerting for trade fills
-- [ ] Consider adding simple trade journal (append-only JSON log)
 
 ## Backlog
 - [ ] Add MarketData.app real-time streaming (currently polling)
@@ -12,6 +8,8 @@
 - [ ] Swap model to `grok-4-20` when available (change `DEFAULT_MODEL` in `core/grok_llm.py`)
 
 ## Completed
+- [x] **Remove market_scan auto-injection** — Grok now calls market_scan() manually each cycle
+- [x] **Position management nudge** — prompt instructs Grok to monitor open positions, set stops/targets
 - [x] **Super aggressive paper mode** — PAPER_AGGRESSIVE=true, 5% risk, 1.5:1 R:R, 50% confidence
 - [x] **Trade execution on FINAL_DECISION** — TRADE decisions now continue the loop and place real orders
 - [x] **First live paper trade** — BOT 28x SMCI $31C 2/20 @ $0.72 ($2,016)

@@ -14,7 +14,7 @@ Grok (ReAct Brain)  →  Tools (thin wrappers)  →  IBKR Execution
 ```
 
 - **1-minute cycles** — Grok observes state, calls tools, decides WAIT or TRADE
-- **Cash-only** — uses CashBalance / AvailableFunds, no margin, no short selling
+- **Cash-only** — uses TotalCashValue for sizing (never AvailableFunds which includes margin), no short selling
 - **MarketData.app** — real-time quotes, candles, options chains, IV, fundamentals via REST API
 - **IBKR execution** — orders placed through Interactive Brokers (paper on port 7497)
 - **temperature=0.0, seed=42** — deterministic, reproducible

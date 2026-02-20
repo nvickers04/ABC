@@ -205,7 +205,7 @@ class IBKRQueriesMixin:
             return {'error': str(e)}
 
     async def get_available_funds(self) -> float:
-        """Get available funds (cash only, no margin)."""
+        """Get available funds (WARNING: includes margin on IBKR paper — prefer cash_value for sizing)."""
         summary = await self.get_account_summary()
         return summary.get('availablefunds', 0.0)
 

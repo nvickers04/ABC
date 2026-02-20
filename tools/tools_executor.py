@@ -39,7 +39,7 @@ enter_option: {symbol, strategy, quantity?=1, dte_target?=30, delta_target?=auto
 
 === ACCOUNT STATE ===
 positions: {} -> all positions with qty, avg_cost, unrealized_pnl
-account: {} -> net_liq, available_funds, cash, pnl (CASH-ONLY, no margin)
+account: {} -> net_liq, cash_balance, pnl (CASH-ONLY — size orders from cash_balance)
 open_orders: {} -> all open orders with order_id, symbol, action, qty, type, price
 get_position: {symbol} -> single position details
 
@@ -492,39 +492,38 @@ class ToolExecutor:
         }
 
     def _check_cash(self, estimated_cost: float):
-        """Block if estimated cost exceeds available funds. Returns error dict or None.
+        """Block if estimated cost exceeds available cash. Returns error dict or None.
         
-        Uses AvailableFunds (what you can actually spend) instead of
-        TotalCashValue (which can be misleading in margin accounts).
-        CASH-ONLY: Never use BuyingPower.
+        CASH-ONLY account: Uses TotalCashValue (actual settled cash).
+        AvailableFunds on IBKR paper includes margin purchasing power,
+        which would allow buying on margin — we MUST NOT do that.
         """
         if not self.gateway:
             return None
-        # Prefer AvailableFunds over TotalCashValue
-        cash = getattr(self.gateway, 'available_funds', 0) or self.gateway.cash_value
-        try:
-            for av in self.gateway.get_cached_account_values():
-                if av.currency == 'USD':
-                    if av.tag == 'AvailableFunds':
-                        cash = float(av.value)
-                        self.gateway.available_funds = cash
-                        break
-        except Exception:
-            pass
+        # ALWAYS use TotalCashValue (actual cash) for cash-only accounts.
+        # AvailableFunds includes margin purchasing power on IBKR paper.
+        cash = self.gateway.cash_value
         if cash <= 0:
-            # Fallback to TotalCashValue if AvailableFunds not available
+            # Refresh from account values subscription
             try:
                 for av in self.gateway.get_cached_account_values():
                     if av.tag == 'TotalCashValue' and av.currency == 'USD':
                         cash = float(av.value)
+                        self.gateway.cash_value = cash
                         break
             except Exception:
                 pass
+        if cash <= 0:
+            return {
+                "error": f"INSUFFICIENT CASH: Order requires ~${estimated_cost:,.2f} "
+                         f"but cash balance is ${cash:,.2f}. "
+                         f"This is a CASH-ONLY account — no margin buying allowed."
+            }
         if estimated_cost > cash:
             return {
                 "error": f"INSUFFICIENT CASH: Order requires ~${estimated_cost:,.2f} "
-                         f"but only ${cash:,.2f} available (AvailableFunds). "
-                         f"This is a CASH-ONLY account - no margin."
+                         f"but only ${cash:,.2f} cash available. "
+                         f"This is a CASH-ONLY account — no margin buying allowed."
             }
         return None
 

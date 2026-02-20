@@ -189,7 +189,7 @@ class IBKRConnector(IBKROrdersMixin, IBKROptionsMixin, IBKRQueriesMixin):
         self.account_id: Optional[str] = None
         self.net_liquidation: float = 0.0
         self.cash_value: float = 0.0  # TotalCashValue - actual cash
-        self.available_funds: float = 0.0  # AvailableFunds - what you can actually spend (CASH ONLY)
+        self.available_funds: float = 0.0  # AvailableFunds (INCLUDES MARGIN — do NOT use for order sizing, use cash_value instead)
         self.day_trades_remaining: int = 3  # PDT tracking - updated on connect
 
         # Thread pool for blocking operations

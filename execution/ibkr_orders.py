@@ -280,6 +280,22 @@ class IBKROrdersMixin:
                 elif time_bucket in ('short_swing', 'swing'):
                     print(f"   [OK] {time_bucket} trade OK - will hold overnight (not a day trade)")
 
+            # HARD CASH GUARD — prevent margin buying in cash-only account
+            # AvailableFunds on IBKR paper includes margin; use TotalCashValue
+            total_cost = entry_price * quantity
+            if self.cash_value > 0 and direction == 'LONG' and total_cost > self.cash_value:
+                msg = (f"CASH GUARD BLOCKED: {symbol} costs ${total_cost:,.2f} "
+                       f"but only ${self.cash_value:,.2f} cash available. "
+                       f"No margin buying allowed in cash-only account.")
+                logger.error(msg)
+                return {
+                    'success': False,
+                    'filled': False,
+                    'reason': msg,
+                    'symbol': symbol,
+                    'direction': direction
+                }
+
             # STEP 1: Place entry order
             entry_order = Order()
             entry_order.action = entry_action

@@ -82,14 +82,15 @@ async def handle_account(executor, params: dict) -> Any:
     if "error" in summary:
         return summary
     cash = summary.get("totalcashvalue", 0)
-    available = summary.get("availablefunds", 0) or cash
+    net_liq = summary.get("netliquidation", 0) or summary.get("net_liquidation", 0)
     return {
-        "cash": round(cash, 2),
-        "available_funds": round(available, 2),
+        "cash_balance": round(cash, 2),
+        "net_liquidation": round(net_liq, 2),
         "daily_pnl": round(summary.get("dailypnl", 0), 2),
         "realized_pnl": round(summary.get("realizedpnl", 0), 2),
         "unrealized_pnl": round(summary.get("unrealizedpnl", 0), 2),
-        "note": "CASH-ONLY account. Use available_funds or cash for sizing — ignore margin."
+        "WARNING": "CASH-ONLY account. Size ALL stock orders using cash_balance ONLY. "
+                   "You can ONLY buy what you can afford with cash_balance. No margin."
     }
 
 

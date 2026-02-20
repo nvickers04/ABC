@@ -236,10 +236,10 @@ class TradingAgent:
             self._market_snapshots = self._market_snapshots[-5:]
 
     async def _get_cash(self) -> float:
-        """Get current cash balance from broker."""
+        """Get current cash balance from broker (TotalCashValue ONLY, never AvailableFunds)."""
         try:
             summary = await self.gateway.get_account_summary()
-            return summary.get("totalcashvalue", 0) or summary.get("availablefunds", 0) or 0
+            return summary.get("totalcashvalue", 0) or 0
         except Exception:
             return self.gateway.cash_value if self.gateway else 0
 
@@ -296,12 +296,11 @@ class TradingAgent:
         try:
             summary = await self.gateway.get_account_summary()
             cash = summary.get("totalcashvalue", 0)
-            avail = summary.get("availablefunds", 0)
             net_liq = summary.get("netliquidation", 0)
             daily_pnl = summary.get("dailypnl", "N/A")
             unreal = summary.get("unrealizedpnl", "N/A")
             real = summary.get("realizedpnl", "N/A")
-            lines.append(f"Cash: ${cash:,.2f}  |  Available: ${avail:,.2f}  |  NetLiq: ${net_liq:,.2f}")
+            lines.append(f"Cash (SIZE ORDERS FROM THIS): ${cash:,.2f}  |  NetLiq: ${net_liq:,.2f}")
             lines.append(f"Daily P&L: {daily_pnl}  |  Unrealized: {unreal}  |  Realized: {real}")
         except Exception as e:
             lines.append(f"Account query error: {e}")

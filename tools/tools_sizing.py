@@ -119,16 +119,16 @@ async def handle_calculate_size(executor, params: dict) -> Any:
         )
 
     # --- 3. Cash constraint (CASH-ONLY account — applies to BUY) ---
-    # Use available cash from gateway
-    available_funds = cash
+    # Use TotalCashValue from gateway (NEVER AvailableFunds — that includes margin)
+    available_cash_total = cash
 
     if side == 'BUY':
         # Reserve 5% cash buffer — CASH ONLY, no margin
-        available_cash = max(0, available_funds * 0.95)
+        available_cash = max(0, available_cash_total * 0.95)
         cash_shares = int(available_cash / entry_price) if entry_price > 0 else 0
         reasoning.append(
             f"Cash: {cash_shares} shares "
-            f"(${available_cash:,.0f} available funds after 5% buffer, CASH-ONLY)"
+            f"(${available_cash:,.0f} cash after 5% buffer, CASH-ONLY)"
         )
     else:
         # Check if this is a short ENTRY (no existing position) vs closing a long
@@ -141,11 +141,11 @@ async def handle_calculate_size(executor, params: dict) -> Any:
         is_short_entry = existing_pos is None or existing_pos.position > 0
         if is_short_entry:
             # Short entry requires cash collateral — treat like BUY for sizing
-            available_cash = max(0, available_funds * 0.95)
+            available_cash = max(0, available_cash_total * 0.95)
             cash_shares = int(available_cash / entry_price) if entry_price > 0 else 0
             reasoning.append(
                 f"Cash: {cash_shares} shares "
-                f"(${available_cash:,.0f} available for short collateral, CASH-ONLY)"
+                f"(${available_cash:,.0f} cash for short collateral, CASH-ONLY)"
             )
         else:
             cash_shares = 999_999  # No cash constraint for closing existing long
@@ -203,7 +203,7 @@ async def handle_calculate_size(executor, params: dict) -> Any:
         "reasoning": reasoning,
         "account": {
             "net_liq": round(net_liq, 2),
-            "available_funds": round(available_funds, 2),
+            "cash_available": round(available_cash_total, 2),
             "cash": round(cash, 2),
             "existing_exposure_in_symbol": round(existing_value, 2),
         },

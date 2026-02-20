@@ -14,6 +14,46 @@ logger = logging.getLogger(__name__)
 
 
 # =============================================================================
+# PARAM SANITIZATION — LLM sometimes sends dicts where scalars are expected
+# =============================================================================
+
+def _safe_float(val) -> float:
+    """Extract float from value, handling dict wrapping from LLM."""
+    if isinstance(val, (int, float)):
+        return float(val)
+    if isinstance(val, str):
+        return float(val)
+    if isinstance(val, dict):
+        # LLM wraps values: {"price": 148.52} or {"value": 10.5}
+        for key in ("price", "value", "amount", "stop", "target", "limit"):
+            if key in val:
+                return float(val[key])
+        # Try first numeric value in the dict
+        for v in val.values():
+            if isinstance(v, (int, float)):
+                return float(v)
+        raise ValueError(f"Cannot extract float from dict: {val}")
+    raise TypeError(f"Cannot convert {type(val).__name__} to float: {val}")
+
+
+def _safe_int(val) -> int:
+    """Extract int from value, handling dict wrapping from LLM."""
+    if isinstance(val, (int, float)):
+        return int(val)
+    if isinstance(val, str):
+        return int(float(val))
+    if isinstance(val, dict):
+        for key in ("quantity", "size", "shares", "count", "value"):
+            if key in val:
+                return int(float(val[key]))
+        for v in val.values():
+            if isinstance(v, (int, float)):
+                return int(v)
+        raise ValueError(f"Cannot extract int from dict: {val}")
+    raise TypeError(f"Cannot convert {type(val).__name__} to int: {val}")
+
+
+# =============================================================================
 # COMMON EXECUTION HELPER
 # =============================================================================
 
@@ -74,7 +114,7 @@ def _cost_price(params, key="limit_price", qty_key="quantity"):
     """Estimate cost from a price param × quantity."""
     def _est():
         p, q = params.get(key), params.get(qty_key)
-        return float(p) * int(q) if p is not None and q is not None else None
+        return _safe_float(p) * _safe_int(q) if p is not None and q is not None else None
     return _est
 
 
@@ -96,7 +136,7 @@ def _cost_smart(executor, params, price_key="limit_price"):
     """Use price param if available, else fall back to quote."""
     def _est():
         if params.get(price_key):
-            return float(params[price_key]) * int(params.get("quantity", 1))
+            return _safe_float(params[price_key]) * _safe_int(params.get("quantity", 1))
         return _cost_quote(executor, params)()
     return _est
 
@@ -109,7 +149,7 @@ async def handle_market_order(executor, params: dict) -> Any:
     return await _run_order(executor, params,
         required=["symbol", "side", "quantity"],
         invoke=lambda: executor.gateway.place_market_order(
-            params["symbol"], params["side"].upper(), int(params["quantity"])),
+            params["symbol"], params["side"].upper(), _safe_int(params["quantity"])),
         estimate_cash=_cost_quote(executor, params))
 
 
@@ -117,8 +157,8 @@ async def handle_limit_order(executor, params: dict) -> Any:
     return await _run_order(executor, params,
         required=["symbol", "side", "quantity", "limit_price"],
         invoke=lambda: executor.gateway.place_limit_order(
-            params["symbol"], params["side"].upper(), int(params["quantity"]),
-            float(params["limit_price"])),
+            params["symbol"], params["side"].upper(), _safe_int(params["quantity"]),
+            _safe_float(params["limit_price"])),
         estimate_cash=_cost_price(params, "limit_price"))
 
 
@@ -126,8 +166,8 @@ async def handle_stop_order(executor, params: dict) -> Any:
     return await _run_order(executor, params,
         required=["symbol", "side", "quantity", "stop_price"],
         invoke=lambda: executor.gateway.place_stop_order(
-            params["symbol"], params["side"].upper(), int(params["quantity"]),
-            float(params["stop_price"])),
+            params["symbol"], params["side"].upper(), _safe_int(params["quantity"]),
+            _safe_float(params["stop_price"])),
         estimate_cash=_cost_price(params, "stop_price"))
 
 
@@ -135,8 +175,8 @@ async def handle_stop_limit(executor, params: dict) -> Any:
     return await _run_order(executor, params,
         required=["symbol", "side", "quantity", "stop_price", "limit_price"],
         invoke=lambda: executor.gateway.place_stop_limit(
-            params["symbol"], params["side"].upper(), int(params["quantity"]),
-            float(params["stop_price"]), float(params["limit_price"])),
+            params["symbol"], params["side"].upper(), _safe_int(params["quantity"]),
+            _safe_float(params["stop_price"]), _safe_float(params["limit_price"])),
         estimate_cash=_cost_price(params, "limit_price"))
 
 
@@ -144,9 +184,9 @@ async def handle_trailing_stop(executor, params: dict) -> Any:
     return await _run_order(executor, params,
         required=["symbol", "quantity", "direction", "trail_percent"],
         invoke=lambda: executor.gateway.place_trailing_stop(
-            params["symbol"], int(params["quantity"]),
+            params["symbol"], _safe_int(params["quantity"]),
             params["direction"].upper(),
-            trail_percent=float(params["trail_percent"])),
+            trail_percent=_safe_float(params["trail_percent"])),
         check_side=False)
 
 
@@ -156,9 +196,9 @@ async def handle_bracket_order(executor, params: dict) -> Any:
         required=["symbol", "side", "quantity", "limit_price",
                   "stop_loss", "take_profit"],
         invoke=lambda: executor.gateway.place_bracket_order(
-            params["symbol"], int(params["quantity"]), direction,
-            float(params["limit_price"]), float(params["stop_loss"]),
-            float(params["take_profit"])),
+            params["symbol"], _safe_int(params["quantity"]), direction,
+            _safe_float(params["limit_price"]), _safe_float(params["stop_loss"]),
+            _safe_float(params["take_profit"])),
         estimate_cash=_cost_price(params, "limit_price"))
 
 
@@ -173,7 +213,7 @@ async def handle_modify_stop(executor, params: dict) -> Any:
     if not params.get("order_id") or not params.get("new_stop_price"):
         return {"error": "Required: order_id, new_stop_price"}
     return await executor.gateway.modify_stop_price(
-        int(params["order_id"]), float(params["new_stop_price"]))
+        _safe_int(params["order_id"]), _safe_float(params["new_stop_price"]))
 
 
 async def handle_oca_order(executor, params: dict) -> Any:
@@ -181,9 +221,9 @@ async def handle_oca_order(executor, params: dict) -> Any:
         required=["symbol", "quantity", "direction",
                   "stop_price", "target_price"],
         invoke=lambda: executor.gateway.place_oca(
-            params["symbol"], int(params["quantity"]),
+            params["symbol"], _safe_int(params["quantity"]),
             params["direction"].upper(),
-            float(params["stop_price"]), float(params["target_price"])),
+            _safe_float(params["stop_price"]), _safe_float(params["target_price"])),
         check_side=False)
 
 
@@ -203,7 +243,7 @@ async def handle_moc_order(executor, params: dict) -> Any:
     return await _run_order(executor, params,
         required=["symbol", "side", "quantity"],
         invoke=lambda: executor.gateway.place_market_on_close(
-            params["symbol"], params["side"].upper(), int(params["quantity"])),
+            params["symbol"], params["side"].upper(), _safe_int(params["quantity"])),
         estimate_cash=_cost_quote(executor, params))
 
 
@@ -211,8 +251,8 @@ async def handle_loc_order(executor, params: dict) -> Any:
     return await _run_order(executor, params,
         required=["symbol", "side", "quantity", "limit_price"],
         invoke=lambda: executor.gateway.place_limit_on_close(
-            params["symbol"], params["side"].upper(), int(params["quantity"]),
-            float(params["limit_price"])),
+            params["symbol"], params["side"].upper(), _safe_int(params["quantity"]),
+            _safe_float(params["limit_price"])),
         estimate_cash=_cost_price(params, "limit_price"))
 
 
@@ -220,7 +260,7 @@ async def handle_moo_order(executor, params: dict) -> Any:
     return await _run_order(executor, params,
         required=["symbol", "side", "quantity"],
         invoke=lambda: executor.gateway.place_market_on_open(
-            params["symbol"], params["side"].upper(), int(params["quantity"])),
+            params["symbol"], params["side"].upper(), _safe_int(params["quantity"])),
         estimate_cash=_cost_quote(executor, params))
 
 
@@ -228,8 +268,8 @@ async def handle_loo_order(executor, params: dict) -> Any:
     return await _run_order(executor, params,
         required=["symbol", "side", "quantity", "limit_price"],
         invoke=lambda: executor.gateway.place_limit_on_open(
-            params["symbol"], params["side"].upper(), int(params["quantity"]),
-            float(params["limit_price"])),
+            params["symbol"], params["side"].upper(), _safe_int(params["quantity"]),
+            _safe_float(params["limit_price"])),
         estimate_cash=_cost_price(params, "limit_price"))
 
 
@@ -246,13 +286,13 @@ async def handle_trailing_stop_limit(executor, params: dict) -> Any:
             and params.get("trail_percent") is None
             else None),
         invoke=lambda: executor.gateway.place_trailing_stop_limit(
-            params["symbol"], int(params["quantity"]),
+            params["symbol"], _safe_int(params["quantity"]),
             params["direction"].upper(),
-            trail_amount=(float(params["trail_amount"])
+            trail_amount=(_safe_float(params["trail_amount"])
                           if params.get("trail_amount") else None),
-            trail_percent=(float(params["trail_percent"])
+            trail_percent=(_safe_float(params["trail_percent"])
                            if params.get("trail_percent") else None),
-            limit_offset=float(params.get("limit_offset", 0.10))),
+            limit_offset=_safe_float(params.get("limit_offset", 0.10))),
         check_side=False)
 
 
@@ -260,9 +300,9 @@ async def handle_adaptive_order(executor, params: dict) -> Any:
     return await _run_order(executor, params,
         required=["symbol", "side", "quantity"],
         invoke=lambda: executor.gateway.place_adaptive(
-            params["symbol"], params["side"].upper(), int(params["quantity"]),
+            params["symbol"], params["side"].upper(), _safe_int(params["quantity"]),
             params.get("order_type", "MKT"),
-            limit_price=(float(params["limit_price"])
+            limit_price=(_safe_float(params["limit_price"])
                          if params.get("limit_price") else None),
             priority=params.get("priority", "Normal")),
         estimate_cash=_cost_smart(executor, params, "limit_price"))
@@ -272,8 +312,8 @@ async def handle_midprice_order(executor, params: dict) -> Any:
     return await _run_order(executor, params,
         required=["symbol", "side", "quantity"],
         invoke=lambda: executor.gateway.place_midprice(
-            params["symbol"], params["side"].upper(), int(params["quantity"]),
-            price_cap=(float(params["price_cap"])
+            params["symbol"], params["side"].upper(), _safe_int(params["quantity"]),
+            price_cap=(_safe_float(params["price_cap"])
                        if params.get("price_cap") else None)),
         estimate_cash=_cost_smart(executor, params, "price_cap"))
 
@@ -282,9 +322,9 @@ async def handle_relative_order(executor, params: dict) -> Any:
     return await _run_order(executor, params,
         required=["symbol", "side", "quantity"],
         invoke=lambda: executor.gateway.place_relative(
-            params["symbol"], params["side"].upper(), int(params["quantity"]),
-            offset=float(params.get("offset", 0.01)),
-            limit_price=(float(params["limit_price"])
+            params["symbol"], params["side"].upper(), _safe_int(params["quantity"]),
+            offset=_safe_float(params.get("offset", 0.01)),
+            limit_price=(_safe_float(params["limit_price"])
                          if params.get("limit_price") else None)),
         estimate_cash=_cost_smart(executor, params, "limit_price"))
 
@@ -294,8 +334,8 @@ async def handle_gtd_order(executor, params: dict) -> Any:
         required=["symbol", "side", "quantity", "limit_price",
                   "good_till_date"],
         invoke=lambda: executor.gateway.place_limit_order_gtd(
-            params["symbol"], params["side"].upper(), int(params["quantity"]),
-            float(params["limit_price"]), params["good_till_date"]),
+            params["symbol"], params["side"].upper(), _safe_int(params["quantity"]),
+            _safe_float(params["limit_price"]), params["good_till_date"]),
         estimate_cash=_cost_price(params, "limit_price"))
 
 
@@ -303,8 +343,8 @@ async def handle_fok_order(executor, params: dict) -> Any:
     return await _run_order(executor, params,
         required=["symbol", "side", "quantity", "limit_price"],
         invoke=lambda: executor.gateway.place_fill_or_kill(
-            params["symbol"], params["side"].upper(), int(params["quantity"]),
-            float(params["limit_price"])),
+            params["symbol"], params["side"].upper(), _safe_int(params["quantity"]),
+            _safe_float(params["limit_price"])),
         estimate_cash=_cost_price(params, "limit_price"))
 
 
@@ -312,8 +352,8 @@ async def handle_ioc_order(executor, params: dict) -> Any:
     return await _run_order(executor, params,
         required=["symbol", "side", "quantity", "limit_price"],
         invoke=lambda: executor.gateway.place_immediate_or_cancel(
-            params["symbol"], params["side"].upper(), int(params["quantity"]),
-            float(params["limit_price"])),
+            params["symbol"], params["side"].upper(), _safe_int(params["quantity"]),
+            _safe_float(params["limit_price"])),
         estimate_cash=_cost_price(params, "limit_price"))
 
 
@@ -325,10 +365,10 @@ async def handle_vwap_order(executor, params: dict) -> Any:
     return await _run_order(executor, params,
         required=["symbol", "side", "quantity"],
         invoke=lambda: executor.gateway.place_vwap(
-            params["symbol"], params["side"].upper(), int(params["quantity"]),
+            params["symbol"], params["side"].upper(), _safe_int(params["quantity"]),
             start_time=params.get("start_time"),
             end_time=params.get("end_time"),
-            max_pct_volume=float(params.get("max_pct_volume", 25.0))),
+            max_pct_volume=_safe_float(params.get("max_pct_volume", 25.0))),
         estimate_cash=_cost_quote(executor, params))
 
 
@@ -336,10 +376,10 @@ async def handle_twap_order(executor, params: dict) -> Any:
     return await _run_order(executor, params,
         required=["symbol", "side", "quantity"],
         invoke=lambda: executor.gateway.place_twap(
-            params["symbol"], params["side"].upper(), int(params["quantity"]),
+            params["symbol"], params["side"].upper(), _safe_int(params["quantity"]),
             start_time=params.get("start_time"),
             end_time=params.get("end_time"),
-            randomize_pct=float(params.get("randomize_pct", 55.0))),
+            randomize_pct=_safe_float(params.get("randomize_pct", 55.0))),
         estimate_cash=_cost_quote(executor, params))
 
 
@@ -349,8 +389,8 @@ async def handle_iceberg_order(executor, params: dict) -> Any:
                   "display_size", "limit_price"],
         invoke=lambda: executor.gateway.place_iceberg_order(
             params["symbol"], params["side"].upper(),
-            int(params["total_quantity"]),
-            int(params["display_size"]), float(params["limit_price"])),
+            _safe_int(params["total_quantity"]),
+            _safe_int(params["display_size"]), _safe_float(params["limit_price"])),
         estimate_cash=_cost_price(params, "limit_price", "total_quantity"))
 
 
@@ -358,7 +398,7 @@ async def handle_snap_mid_order(executor, params: dict) -> Any:
     return await _run_order(executor, params,
         required=["symbol", "side", "quantity"],
         invoke=lambda: executor.gateway.place_snap_to_midpoint(
-            params["symbol"], params["side"].upper(), int(params["quantity"])),
+            params["symbol"], params["side"].upper(), _safe_int(params["quantity"])),
         estimate_cash=_cost_quote(executor, params))
 
 

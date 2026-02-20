@@ -218,19 +218,30 @@ class TradingAgent:
         """Capture cash at session start for daily loss tracking."""
         if self._start_of_day_cash is not None:
             return
+        # Use net liquidation as the baseline (not cash — cash drops on stock buys)
+        net_liq = self.gateway.net_liquidation if self.gateway else 0
         cash = self.gateway.cash_value if self.gateway else 0
-        if cash > 0:
-            self._start_of_day_cash = cash
+        baseline = net_liq if net_liq > 0 else cash
+        if baseline > 0:
+            self._start_of_day_cash = baseline
             logger.info(
-                f"Start-of-day Cash: ${cash:,.2f} "
-                f"(loss limit: -{MAX_DAILY_LOSS_PCT}% = ${cash * MAX_DAILY_LOSS_PCT / 100:,.2f})"
+                f"Start-of-day Net Liq: ${baseline:,.2f} (cash: ${cash:,.2f}) "
+                f"(loss limit: -{MAX_DAILY_LOSS_PCT}% = ${baseline * MAX_DAILY_LOSS_PCT / 100:,.2f})"
             )
 
     def _check_daily_loss(self) -> Optional[float]:
-        """Check if daily loss limit breached. Returns loss % if breached."""
+        """Check if daily loss limit breached using NET LIQUIDATION (not cash).
+        
+        Cash drops when you buy stock but net liq stays the same — using cash
+        would trigger false emergency flattens on any stock purchase.
+        """
         if not self._start_of_day_cash or self._start_of_day_cash <= 0:
             return None
-        current = self.gateway.cash_value if self.gateway else 0
+        # Use net liquidation (includes position value), not raw cash
+        current = self.gateway.net_liquidation if self.gateway else 0
+        if current <= 0:
+            # Fallback to cash if net liq not available
+            current = self.gateway.cash_value if self.gateway else 0
         if current <= 0:
             return None
         loss_pct = (self._start_of_day_cash - current) / self._start_of_day_cash * 100

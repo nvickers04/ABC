@@ -103,6 +103,7 @@ roll_option: {symbol, old_expiration, old_strike, new_expiration, new_strike, ri
 option_chain: {symbol, expiration?='YYYY-MM-DD', side?='call'|'put', dte_min?, dte_max?, strike_min?, strike_max?, limit?=20} -> contracts with Greeks (widen DTE or omit expiration if empty)
 option_greeks: {symbol, expiration, strike, right} -> delta, gamma, theta, vega, IV for specific contract
 position_greeks: {symbol?} -> Greeks for all option positions (or filtered by symbol)
+multi_leg: {type, symbol, legs?=[{strike,right,expiration,side},...], ...} -> generic multi-leg dispatcher (debit_spread, iron_condor, calendar, etc.)
 
 === SIZING ===
 calculate_size: {symbol, side, stop_distance_pct?, risk_per_trade_pct?=1.5, max_position_pct?=20} -> recommended qty + plan_order_params
@@ -123,6 +124,8 @@ import os
 import re
 from dataclasses import dataclass, field
 from typing import Any
+
+from core.config import PAPER_AGGRESSIVE
 
 logger = logging.getLogger(__name__)
 
@@ -159,6 +162,43 @@ _REGISTRY.update(_SIZING)
 _REGISTRY.update(_INSTRUMENTS)
 _REGISTRY.update(_SCAN)
 
+
+# ── plan_order / enter_option handler wrappers ────────────────
+# These are instance methods on ToolExecutor but must live in _REGISTRY
+# so the dispatch chain can reach them like any other handler.
+
+async def _handle_plan_order(executor, params: dict) -> Any:
+    """Wrapper: unpack params dict → ToolExecutor._plan_order(**kw)."""
+    return executor._plan_order(
+        symbol=params.get("symbol", ""),
+        side=params.get("side", "BUY"),
+        quantity=int(params.get("quantity", 1)),
+        urgency=params.get("urgency", "normal"),
+        intent=params.get("intent", "entry"),
+        stop_distance_pct=params.get("stop_distance_pct"),
+        stop_type=params.get("stop_type"),
+        trail_pct=params.get("trail_pct"),
+        order_type=params.get("order_type"),
+        limit_price=params.get("limit_price"),
+    )
+
+
+async def _handle_enter_option(executor, params: dict) -> Any:
+    """Wrapper: unpack params dict → ToolExecutor._enter_option(**kw)."""
+    return executor._enter_option(
+        symbol=params.get("symbol", ""),
+        strategy=params.get("strategy", ""),
+        quantity=int(params.get("quantity", 1)),
+        dte_target=int(params.get("dte_target", 30)),
+        delta_target=params.get("delta_target"),
+        max_spread_pct=float(params.get("max_spread_pct", 15.0)),
+    )
+
+
+_REGISTRY["plan_order"] = _handle_plan_order
+_REGISTRY["enter_option"] = _handle_enter_option
+
+
 # ── Tool Aliases (common LLM misspellings) ───────────────────
 _ALIASES: dict[str, str] = {
     "options_chain": "option_chain",
@@ -187,6 +227,10 @@ _ALIASES: dict[str, str] = {
     "put_spread": "vertical_spread",
     "debit_spread": "vertical_spread",
     "credit_spread": "vertical_spread",
+    # buy/sell verbs pass through to _dispatch where params are restructured
+    # multi-leg convenience aliases
+    "spread": "multi_leg",
+    "multi_leg_order": "multi_leg",
 }
 
 # OCC symbol pattern: e.g. SMCI260220C00031000 or AAPL260321P00250000
@@ -217,7 +261,7 @@ _ORDER_ACTIONS = {
     "vertical_spread", "iron_condor", "iron_butterfly", "straddle",
     "strangle", "collar", "calendar_spread", "diagonal_spread",
     "butterfly", "ratio_spread", "jade_lizard", "close_option", "roll_option",
-    "plan_order", "enter_option",
+    "plan_order", "enter_option", "multi_leg",
 }
 
 
@@ -906,10 +950,18 @@ class ToolExecutor:
         }
 
         if strategy in ("long_call", "long_put"):
-            return self._select_single_leg(
+            result = self._select_single_leg(
                 symbol, strategy, chain, price, delta, dte_target,
                 max_spread_pct, quantity, iv_info, earnings_warning, data_snapshot
             )
+            # In aggressive mode, auto-suggest a spread upgrade for simple legs
+            if PAPER_AGGRESSIVE and isinstance(result, dict) and "error" not in result:
+                upgrade = "bull_call_spread" if strategy == "long_call" else "bear_put_spread"
+                result["aggressive_suggestion"] = (
+                    f"PAPER_AGGRESSIVE: Consider upgrading to {upgrade} to reduce cost basis "
+                    f"and test multi-leg execution. Call enter_option with strategy='{upgrade}'."
+                )
+            return result
 
         elif strategy in ("bull_call_spread", "bear_put_spread"):
             return self._select_vertical_spread(
@@ -1460,7 +1512,8 @@ class ToolExecutor:
             action = _ALIASES.get(action, action)
 
             # Basic validation: check action exists in registry
-            if action not in _REGISTRY and action not in ("wait", "think", "feedback", "done"):
+            # buy/sell pass through — _dispatch restructures their params into plan_order
+            if action not in _REGISTRY and action not in ("wait", "think", "feedback", "done", "buy", "sell"):
                 err = {"error": f"Unknown action: {action}", "valid_actions": get_valid_actions()[:25]}
                 return ToolResult(
                     action=action, data=err, success=False,

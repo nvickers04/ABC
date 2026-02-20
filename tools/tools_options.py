@@ -716,6 +716,91 @@ async def handle_position_greeks(executor, params: dict) -> Any:
     return {"positions": results, "count": len(results)}
 
 
+# =========================================================================
+# MULTI-LEG CONVENIENCE (one-call dispatch for generic spread requests)
+# =========================================================================
+
+# Map generic spread names to existing handlers + param transforms
+_MULTI_LEG_MAP = {
+    "debit_spread": "vertical_spread",
+    "credit_spread": "vertical_spread",
+    "call_spread": "vertical_spread",
+    "put_spread": "vertical_spread",
+    "bull_call_spread": "vertical_spread",
+    "bear_put_spread": "vertical_spread",
+    "bear_call_spread": "vertical_spread",
+    "bull_put_spread": "vertical_spread",
+    "iron_condor": "iron_condor",
+    "iron_butterfly": "iron_butterfly",
+    "calendar": "calendar_spread",
+    "calendar_spread": "calendar_spread",
+    "diagonal": "diagonal_spread",
+    "diagonal_spread": "diagonal_spread",
+    "straddle": "straddle",
+    "strangle": "strangle",
+    "butterfly": "butterfly",
+    "collar": "collar",
+    "jade_lizard": "jade_lizard",
+    "ratio_spread": "ratio_spread",
+}
+
+
+async def handle_multi_leg(executor, params: dict) -> Any:
+    """
+    One-call multi-leg dispatcher.
+
+    Accepts: {"type": "debit_spread", "legs": [...], ...} or just
+             {"type": "iron_condor", "symbol": ..., ...}
+
+    Maps to the correct existing handler, so Grok can use a single
+    generic action name for any multi-leg structure.
+    """
+    spread_type = (params.get("type") or params.get("strategy") or "").lower().replace(" ", "_")
+    if not spread_type:
+        return {
+            "error": "Required: type (e.g. 'debit_spread', 'iron_condor', 'calendar_spread')",
+            "valid_types": sorted(_MULTI_LEG_MAP.keys()),
+        }
+
+    handler_name = _MULTI_LEG_MAP.get(spread_type)
+    if not handler_name:
+        return {
+            "error": f"Unknown multi-leg type: '{spread_type}'",
+            "valid_types": sorted(_MULTI_LEG_MAP.keys()),
+        }
+
+    # If legs are provided, try to extract params from them
+    legs = params.get("legs")
+    if legs and isinstance(legs, list) and len(legs) >= 2:
+        # Auto-extract from legs array: [{strike, right, expiration, side}, ...]
+        symbol = params.get("symbol") or legs[0].get("symbol")
+        expiration = params.get("expiration") or legs[0].get("expiration")
+        quantity = params.get("quantity", 1)
+
+        if handler_name == "vertical_spread" and len(legs) >= 2:
+            long_leg = next((l for l in legs if l.get("side", "").upper() in ("BUY", "LONG")), legs[0])
+            short_leg = next((l for l in legs if l.get("side", "").upper() in ("SELL", "SHORT")), legs[1])
+            right = long_leg.get("right", params.get("right", "C"))
+            dispatch_params = {
+                "symbol": symbol,
+                "expiration": expiration,
+                "long_strike": long_leg.get("strike"),
+                "short_strike": short_leg.get("strike"),
+                "right": right,
+                "quantity": quantity,
+            }
+            logger.info(f"MULTI-LEG ({spread_type}): dispatching as vertical_spread {dispatch_params}")
+            return await handle_vertical_spread(executor, dispatch_params)
+
+    # Otherwise pass params directly to the target handler
+    handler = HANDLERS.get(handler_name)
+    if handler is None:
+        return {"error": f"Handler '{handler_name}' not found"}
+
+    logger.info(f"MULTI-LEG ({spread_type}): dispatching as {handler_name}")
+    return await handler(executor, params)
+
+
 HANDLERS = {
     # Single leg
     "buy_option": handle_buy_option,
@@ -740,4 +825,6 @@ HANDLERS = {
     "option_chain": handle_option_chain,
     "option_greeks": handle_option_greeks,
     "position_greeks": handle_position_greeks,
+    # Multi-leg convenience
+    "multi_leg": handle_multi_leg,
 }

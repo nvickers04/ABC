@@ -24,11 +24,28 @@ async def handle_quote(executor, params: dict) -> Any:
 
         quote = executor.data_provider.get_quote(symbol)
         if quote:
-            result = asdict(quote)
-            # Tag data source for transparency
-            src = quote.source or ''
-            result["source"] = src
-            return result
+            # Determine real-time status from source tag
+            src = (quote.source or '').lower()
+            is_realtime = 'realtime' in src or 'hybrid' in src or src.startswith('ibkr')
+            data_warning = None if is_realtime else "DELAYED DATA — prices may be 15+ minutes old. Do not use for entry timing."
+            ts = None
+            if quote.source_updated:
+                ts = datetime.datetime.utcfromtimestamp(quote.source_updated).strftime('%Y-%m-%dT%H:%M:%SZ')
+            elif quote.timestamp:
+                ts = quote.timestamp.strftime('%Y-%m-%dT%H:%M:%SZ')
+
+            return {
+                "symbol": quote.symbol,
+                "last": quote.last,
+                "bid": quote.bid,
+                "ask": quote.ask,
+                "volume": quote.volume,
+                "change_pct": quote.change_pct,
+                "is_realtime": is_realtime,
+                "data_warning": data_warning,
+                "timestamp": ts,
+                "source": quote.source,
+            }
         return {"error": f"No quote for {symbol}"}
     except Exception as e:
         return {"error": str(e)}
@@ -75,7 +92,7 @@ async def _vix_fallback(executor) -> dict:
                 "last": annualized,
                 "atr_daily": round(atr.value, 2),
                 "spy_price": round(quote.last, 2),
-                "note": "Annualized from SPY 14-day ATR. Rough proxy only.",
+                "note": "VIX unavailable — using SPY ATR as proxy.",
                 "source": "spy_atr_estimate",
             }
     except Exception:
@@ -128,6 +145,7 @@ async def handle_candles(executor, params: dict) -> Any:
                 "symbol": symbol,
                 "resolution": valid_resolutions[resolution],
                 "bars": n,
+                "is_realtime": True,
                 "candles": candle_list
             }
         return {"error": f"No candle data for {symbol}"}
@@ -358,15 +376,19 @@ async def handle_budget(executor, params: dict) -> Any:
 
 async def handle_economic_calendar(executor, params: dict) -> Any:
     """Return today's macro events + 3-day look-ahead."""
-    from data.economic_calendar import get_todays_events, get_upcoming_events
-    today_events = get_todays_events()
-    upcoming = get_upcoming_events(days=3)
-    return {
-        "today": [e.to_dict() for e in today_events],
-        "upcoming_3d": [e.to_dict() for e in upcoming],
-        "count_today": len(today_events),
-        "count_upcoming": len(upcoming),
-    }
+    try:
+        from data.economic_calendar import get_todays_events, get_upcoming_events
+        today_events = get_todays_events()
+        upcoming = get_upcoming_events(days=3)
+        return {
+            "today": [e.to_dict() for e in today_events],
+            "upcoming_3d": [e.to_dict() for e in upcoming],
+            "count_today": len(today_events),
+            "count_upcoming": len(upcoming),
+        }
+    except Exception as e:
+        logger.warning(f"economic_calendar failed: {e}")
+        return {"today": [], "upcoming_3d": [], "count_today": 0, "count_upcoming": 0, "warning": str(e)}
 
 
 HANDLERS = {

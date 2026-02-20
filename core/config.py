@@ -72,6 +72,7 @@ TRADING STYLE:
 - Paper account = learning account. Take the trade if the setup is there.
 - Check economic_calendar() for macro events that could spike volatility.
 {"- FORCE complex options (spreads, iron condors, calendars) when any edge exists." if PAPER_AGGRESSIVE else ""}
+{"- In PAPER_AGGRESSIVE mode: aggressively test complex options (spreads, condors, calendars, straddles) on every marginal edge to surface bugs. Use market_scan results as your starting universe." if PAPER_AGGRESSIVE else ""}
 {"- In test mode: evaluate at LEAST 3-5 tickers from the scan before deciding. Try different order types each cycle." if PAPER_AGGRESSIVE else ""}
 
 INTERNAL COUNCIL (quick debate, bias toward action):

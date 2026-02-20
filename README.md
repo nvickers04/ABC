@@ -13,9 +13,10 @@ Grok (ReAct Brain)  →  Tools (thin wrappers)  →  IBKR Execution
      └──────────── broker queries ←─────────────┘
 ```
 
-- **5-minute cycles** — Grok observes state, calls tools, decides WAIT or TRADE
+- **1-minute cycles** — Grok observes state, calls tools, decides WAIT or TRADE
 - **Cash-only** — uses CashBalance / AvailableFunds, no margin, no short selling
-- **Direct broker queries** — no caching layer, always fresh data from IBKR
+- **MarketData.app** — real-time quotes, candles, options chains, IV, fundamentals via REST API
+- **IBKR execution** — orders placed through Interactive Brokers (paper on port 7497)
 - **temperature=0.0, seed=42** — deterministic, reproducible
 - **Configurable risk** — `RISK_PER_TRADE` in `.env` (default 1.0% of cash)
 - **No auto-close** — Grok decides hold time (intraday, overnight, multi-day)
@@ -89,18 +90,21 @@ When `PAPER_AGGRESSIVE=true`:
 - Min R:R: **1.5:1** (vs 2:1 normal)
 - Min confidence: **50%** (vs 65% normal)
 - Forces complex options: spreads, iron condors, calendars, straddles, diagonals
+- Auto-suggests spread upgrades when simple long calls/puts are selected
 - Evaluates 3–5 setups per cycle (vs 1 normal)
 - Tests all order types: bracket, trailing stop, adaptive, midprice, VWAP
+- 42-symbol watchlist scanned every cycle
 
 ## Risk Rules
 
 - Max **RISK_PER_TRADE%** of cash balance risk per trade (default 1.0%, configurable in `.env`)
 - **Cash-only** — no margin, no short selling (use long puts for bearish views)
-- Min **3:1** reward-to-risk ratio
-- Min **75%** confidence required
+- Min **2:1** reward-to-risk ratio (1.5:1 in PAPER_AGGRESSIVE mode)
+- Min **65%** confidence required (50% in PAPER_AGGRESSIVE mode)
 - **15%** daily loss → emergency flatten
 - **$50** daily LLM cost ceiling → halt
-- WAIT 95%+ of the time — doing nothing is winning
+- Turn limit: nudge at turn 8, hard max at turn 10 per cycle
+- Rolling context summary every 5 turns to keep reasoning sharp
 
 ## Model
 

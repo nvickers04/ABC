@@ -231,6 +231,17 @@ _ALIASES: dict[str, str] = {
     # multi-leg convenience aliases
     "spread": "multi_leg",
     "multi_leg_order": "multi_leg",
+    # Common LLM action name mistakes
+    "sell_to_close": "close_option",
+    "buy_to_open": "buy_option",
+    "sell_to_open": "buy_option",
+    "close_options": "close_option",
+    "trailing_stop_order": "trailing_stop",
+    "stop_loss": "stop_order",
+    "stop_loss_order": "stop_order",
+    "modify_order": "modify_stop",
+    "cancel": "cancel_order",
+    "flatten": "flatten_limits",
 }
 
 # OCC symbol pattern: e.g. SMCI260220C00031000 or AAPL260321P00250000
@@ -383,26 +394,43 @@ class ToolExecutor:
             }
         return None
 
+    # Option tools that should never be blocked by cash-only guard
+    _OPTION_ACTIONS_SKIP_CASH_CHECK = {
+        "close_option", "roll_option", "buy_option", "covered_call",
+        "cash_secured_put", "protective_put", "vertical_spread",
+        "iron_condor", "iron_butterfly", "straddle", "strangle",
+        "collar", "calendar_spread", "diagonal_spread", "butterfly",
+        "ratio_spread", "jade_lizard", "multi_leg", "enter_option",
+        "option_chain", "option_greeks", "position_greeks",
+    }
+
     def _check_cash_only(self, side: str, symbol: str, intent: str = "entry") -> dict | None:
-        """STRICT cash-only guardrail: block any order that would create a short stock position.
+        """STRICT cash-only guardrail: block orders that would create a short STOCK position.
 
         Returns error dict if blocked, None if allowed.
         Rules:
-        - BUY side → always allowed (buying stock with cash)
-        - SELL side → only allowed if a long position exists in the symbol
-          (regardless of intent label — no naked shorts in a cash account)
+        - BUY side → always allowed
+        - SELL side → allowed if we hold a long position in the symbol
+        - OCC option symbols → allowed (option closes are not short stock)
         """
         if not self.cash_only:
             return None
         if side.upper() != "SELL":
             return None  # BUY always OK in cash-only
+
+        # If the symbol looks like an OCC option symbol, allow it —
+        # this is closing/selling an option contract, not shorting stock.
+        if _parse_occ_symbol(symbol):
+            return None
+
         # SELL is only allowed if we hold a long position in this symbol.
         # Check cached portfolio synchronously to avoid async in this guard.
+        # Match on underlying symbol so "SMCI" matches both stock and option positions.
+        _sym = (symbol or "").upper().split("_")[0]  # strip option suffixes like SMCI_C_31_20260220
         portfolio = self.gateway.get_cached_portfolio() if self.gateway else []
         for item in portfolio:
-            if (item.contract.symbol.upper() == (symbol or "").upper()
-                    and item.position > 0):
-                return None  # selling shares we own — allowed
+            if (item.contract.symbol.upper() == _sym and item.position > 0):
+                return None  # selling shares/contracts we own — allowed
         return {
             "error": f"CASH-ONLY BLOCKED: Cannot SELL {symbol} — no long position held. "
                      f"Cash accounts cannot open short stock positions. "
@@ -1597,7 +1625,10 @@ class ToolExecutor:
 
         # STRICT cash-only guardrail at dispatch level — catches direct order
         # calls (market_order, limit_order, etc.) that bypass plan_order.
-        if self.cash_only and action in self._order_actions:
+        # Skip for option-specific tools (they handle their own validation).
+        if (self.cash_only
+                and action in self._order_actions
+                and action not in self._OPTION_ACTIONS_SKIP_CASH_CHECK):
             side = params.get("side", "").upper()
             symbol = (params.get("symbol") or "").upper()
             intent = params.get("intent", "entry").lower()

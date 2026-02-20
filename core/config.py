@@ -51,8 +51,6 @@ _MODE_TEXT = _MODE_TEXTS[TRADING_MODE]
 
 # ── Risk Constants ──────────────────────────────────────────────
 CYCLE_SLEEP_SECONDS = 60        # 1-minute cycles — fast iteration for paper
-MAX_TURNS_PER_CYCLE = 50        # Safety valve only — lets agent work without forced stops
-SOFT_BUDGET_TURN = 12           # Soft hint: "wrap up soon" (no forced action)
 MAX_DAILY_LOSS_PCT = 15.0       # Emergency flatten threshold
 MAX_DAILY_LLM_COST = 50.0      # LLM cost ceiling per day
 

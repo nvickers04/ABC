@@ -29,8 +29,7 @@ from core.config import (
     SYSTEM_PROMPT,
     RISK_PER_TRADE,
     CYCLE_SLEEP_SECONDS,
-    MAX_TURNS_PER_CYCLE,
-    SOFT_BUDGET_TURN,
+
     MAX_DAILY_LOSS_PCT,
     MAX_DAILY_LLM_COST,
     LLM_TEMPERATURE,
@@ -383,25 +382,6 @@ You have account state above. Call market_scan() then find a trade. What is your
 
         while True:
             turn += 1
-
-            # Runaway safety valve (50 turns = ~5 min of API calls)
-            if turn > MAX_TURNS_PER_CYCLE:
-                logger.warning(f"Runaway safety valve ({MAX_TURNS_PER_CYCLE} turns) — ending cycle")
-                self._last_cycle_summary = f"Cycle {self._cycle_id}: ended (safety valve)"
-                self._append_snapshot(f"C{self._cycle_id}: safety-valve")
-                return CYCLE_SLEEP_SECONDS
-
-            # Soft budget hint — no forced action, just a nudge
-            if turn == SOFT_BUDGET_TURN:
-                logger.info(f"Turn {turn}: soft budget nudge")
-                messages.append({
-                    "role": "user",
-                    "content": (
-                        f"FYI: You've used {turn} turns this cycle. "
-                        "Wrap up when ready — execute your best setup or WAIT. "
-                        "No rush, but don't loop without progress."
-                    ),
-                })
 
             # Re-check daily loss every turn
             loss_pct = self._check_daily_loss()

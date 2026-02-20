@@ -99,7 +99,9 @@ async def handle_cash_secured_put(executor, params: dict) -> Any:
     cash = executor._check_cash(float(strike) * 100 * int(contracts))
     if cash:
         return cash
+    logger.info(f"CASH SECURED PUT: {symbol} strike={strike} exp={expiration} contracts={contracts}")
     result = await executor.gateway.sell_cash_secured_put(symbol, expiration, float(strike), int(contracts))
+    logger.info(f"CASH SECURED PUT RESULT: {symbol} -> {result}")
     await executor._refresh_state()
     return result
 
@@ -115,7 +117,9 @@ async def handle_protective_put(executor, params: dict) -> Any:
         return {"error": "Required: symbol, expiration ('YYYYMMDD'), strike"}
     if executor.gateway and executor.gateway.cash_value <= 0:
         return {"error": "INSUFFICIENT CASH: No available cash for protective put purchase."}
+    logger.info(f"PROTECTIVE PUT: {symbol} strike={strike} exp={expiration} shares={shares}")
     result = await executor.gateway.place_protective_put(symbol, expiration, float(strike), int(shares))
+    logger.info(f"PROTECTIVE PUT RESULT: {symbol} -> {result}")
     await executor._refresh_state()
     return result
 
@@ -208,9 +212,11 @@ async def handle_iron_butterfly(executor, params: dict) -> Any:
         return cash
     cs = float(center_strike)
     ww = float(wing_width)
+    logger.info(f"IRON BUTTERFLY: {symbol} center={cs} wing={ww} exp={expiration} qty={quantity}")
     result = await executor.gateway.place_iron_butterfly(
         symbol, expiration, cs, ww, int(quantity)
     )
+    logger.info(f"IRON BUTTERFLY RESULT: {symbol} -> {result}")
     await executor._refresh_state()
     leg_keys = [
         _make_leg_key(symbol, 'P', cs - ww, expiration),
@@ -238,7 +244,9 @@ async def handle_straddle(executor, params: dict) -> Any:
     if executor.gateway and executor.gateway.cash_value < estimated_debit:
         return {"error": f"INSUFFICIENT CASH: Straddle estimated to cost ~${estimated_debit:,.0f} but only ${executor.gateway.cash_value:,.2f} available."}
     s = float(strike)
+    logger.info(f"STRADDLE: {symbol} strike={s} exp={expiration} qty={quantity}")
     result = await executor.gateway.place_straddle(symbol, expiration, s, int(quantity))
+    logger.info(f"STRADDLE RESULT: {symbol} -> {result}")
     await executor._refresh_state()
     leg_keys = [
         _make_leg_key(symbol, 'C', s, expiration),
@@ -265,7 +273,9 @@ async def handle_strangle(executor, params: dict) -> Any:
     estimated_debit = avg_strike * 0.08 * 100 * int(quantity)
     if executor.gateway and executor.gateway.cash_value < estimated_debit:
         return {"error": f"INSUFFICIENT CASH: Strangle estimated to cost ~${estimated_debit:,.0f} but only ${executor.gateway.cash_value:,.2f} available."}
+    logger.info(f"STRANGLE: {symbol} puts={put_strike} calls={call_strike} exp={expiration} qty={quantity}")
     result = await executor.gateway.place_strangle(symbol, expiration, float(put_strike), float(call_strike), int(quantity))
+    logger.info(f"STRANGLE RESULT: {symbol} -> {result}")
     await executor._refresh_state()
     leg_keys = [
         _make_leg_key(symbol, 'P', float(put_strike), expiration),
@@ -285,7 +295,9 @@ async def handle_collar(executor, params: dict) -> Any:
     shares = params.get("shares", 100)
     if not all([symbol, expiration, put_strike, call_strike]):
         return {"error": "Required: symbol, expiration, put_strike, call_strike"}
+    logger.info(f"COLLAR: {symbol} put={put_strike} call={call_strike} exp={expiration} shares={shares}")
     result = await executor.gateway.place_collar(symbol, expiration, float(put_strike), float(call_strike), int(shares))
+    logger.info(f"COLLAR RESULT: {symbol} -> {result}")
     await executor._refresh_state()
     leg_keys = [
         _make_leg_key(symbol, 'P', float(put_strike), expiration),
@@ -312,7 +324,9 @@ async def handle_calendar_spread(executor, params: dict) -> Any:
     estimated_debit = float(strike) * 0.05 * 100 * int(quantity)
     if executor.gateway and executor.gateway.cash_value < estimated_debit:
         return {"error": f"INSUFFICIENT CASH: Calendar spread estimated to cost ~${estimated_debit:,.0f} but only ${executor.gateway.cash_value:,.2f} available."}
+    logger.info(f"CALENDAR SPREAD: {symbol} strike={strike} near={near_exp} far={far_exp} {right} qty={quantity}")
     result = await executor.gateway.place_calendar_spread(symbol, float(strike), near_exp, far_exp, right.upper(), int(quantity))
+    logger.info(f"CALENDAR SPREAD RESULT: {symbol} -> {result}")
     await executor._refresh_state()
     r = right.upper()
     s = float(strike)
@@ -344,9 +358,11 @@ async def handle_diagonal_spread(executor, params: dict) -> Any:
         cash = executor._check_cash(max_debit)
         if cash:
             return cash
+    logger.info(f"DIAGONAL SPREAD: {symbol} near={near_strike}/{near_exp} far={far_strike}/{far_exp} {right} qty={quantity}")
     result = await executor.gateway.place_diagonal_spread(
         symbol, float(near_strike), float(far_strike), near_exp, far_exp, right.upper(), int(quantity)
     )
+    logger.info(f"DIAGONAL SPREAD RESULT: {symbol} -> {result}")
     await executor._refresh_state()
     r = right.upper()
     leg_keys = [
@@ -378,10 +394,12 @@ async def handle_butterfly(executor, params: dict) -> Any:
         cash = executor._check_cash(max_debit)
         if cash:
             return cash
+    logger.info(f"BUTTERFLY: {symbol} {lower_strike}/{middle_strike}/{upper_strike} {right} exp={expiration} qty={quantity}")
     result = await executor.gateway.place_butterfly(
         symbol, expiration, float(lower_strike), float(middle_strike), float(upper_strike),
         right.upper(), int(quantity)
     )
+    logger.info(f"BUTTERFLY RESULT: {symbol} -> {result}")
     await executor._refresh_state()
     r = right.upper()
     leg_keys = [
@@ -405,10 +423,12 @@ async def handle_ratio_spread(executor, params: dict) -> Any:
     quantity = params.get("quantity", 1)
     if not all([symbol, expiration, long_strike, short_strike]):
         return {"error": "Required: symbol, expiration, long_strike, short_strike. Optional: right, ratio [long, short], quantity"}
+    logger.info(f"RATIO SPREAD: {symbol} long={long_strike} short={short_strike} {right} ratio={ratio} exp={expiration} qty={quantity}")
     result = await executor.gateway.place_ratio_spread(
         symbol, expiration, float(long_strike), float(short_strike),
         right.upper(), tuple(ratio), int(quantity)
     )
+    logger.info(f"RATIO SPREAD RESULT: {symbol} -> {result}")
     await executor._refresh_state()
     r = right.upper()
     leg_keys = [
@@ -434,10 +454,12 @@ async def handle_jade_lizard(executor, params: dict) -> Any:
     cash = executor._check_cash(max_collateral)
     if cash:
         return cash
+    logger.info(f"JADE LIZARD: {symbol} put={put_strike} calls={call_short_strike}/{call_long_strike} exp={expiration} qty={quantity}")
     result = await executor.gateway.place_jade_lizard(
         symbol, expiration, float(put_strike), float(call_short_strike), float(call_long_strike),
         int(quantity)
     )
+    logger.info(f"JADE LIZARD RESULT: {symbol} -> {result}")
     await executor._refresh_state()
     leg_keys = [
         _make_leg_key(symbol, 'P', float(put_strike), expiration),
@@ -468,10 +490,12 @@ async def handle_close_option(executor, params: dict) -> Any:
     # With no spread registry, we skip the orphan-leg warning.
     # The agent should still manage spreads carefully.
     
+    logger.info(f"CLOSE OPTION: {symbol} {right}{strike} exp={expiration} limit={limit_price}")
     result = await executor.gateway.close_option_position(
         symbol, expiration, float(strike), right.upper(),
         limit_price=float(limit_price) if limit_price else None
     )
+    logger.info(f"CLOSE OPTION RESULT: {symbol} -> {result}")
     await executor._refresh_state()
     return result
 
@@ -499,10 +523,12 @@ async def handle_roll_option(executor, params: dict) -> Any:
         new_dte = (exp_date - dt.now()).days
     except ValueError:
         new_dte = 30
+    logger.info(f"ROLL OPTION: {symbol} {right}{old_strike} {old_exp} -> {new_strike} {new_exp} qty={quantity}")
     result = await executor.gateway.roll_option_position(
         symbol, current_contract, int(quantity),
         new_strike=float(new_strike), new_dte=new_dte
     )
+    logger.info(f"ROLL OPTION RESULT: {symbol} -> {result}")
     await executor._refresh_state()
     return result
 

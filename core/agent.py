@@ -389,14 +389,24 @@ You have account state above. Call market_scan() then find a trade. What is your
                 self._append_snapshot(f"C{self._cycle_id}: WAIT (limit)")
                 return CYCLE_SLEEP_SECONDS
 
-            # Nudge for FINAL_DECISION when approaching turn limit
+            # Inject rolling context summary every 5 turns to keep LLM grounded
+            if turn > 1 and turn % 5 == 1 and cycle_actions:
+                summary_msg = (
+                    f"── CYCLE PROGRESS (turn {turn}/{MAX_TURNS_PER_CYCLE}) ──\n"
+                    f"Actions so far: {', '.join(cycle_actions[-10:])}\n"
+                    f"Decide soon — {'FINAL_DECISION required by turn ' + str(FINAL_DECISION_NUDGE_TURN) if turn < FINAL_DECISION_NUDGE_TURN else 'FINAL_DECISION overdue!'}"
+                )
+                messages.append({"role": "user", "content": summary_msg})
+
+            # Nudge HARD for FINAL_DECISION at turn limit
             if turn == FINAL_DECISION_NUDGE_TURN:
-                logger.info(f"Turn {turn}: nudging for FINAL_DECISION")
+                logger.info(f"Turn {turn}: HARD nudge for FINAL_DECISION")
                 messages.append({
                     "role": "user",
                     "content": (
-                        f"TURN {turn}/{MAX_TURNS_PER_CYCLE} — you are running out of turns. "
-                        "Issue your FINAL_DECISION NOW as JSON: "
+                        f"⚠️ TURN {turn}/{MAX_TURNS_PER_CYCLE} — DECIDE NOW.\n"
+                        "You MUST issue your FINAL_DECISION in this response. "
+                        "No more research. Pick the best setup you've seen or WAIT.\n"
                         '{"action": "FINAL_DECISION", "decision": "WAIT"|"TRADE", ...}'
                     ),
                 })
@@ -709,7 +719,8 @@ if __name__ == "__main__":
         format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
     )
     for lib in ("httpx", "httpcore", "openai", "ib_insync.wrapper",
-                "ib_insync.ib", "ib_insync.client"):
-        logging.getLogger(lib).setLevel(logging.WARNING)
+                "ib_insync.ib", "ib_insync.client", "ib_insync.decoder",
+                "ib_insync.connection", "ib_insync.flexreport", "ib_insync.order",
+                "asyncio", "nest_asyncio"):        logging.getLogger(lib).setLevel(logging.WARNING)
     print("Grok 4.20 Trader started (paper mode recommended)")
     asyncio.run(run_agent())

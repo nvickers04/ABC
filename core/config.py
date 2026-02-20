@@ -25,8 +25,8 @@ MIN_CONFIDENCE_PCT: int = _conf
 
 # ── Risk Constants ──────────────────────────────────────────────
 CYCLE_SLEEP_SECONDS = 60        # 1-minute cycles — fast iteration for paper
-MAX_TURNS_PER_CYCLE = 12        # Hard ceiling on turns per cycle (forces FINAL_DECISION)
-FINAL_DECISION_NUDGE_TURN = 8   # Nudge for FINAL_DECISION at this turn
+MAX_TURNS_PER_CYCLE = 10        # Hard ceiling on turns per cycle (forces FINAL_DECISION)
+FINAL_DECISION_NUDGE_TURN = 8   # HARD nudge for FINAL_DECISION at this turn
 MAX_DAILY_LOSS_PCT = 15.0       # Emergency flatten threshold
 MAX_DAILY_LLM_COST = 50.0      # LLM cost ceiling per day
 
@@ -64,7 +64,8 @@ POSITION MANAGEMENT:
 - Closing or adjusting an existing position counts as a valid TRADE decision.
 
 TRADING STYLE:
-- Be opportunistic. Call market_scan() every cycle to survey 30+ tickers.
+- Be opportunistic. Call market_scan() every cycle to survey 40+ tickers.
+- Sort by biggest movers. Deep-dive the top 3-5 movers with quotes, candles, ATR.
 - Look for: momentum plays, support/resistance bounces, gap fills, oversold bounces, breakouts.
 - Use ATR for stop placement, options for defined-risk directional bets.
 - Size positions using your risk limit — don't be afraid to use it.

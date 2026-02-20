@@ -844,7 +844,9 @@ class IBKRConnector(IBKROrdersMixin, IBKROptionsMixin, IBKRQueriesMixin):
                     continue
                 try:
                     await self.ib.reqCurrentTimeAsync()
-                    logger.debug("Heartbeat OK")
+                    # Re-force live data type on every heartbeat to prevent drift
+                    self.ib.reqMarketDataType(1)
+                    logger.debug("Heartbeat OK (live data enforced)")
                 except Exception as e:
                     logger.warning(f"Heartbeat failed: {e} — attempting reconnect")
                     self._connected = False
@@ -865,7 +867,7 @@ class IBKRConnector(IBKROrdersMixin, IBKROptionsMixin, IBKRQueriesMixin):
 
         Args:
             symbol: Stock symbol
-            delayed: If True, request delayed data (free). If False (default), request live data.
+            delayed: Ignored — always forces LIVE (type 1). Paper accounts get it free.
 
         Returns:
             Ticker object for accessing bid/ask/last, or None on error
@@ -877,11 +879,8 @@ class IBKRConnector(IBKROrdersMixin, IBKROptionsMixin, IBKRQueriesMixin):
             return self._tickers[symbol]
 
         try:
-            # Set market data type: 1=Live, 3=Delayed, 4=Delayed Frozen
-            if delayed:
-                self.ib.reqMarketDataType(3)  # Delayed data (free)
-            else:
-                self.ib.reqMarketDataType(1)  # Live data (requires subscription)
+            # ALWAYS force live — paper accounts have free real-time data
+            self.ib.reqMarketDataType(1)
 
             contract = Stock(symbol, 'SMART', 'USD')
             await self.ib.qualifyContractsAsync(contract)

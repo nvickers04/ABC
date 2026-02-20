@@ -6,24 +6,24 @@ from typing import Any
 
 logger = logging.getLogger(__name__)
 
-# Broad liquid watchlist: ETFs + mega-cap + sectors + momentum names (30+)
+# Broad liquid watchlist: ETFs + mega-cap + sectors + momentum names (40+)
 SCAN_SYMBOLS = [
     # Index ETFs
     "SPY", "QQQ", "IWM", "DIA",
     # Sector ETFs
-    "XLF", "XLE", "XLK", "XLV", "XBI", "ARKK",
+    "XLF", "XLE", "XLK", "XLV", "XBI", "ARKK", "XLP", "XLI",
     # Mega-cap tech
     "AAPL", "MSFT", "NVDA", "TSLA", "AMZN", "META", "GOOGL",
     # Semiconductors
-    "AMD", "SMCI", "AVGO", "MU",
+    "AMD", "SMCI", "AVGO", "MU", "MRVL",
     # Financials
     "JPM", "GS", "BAC",
     # Energy / commodities
-    "XOM", "CVX",
+    "XOM", "CVX", "SLV",
     # Volatility / hedging
     "UVXY", "GLD", "TLT",
     # Other liquid movers
-    "NFLX", "CRM", "COIN", "PLTR", "SNAP", "BABA",
+    "NFLX", "CRM", "COIN", "PLTR", "SNAP", "BABA", "UBER", "SQ", "SHOP",
 ]
 
 
@@ -41,19 +41,23 @@ async def handle_market_scan(executor, params: dict) -> Any:
     try:
         quotes = executor.data_provider.get_quotes_bulk(symbols)
         if not quotes:
-            return {"error": "No quotes returned", "symbols_tried": symbols}
+            return {"error": "No quotes returned", "symbols_tried": len(symbols)}
 
         results = []
         for sym, q in quotes.items():
-            d = asdict(q)
-            results.append({
-                "symbol": d.get("symbol", sym),
-                "last": d.get("last"),
-                "change_pct": round((d.get("change_pct") or 0) * 100, 2),
-                "volume": d.get("volume", 0),
-                "bid": d.get("bid"),
-                "ask": d.get("ask"),
-            })
+            try:
+                d = asdict(q)
+                results.append({
+                    "symbol": d.get("symbol", sym),
+                    "last": d.get("last"),
+                    "change_pct": round((d.get("change_pct") or 0) * 100, 2),
+                    "volume": d.get("volume", 0),
+                    "bid": d.get("bid"),
+                    "ask": d.get("ask"),
+                })
+            except Exception:
+                logger.debug(f"Skipping bad quote for {sym}")
+                continue
 
         # Sort by absolute change — biggest movers first
         results.sort(key=lambda r: abs(r.get("change_pct", 0)), reverse=True)

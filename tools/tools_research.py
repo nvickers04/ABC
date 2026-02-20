@@ -25,12 +25,9 @@ async def handle_quote(executor, params: dict) -> Any:
         quote = executor.data_provider.get_quote(symbol)
         if quote:
             result = asdict(quote)
-            # Tag realtime vs delayed so agent knows data quality
+            # Tag data source for transparency
             src = quote.source or ''
-            is_realtime = src.startswith('marketdata') or src.startswith('ibkr')
-            result["is_realtime"] = is_realtime
-            if not is_realtime:
-                result["data_warning"] = "DELAYED DATA — prices may be 15+ minutes old. Do not use for entry timing."
+            result["source"] = src
             return result
         return {"error": f"No quote for {symbol}"}
     except Exception as e:

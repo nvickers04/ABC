@@ -30,7 +30,7 @@ from core.config import (
     RISK_PER_TRADE,
     CYCLE_SLEEP_SECONDS,
     MAX_TURNS_PER_CYCLE,
-    FINAL_DECISION_NUDGE_TURN,
+    SOFT_BUDGET_TURN,
     MAX_DAILY_LOSS_PCT,
     MAX_DAILY_LLM_COST,
     LLM_TEMPERATURE,
@@ -384,31 +384,22 @@ You have account state above. Call market_scan() then find a trade. What is your
         while True:
             turn += 1
 
+            # Runaway safety valve (50 turns = ~5 min of API calls)
             if turn > MAX_TURNS_PER_CYCLE:
-                logger.warning(f"Turn limit ({MAX_TURNS_PER_CYCLE}) reached — forcing WAIT")
-                self._last_cycle_summary = f"Cycle {self._cycle_id}: WAIT (turn limit)"
-                self._append_snapshot(f"C{self._cycle_id}: WAIT (limit)")
+                logger.warning(f"Runaway safety valve ({MAX_TURNS_PER_CYCLE} turns) — ending cycle")
+                self._last_cycle_summary = f"Cycle {self._cycle_id}: ended (safety valve)"
+                self._append_snapshot(f"C{self._cycle_id}: safety-valve")
                 return CYCLE_SLEEP_SECONDS
 
-            # Inject rolling context summary every 5 turns to keep LLM grounded
-            if turn > 1 and turn % 5 == 1 and cycle_actions:
-                summary_msg = (
-                    f"── CYCLE PROGRESS (turn {turn}/{MAX_TURNS_PER_CYCLE}) ──\n"
-                    f"Actions so far: {', '.join(cycle_actions[-10:])}\n"
-                    f"Decide soon — {'FINAL_DECISION required by turn ' + str(FINAL_DECISION_NUDGE_TURN) if turn < FINAL_DECISION_NUDGE_TURN else 'FINAL_DECISION overdue!'}"
-                )
-                messages.append({"role": "user", "content": summary_msg})
-
-            # Nudge HARD for FINAL_DECISION at turn limit
-            if turn == FINAL_DECISION_NUDGE_TURN:
-                logger.info(f"Turn {turn}: HARD nudge for FINAL_DECISION")
+            # Soft budget hint — no forced action, just a nudge
+            if turn == SOFT_BUDGET_TURN:
+                logger.info(f"Turn {turn}: soft budget nudge")
                 messages.append({
                     "role": "user",
                     "content": (
-                        f"⚠️ TURN {turn}/{MAX_TURNS_PER_CYCLE} — DECIDE NOW.\n"
-                        "You MUST issue your FINAL_DECISION in this response. "
-                        "No more research. Pick the best setup you've seen or WAIT.\n"
-                        '{"action": "FINAL_DECISION", "decision": "WAIT"|"TRADE", ...}'
+                        f"FYI: You've used {turn} turns this cycle. "
+                        "Wrap up when ready — execute your best setup or WAIT. "
+                        "No rush, but don't loop without progress."
                     ),
                 })
 
@@ -497,15 +488,32 @@ You have account state above. Call market_scan() then find a trade. What is your
                             logger.info(f"Decision: TRADE {ticker} x{size} stop={stop} tgt={target} | {tactic}")
                             messages.append({"role": "assistant", "content": raw})
                             # Don't return — tell Grok to execute NOW
-                            messages.append({
-                                "role": "user",
-                                "content": (
+                            # Detect if this is an options trade (OCC symbol or option-related tactic)
+                            _is_option_trade = (
+                                any(kw in (tactic or "").lower() for kw in ("option", "call", "put", "spread", "condor", "straddle", "strangle", "calendar", "diagonal", "close_option", "roll"))
+                                or any(kw in (ticker or "").lower() for kw in ("c0", "p0", "260", "270"))
+                                or len(ticker) > 6  # OCC symbols are long
+                            )
+                            if _is_option_trade:
+                                _exec_hint = (
+                                    f"TRADE APPROVED for {ticker}. Now EXECUTE it immediately. "
+                                    f"For OPTIONS: use close_option (symbol, expiration, strike, right), "
+                                    f"buy_option, vertical_spread, iron_condor, or another options tool. "
+                                    f"For STOCK: use bracket_order, market_order, or limit_order. "
+                                    f"Your plan: size={size}, stop=${stop}, target=${target}. "
+                                    f"Place the order NOW — do not re-analyze."
+                                )
+                            else:
+                                _exec_hint = (
                                     f"TRADE APPROVED for {ticker}. Now EXECUTE it immediately. "
                                     f"Use bracket_order (preferred — sets entry + stop + target), "
                                     f"market_order, limit_order, or an options strategy tool. "
                                     f"Your plan: {size} shares, stop ${stop}, target ${target}. "
                                     f"Place the order NOW — do not re-analyze."
-                                ),
+                                )
+                            messages.append({
+                                "role": "user",
+                                "content": _exec_hint,
                             })
                             self._last_cycle_summary = f"Cycle {self._cycle_id}: TRADE {ticker}"
                             self._append_snapshot(f"C{self._cycle_id}: TRADE {ticker}")

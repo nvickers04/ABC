@@ -247,18 +247,68 @@ _ALIASES: dict[str, str] = {
 # OCC symbol pattern: e.g. SMCI260220C00031000 or AAPL260321P00250000
 _OCC_RE = re.compile(r'^([A-Z]{1,6})(\d{6})([CP])(\d{8})$')
 
-def _parse_occ_symbol(sym: str) -> dict | None:
-    """Parse an OCC option symbol into components, or None if not OCC."""
-    m = _OCC_RE.match((sym or "").upper().strip())
-    if not m:
+# Space/underscore-separated option format: "SMCI C31.0 20260220" or "SMCI_C_31_20260220"
+_SPACE_OPT_RE = re.compile(
+    r'^([A-Z]{1,6})\s+([CP])\s*(\d+\.?\d*)\s+(\d{8})$'
+)
+_UNDER_OPT_RE = re.compile(
+    r'^([A-Z]{1,6})_([CP])_(\d+\.?\d*)_(\d{8})$'
+)
+
+def _parse_option_symbol(sym: str) -> dict | None:
+    """Parse ANY option symbol format into components, or None.
+
+    Supports:
+      - OCC: SMCI260220C00031000
+      - Space-separated: SMCI C31.0 20260220
+      - Underscore-separated: SMCI_C_31_20260220
+    """
+    s = (sym or "").upper().strip()
+    if not s:
         return None
-    underlying, date_str, right_char, strike_raw = m.groups()
-    # date_str = YYMMDD -> YYYYMMDD
-    expiration = f"20{date_str}"
-    # strike_raw = 00031000 -> 31.0  (8 digits, last 3 are decimal)
-    strike = int(strike_raw) / 1000.0
-    right = "C" if right_char == "C" else "P"
-    return {"underlying": underlying, "expiration": expiration, "strike": strike, "right": right}
+
+    # Try OCC first
+    m = _OCC_RE.match(s)
+    if m:
+        underlying, date_str, right_char, strike_raw = m.groups()
+        return {
+            "underlying": underlying,
+            "expiration": f"20{date_str}",
+            "strike": int(strike_raw) / 1000.0,
+            "right": right_char,
+        }
+
+    # Try space-separated: "SMCI C31.0 20260220" or "SMCI C 31.0 20260220"
+    m = _SPACE_OPT_RE.match(s)
+    if not m:
+        # Also try variant with space between right and strike
+        m2 = re.match(r'^([A-Z]{1,6})\s+([CP])\s+(\d+\.?\d*)\s+(\d{8})$', s)
+        if m2:
+            m = m2
+    if m:
+        underlying, right_char, strike_str, expiration = m.groups()
+        return {
+            "underlying": underlying,
+            "expiration": expiration,
+            "strike": float(strike_str),
+            "right": right_char,
+        }
+
+    # Try underscore-separated: "SMCI_C_31_20260220"
+    m = _UNDER_OPT_RE.match(s)
+    if m:
+        underlying, right_char, strike_str, expiration = m.groups()
+        return {
+            "underlying": underlying,
+            "expiration": expiration,
+            "strike": float(strike_str),
+            "right": right_char,
+        }
+
+    return None
+
+# Backward compat alias
+_parse_occ_symbol = _parse_option_symbol
 
 # Inline order action names (replaces deleted tool_registry dependency)
 _ORDER_ACTIONS = {
@@ -1536,6 +1586,9 @@ class ToolExecutor:
     async def execute(self, action: str, params: dict) -> 'ToolResult':
         """Execute a tool and return structured ToolResult."""
         try:
+            # Normalize case — LLMs sometimes send ATR, Quote, etc.
+            action = action.strip().lower() if isinstance(action, str) else action
+
             # Resolve aliases before validation
             action = _ALIASES.get(action, action)
 
@@ -1623,6 +1676,35 @@ class ToolExecutor:
             _norm = _side_raw.upper().split("_")[0]  # BUY or SELL
             params["side"] = _norm
 
+        # ── Option symbol redirect (BEFORE cash guard) ─────────
+        # If LLM passes an option symbol (OCC, space-separated, or underscore)
+        # to a stock order tool, parse it and redirect to close_option / buy_option.
+        if action in ("limit_order", "market_order", "plan_order",
+                     "bracket_order", "stop_order", "trailing_stop",
+                     "stop_limit", "adaptive_order"):
+            _sym = (params.get("symbol") or "")
+            _occ = _parse_option_symbol(_sym)
+            if _occ:
+                # Detect side: if Grok says SELL or intent is exit/close, it's a close
+                _raw_side = (params.get("side") or "").upper()
+                _raw_intent = (params.get("intent") or "").lower()
+                _is_sell = (_raw_side == "SELL" or _raw_intent in ("exit", "close", "trim", "protect")
+                           or action in ("trailing_stop", "stop_order"))
+                qty = params.get("quantity", 1)
+                if _is_sell:
+                    logger.info(f"Option redirect: {action}({_sym}) → close_option({_occ['underlying']}, {_occ['expiration']}, {_occ['strike']}, {_occ['right']})")
+                    action = "close_option"
+                else:
+                    logger.info(f"Option redirect: {action}({_sym}) → buy_option({_occ['underlying']}, {_occ['expiration']}, {_occ['strike']}, {_occ['right']})")
+                    action = "buy_option"
+                params = {
+                    "symbol": _occ["underlying"],
+                    "expiration": _occ["expiration"],
+                    "strike": _occ["strike"],
+                    "right": _occ["right"],
+                    "quantity": int(qty),
+                }
+
         # STRICT cash-only guardrail at dispatch level — catches direct order
         # calls (market_order, limit_order, etc.) that bypass plan_order.
         # Skip for option-specific tools (they handle their own validation).
@@ -1643,35 +1725,6 @@ class ToolExecutor:
             _ev = params.get(_ek)
             if _ev:
                 params[_ek] = _normalize_expiration(str(_ev))
-
-        # ── OCC symbol redirect ─────────────────────────────────
-        # If LLM passes an OCC options symbol (e.g. SMCI260220C00031000) to a
-        # stock order tool, parse it and redirect to buy_option / close_option.
-        if action in ("limit_order", "market_order", "plan_order"):
-            _sym = (params.get("symbol") or "")
-            _occ = _parse_occ_symbol(_sym)
-            if _occ:
-                side = params.get("side", "BUY").upper().replace("_TO_OPEN", "").replace("_TO_CLOSE", "")
-                qty = params.get("quantity", 1)
-                logger.info(f"OCC redirect: {action}({_sym}) → buy_option({_occ['underlying']}, {_occ['expiration']}, {_occ['strike']}, {_occ['right']})")
-                if side == "SELL":
-                    action = "close_option"
-                    params = {
-                        "symbol": _occ["underlying"],
-                        "expiration": _occ["expiration"],
-                        "strike": _occ["strike"],
-                        "right": _occ["right"],
-                        "quantity": int(qty),
-                    }
-                else:
-                    action = "buy_option"
-                    params = {
-                        "symbol": _occ["underlying"],
-                        "expiration": _occ["expiration"],
-                        "strike": _occ["strike"],
-                        "right": _occ["right"],
-                        "quantity": int(qty),
-                    }
 
         handler = _REGISTRY.get(action)
         if handler is None:

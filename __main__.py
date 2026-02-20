@@ -48,7 +48,9 @@ def setup_logging(verbose: bool = False):
 
     # Silence noisy libraries
     for lib in ("httpx", "httpcore", "openai", "ib_insync.wrapper",
-               "ib_insync.ib", "ib_insync.client"):
+               "ib_insync.ib", "ib_insync.client", "ib_insync.decoder",
+               "ib_insync.connection", "asyncio", "urllib3", "charset_normalizer",
+               "hpack", "h2"):
         logging.getLogger(lib).setLevel(logging.WARNING)
 
 

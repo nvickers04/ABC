@@ -73,8 +73,24 @@ python __main__.py --account live
 | `IBKR_PORT` | IBKR port — 7497=paper, 7496=live |
 | `IBKR_CLIENT_ID` | Client ID (default: 1) |
 | `PAPER_MODE` | `True` (default) or `False` for live |
+| `PAPER_AGGRESSIVE` | `true` for stress-test mode (5% risk, 1.5:1 R:R, 50% confidence, forces complex options) |
 | `RISK_PER_TRADE` | % of cash balance per trade (default: 1.0) |
 | `CASH_ONLY` | `true` (default) — enforce cash-only, no shorts |
+
+## Stress Test Mode (Paper)
+
+```bash
+# Super aggressive paper mode — forces complex options orders, tests every order type
+PAPER_AGGRESSIVE=true python __main__.py
+```
+
+When `PAPER_AGGRESSIVE=true`:
+- Risk per trade: **5%** of cash (vs 1% normal)
+- Min R:R: **1.5:1** (vs 2:1 normal)
+- Min confidence: **50%** (vs 65% normal)
+- Forces complex options: spreads, iron condors, calendars, straddles, diagonals
+- Evaluates 3–5 setups per cycle (vs 1 normal)
+- Tests all order types: bracket, trailing stop, adaptive, midprice, VWAP
 
 ## Risk Rules
 

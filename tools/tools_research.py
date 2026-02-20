@@ -65,6 +65,25 @@ async def _vix_fallback(executor) -> dict:
     except Exception:
         pass
 
+    # Final fallback: estimate volatility from SPY ATR
+    try:
+        atr = executor.data_provider.get_atr("SPY", 14)
+        quote = executor.data_provider.get_quote("SPY")
+        if atr and quote and quote.last and quote.last > 0:
+            # Annualized ATR as % ≈ daily ATR% × √252 — rough VIX proxy
+            atr_pct = atr.value / quote.last
+            annualized = round(atr_pct * (252 ** 0.5) * 100, 1)
+            return {
+                "symbol": "VIX (estimated from SPY ATR)",
+                "last": annualized,
+                "atr_daily": round(atr.value, 2),
+                "spy_price": round(quote.last, 2),
+                "note": "Annualized from SPY 14-day ATR. Rough proxy only.",
+                "source": "spy_atr_estimate",
+            }
+    except Exception:
+        pass
+
     return {"error": "VIX unavailable. Use UVXY quote or SPY option IV as proxy."}
 
 
@@ -74,10 +93,21 @@ async def handle_candles(executor, params: dict) -> Any:
         return {"error": "symbol required"}
     try:
         days = int(params.get("days", 30))
-        resolution = params.get("resolution", "D")
-        valid_resolutions = {"D": "daily", "H": "hourly", "5": "5min", "15": "15min", "1": "1min"}
+        resolution = str(params.get("resolution", "D")).upper().strip()
+        # Normalize common aliases
+        _res_aliases = {
+            "DAILY": "D", "DAY": "D", "1D": "D",
+            "HOURLY": "H", "HOUR": "H", "60": "H", "1H": "H",
+            "5MIN": "5", "5M": "5",
+            "15MIN": "15", "15M": "15",
+            "1MIN": "1", "1M": "1",
+            "WEEKLY": "W", "WEEK": "W", "1W": "W",
+            "MONTHLY": "M", "MONTH": "M", "1MO": "M",
+        }
+        resolution = _res_aliases.get(resolution, resolution)
+        valid_resolutions = {"D": "daily", "H": "hourly", "5": "5min", "15": "15min", "1": "1min", "W": "weekly", "M": "monthly"}
         if resolution not in valid_resolutions:
-            return {"error": f"Invalid resolution '{resolution}'. Use: D (daily), H (hourly), 5 (5min), 15 (15min), 1 (1min)"}
+            return {"error": f"Invalid resolution '{resolution}'. Use: D (daily), H (hourly), 5 (5min), 15 (15min), 1 (1min), W (weekly), M (monthly)"}
         
         candles = executor.data_provider.get_candles(symbol, resolution=resolution, days_back=days)
         if candles and len(candles) > 0:
@@ -329,6 +359,19 @@ async def handle_budget(executor, params: dict) -> Any:
     return {"budget": summary.to_llm_string()}
 
 
+async def handle_economic_calendar(executor, params: dict) -> Any:
+    """Return today's macro events + 3-day look-ahead."""
+    from data.economic_calendar import get_todays_events, get_upcoming_events
+    today_events = get_todays_events()
+    upcoming = get_upcoming_events(days=3)
+    return {
+        "today": [e.to_dict() for e in today_events],
+        "upcoming_3d": [e.to_dict() for e in upcoming],
+        "count_today": len(today_events),
+        "count_upcoming": len(upcoming),
+    }
+
+
 HANDLERS = {
     "quote": handle_quote,
     "candles": handle_candles,
@@ -344,4 +387,5 @@ HANDLERS = {
     "peer_comparison": handle_peer_comparison,
     "market_hours": handle_market_hours,
     "budget": handle_budget,
+    "economic_calendar": handle_economic_calendar,
 }

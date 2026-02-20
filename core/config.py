@@ -11,10 +11,12 @@ _risk = float(os.getenv("RISK_PER_TRADE", "5.0" if PAPER_AGGRESSIVE else "1.0"))
 _rr = float(os.getenv("MIN_RR", "1.5" if PAPER_AGGRESSIVE else "2.0"))
 _conf = int(os.getenv("MIN_CONFIDENCE", "50" if PAPER_AGGRESSIVE else "65"))
 _MODE_TEXT = (
-    "TEST MODE — SUPER AGGRESSIVE PAPER TRADING.\n"
+    "PAPER TEST MODE — BE SUPER AGGRESSIVE. This is a stress test.\n"
     "Find every edge, even marginal ones. Test complex options orders aggressively.\n"
-    "Pursue EVERY high-volume liquid setup. Force complex options (spreads, iron condors, "
-    "calendars) when edge exists."
+    "Pursue EVERY high-volume liquid setup. Force complex options (debit/credit spreads, "
+    "iron condors, calendars, straddles, diagonals) on ANY edge.\n"
+    "Test every order type available: bracket, trailing stop, OCA, adaptive, midprice, VWAP.\n"
+    "Break things safely — this is how we find bugs before live capital."
 ) if PAPER_AGGRESSIVE else "Live mode — conservative. Only take high-conviction setups."
 
 RISK_PER_TRADE: float = _risk
@@ -23,7 +25,8 @@ MIN_CONFIDENCE_PCT: int = _conf
 
 # ── Risk Constants ──────────────────────────────────────────────
 CYCLE_SLEEP_SECONDS = 60        # 1-minute cycles — fast iteration for paper
-MAX_TURNS_PER_CYCLE = 15        # Hard ceiling on turns per cycle
+MAX_TURNS_PER_CYCLE = 12        # Hard ceiling on turns per cycle (forces FINAL_DECISION)
+FINAL_DECISION_NUDGE_TURN = 8   # Nudge for FINAL_DECISION at this turn
 MAX_DAILY_LOSS_PCT = 15.0       # Emergency flatten threshold
 MAX_DAILY_LLM_COST = 50.0      # LLM cost ceiling per day
 
@@ -66,7 +69,9 @@ TRADING STYLE:
 - Use ATR for stop placement, options for defined-risk directional bets.
 - Size positions using your risk limit — don't be afraid to use it.
 - Paper account = learning account. Take the trade if the setup is there.
+- Check economic_calendar() for macro events that could spike volatility.
 {"- FORCE complex options (spreads, iron condors, calendars) when any edge exists." if PAPER_AGGRESSIVE else ""}
+{"- In test mode: evaluate at LEAST 3-5 tickers from the scan before deciding. Try different order types each cycle." if PAPER_AGGRESSIVE else ""}
 
 INTERNAL COUNCIL (quick debate, bias toward action):
 1. Conservative Child: risk management, stop placement, position sizing.

@@ -30,6 +30,7 @@ from core.config import (
     RISK_PER_TRADE,
     CYCLE_SLEEP_SECONDS,
     MAX_TURNS_PER_CYCLE,
+    FINAL_DECISION_NUDGE_TURN,
     MAX_DAILY_LOSS_PCT,
     MAX_DAILY_LLM_COST,
     LLM_TEMPERATURE,
@@ -355,10 +356,18 @@ class TradingAgent:
         if self._market_snapshots:
             continuity += "RECENT SNAPSHOTS:\n" + "\n".join(self._market_snapshots[-5:]) + "\n"
 
+        aggressive_nudge = ""
+        if PAPER_AGGRESSIVE:
+            aggressive_nudge = (
+                "\nAGGRESSIVE TEST MODE: Evaluate at least 3-5 setups from market_scan. "
+                "Try a complex options strategy this cycle (spread, iron condor, calendar, straddle). "
+                "Test different order types (bracket, trailing stop, adaptive). Break things safely."
+            )
+
         context = f"""{state_text}
 {cost_line}
 Time: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
-{continuity}
+{continuity}{aggressive_nudge}
 You have account state above. Call market_scan() then find a trade. What is your next action?"""
 
         messages = [
@@ -375,8 +384,22 @@ You have account state above. Call market_scan() then find a trade. What is your
             turn += 1
 
             if turn > MAX_TURNS_PER_CYCLE:
-                logger.warning(f"Turn limit ({MAX_TURNS_PER_CYCLE}) reached")
-                return 0
+                logger.warning(f"Turn limit ({MAX_TURNS_PER_CYCLE}) reached — forcing WAIT")
+                self._last_cycle_summary = f"Cycle {self._cycle_id}: WAIT (turn limit)"
+                self._append_snapshot(f"C{self._cycle_id}: WAIT (limit)")
+                return CYCLE_SLEEP_SECONDS
+
+            # Nudge for FINAL_DECISION when approaching turn limit
+            if turn == FINAL_DECISION_NUDGE_TURN:
+                logger.info(f"Turn {turn}: nudging for FINAL_DECISION")
+                messages.append({
+                    "role": "user",
+                    "content": (
+                        f"TURN {turn}/{MAX_TURNS_PER_CYCLE} — you are running out of turns. "
+                        "Issue your FINAL_DECISION NOW as JSON: "
+                        '{"action": "FINAL_DECISION", "decision": "WAIT"|"TRADE", ...}'
+                    ),
+                })
 
             # Re-check daily loss every turn
             loss_pct = self._check_daily_loss()

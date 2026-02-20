@@ -545,7 +545,13 @@ class IBKRConnector(IBKROrdersMixin, IBKROptionsMixin, IBKRQueriesMixin):
 
         logger.info("Connection lost or not established, attempting reconnect...")
         self._connected = False  # Reset state
-        return await self.connect()
+        result = await self.connect()
+        if result:
+            # Re-force live data after reconnect
+            self.ib.reqMarketDataType(1)
+            logger.info("Re-forced LIVE market data type after reconnect")
+            await self._update_account_values()
+        return result
 
     async def _wait_for_fill(self, trade, timeout: float = 5.0) -> Dict[str, Any]:
         """
@@ -821,22 +827,33 @@ class IBKRConnector(IBKROrdersMixin, IBKROptionsMixin, IBKRQueriesMixin):
             logger.debug("IBKR heartbeat stopped")
 
     async def _heartbeat_loop(self):
-        """Ping broker every 60s to keep connection alive."""
+        """Ping broker every 60s to keep connection alive. Auto-reconnect on failure."""
         try:
             while True:
                 await asyncio.sleep(60)
                 if not self.connected:
-                    break
+                    logger.warning("Heartbeat: connection lost, attempting reconnect...")
+                    try:
+                        reconnected = await self.connect()
+                        if reconnected:
+                            logger.info("Heartbeat: reconnected successfully")
+                        else:
+                            logger.error("Heartbeat: reconnect failed, retrying in 60s")
+                    except Exception as e:
+                        logger.error(f"Heartbeat: reconnect error: {e}")
+                    continue
                 try:
-                    # Use reqCurrentTime — lightweight, no subscription accumulation.
-                    # reqAccountSummary creates persistent subscriptions that stack
-                    # up and hit IBKR's Error 322 limit.
                     await self.ib.reqCurrentTimeAsync()
                     logger.debug("Heartbeat OK")
                 except Exception as e:
-                    logger.warning(f"Heartbeat failed: {e}")
+                    logger.warning(f"Heartbeat failed: {e} — attempting reconnect")
                     self._connected = False
-                    break
+                    try:
+                        reconnected = await self.connect()
+                        if reconnected:
+                            logger.info("Heartbeat: reconnected after failure")
+                    except Exception as re:
+                        logger.error(f"Heartbeat: reconnect error: {re}")
         except asyncio.CancelledError:
             pass
 

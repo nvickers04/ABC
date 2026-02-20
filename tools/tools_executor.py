@@ -9,7 +9,7 @@ AVAILABLE TOOLS (for agent prompt):
 === RESEARCH ===
 quote: {symbol} -> price, bid, ask, volume, change_pct
 market_scan: {symbols?} -> top movers from liquid watchlist
-candles: {symbol, days?=30, resolution?='D'} -> OHLCV data (resolution: D=daily, H=hourly, 5=5min, 15=15min, 1=1min)
+candles: {symbol, days?=30, resolution?='D'} -> OHLCV data (resolution: D=daily, H=hourly, 5=5min, 15=15min, 1=1min, W=weekly, M=monthly)
 fundamentals: {symbol} -> sector, industry, market_cap, pe_ratio, earnings_date
 earnings: {symbol} -> next_earnings_date, days_until_earnings
 atr: {symbol, period?=14} -> ATR value and ATR as % of price (for stop calibration)
@@ -24,6 +24,7 @@ peer_comparison: {symbol} -> 20-day performance vs sector ETF
 === KNOWLEDGE ===
 market_hours: {} -> current session (premarket/regular/postmarket/closed), next transition time
 budget: {} -> LLM cost tracking, today's P&L, budget remaining
+economic_calendar: {} -> today's macro events (FOMC, NFP, CPI, etc.) + 3-day look-ahead
 
 === ORDER PLANNING ===
 plan_order: {symbol, side, quantity, urgency?='normal', intent?='entry', execute?=false,
@@ -171,6 +172,9 @@ _ALIASES: dict[str, str] = {
     "get_positions": "positions",
     "scan": "market_scan",
     "get_news": "news",
+    "econ_calendar": "economic_calendar",
+    "calendar": "economic_calendar",
+    "macro_events": "economic_calendar",
     "fundamentals_extended": "extended_fundamentals",
     "buy_stock": "market_order",
     "sell_stock": "market_order",

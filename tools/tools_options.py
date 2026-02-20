@@ -64,7 +64,9 @@ async def handle_buy_option(executor, params: dict) -> Any:
         return pdt
     if executor.gateway and executor.gateway.cash_value <= 0:
         return {"error": "INSUFFICIENT CASH: No available cash for options purchase."}
+    logger.info(f"BUY OPTION: {symbol} {right.upper()}{strike} exp={expiration} qty={quantity}")
     result = await executor.gateway.buy_option(symbol, expiration, float(strike), right.upper(), int(quantity))
+    logger.info(f"BUY OPTION RESULT: {symbol} -> {result}")
     await executor._refresh_state()
     return result
 
@@ -78,7 +80,9 @@ async def handle_covered_call(executor, params: dict) -> Any:
     shares = params.get("shares", 100)
     if not all([symbol, expiration, strike]):
         return {"error": "Required: symbol, expiration ('YYYYMMDD'), strike"}
+    logger.info(f"COVERED CALL: {symbol} strike={strike} exp={expiration} shares={shares}")
     result = await executor.gateway.place_covered_call(symbol, expiration, float(strike), int(shares))
+    logger.info(f"COVERED CALL RESULT: {symbol} -> {result}")
     await executor._refresh_state()
     return result
 
@@ -138,9 +142,11 @@ async def handle_vertical_spread(executor, params: dict) -> Any:
     cash = executor._check_cash(max_debit)
     if cash:
         return cash
+    logger.info(f"VERTICAL SPREAD: {symbol} {right.upper()} long={long_strike} short={short_strike} exp={expiration} qty={quantity}")
     result = await executor.gateway.place_vertical_spread(
         symbol, expiration, float(long_strike), float(short_strike), right.upper(), int(quantity)
     )
+    logger.info(f"VERTICAL SPREAD RESULT: {symbol} -> {result}")
     await executor._refresh_state()
     r = right.upper()
     leg_keys = [
@@ -170,9 +176,11 @@ async def handle_iron_condor(executor, params: dict) -> Any:
     cash = executor._check_cash(max_collateral)
     if cash:
         return cash
+    logger.info(f"IRON CONDOR: {symbol} puts={put_long}/{put_short} calls={call_short}/{call_long} exp={expiration} qty={quantity}")
     result = await executor.gateway.place_iron_condor(
         symbol, expiration, float(put_long), float(put_short), float(call_short), float(call_long), int(quantity)
     )
+    logger.info(f"IRON CONDOR RESULT: {symbol} -> {result}")
     await executor._refresh_state()
     leg_keys = [
         _make_leg_key(symbol, 'P', float(put_long), expiration),

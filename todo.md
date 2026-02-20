@@ -8,6 +8,7 @@
 - [ ] Swap model to `grok-4-20` when available (change `DEFAULT_MODEL` in `core/grok_llm.py`)
 
 ## Completed
+- [x] **Bulletproof + aggressive paper hardening** — VIX SPY ATR fallback, economic_calendar tool, candle resolution aliases, IBKR auto-reconnect, FINAL_DECISION nudge at turn 8, full options order logging, aggressive multi-setup mode
 - [x] **Remove market_scan auto-injection** — Grok now calls market_scan() manually each cycle
 - [x] **Position management nudge** — prompt instructs Grok to monitor open positions, set stops/targets
 - [x] **Super aggressive paper mode** — PAPER_AGGRESSIVE=true, 5% risk, 1.5:1 R:R, 50% confidence

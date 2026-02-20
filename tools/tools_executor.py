@@ -125,7 +125,7 @@ import re
 from dataclasses import dataclass, field
 from typing import Any
 
-from core.config import PAPER_AGGRESSIVE
+from core.config import TRADING_MODE, PAPER_AGGRESSIVE
 
 logger = logging.getLogger(__name__)
 
@@ -958,7 +958,7 @@ class ToolExecutor:
             if PAPER_AGGRESSIVE and isinstance(result, dict) and "error" not in result:
                 upgrade = "bull_call_spread" if strategy == "long_call" else "bear_put_spread"
                 result["aggressive_suggestion"] = (
-                    f"PAPER_AGGRESSIVE: Consider upgrading to {upgrade} to reduce cost basis "
+                    f"AGGRESSIVE_PAPER: Consider upgrading to {upgrade} to reduce cost basis "
                     f"and test multi-leg execution. Call enter_option with strategy='{upgrade}'."
                 )
             return result

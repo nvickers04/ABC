@@ -65,42 +65,48 @@ python __main__.py --verbose
 python __main__.py --account live
 ```
 
-## Environment Variables (required)
+## Environment Variables
 
 | Variable | Description |
 |----------|-------------|
 | `GROK_API_KEY` | xAI API key (or `XAI_API_KEY`) |
+| `TRADING_MODE` | **`aggressive_paper`** · **`paper`** (default) · **`live`** — controls risk, prompt, and IBKR port |
 | `IBKR_HOST` | IBKR TWS/Gateway host (default: 127.0.0.1) |
-| `IBKR_PORT` | IBKR port — 7497=paper, 7496=live |
+| `IBKR_PORT` | IBKR port — auto-set by TRADING_MODE (7497=paper, 7496=live) |
 | `IBKR_CLIENT_ID` | Client ID (default: 1) |
-| `PAPER_MODE` | `True` (default) or `False` for live |
-| `PAPER_AGGRESSIVE` | `true` for stress-test mode (5% risk, 1.5:1 R:R, 50% confidence, forces complex options) |
-| `RISK_PER_TRADE` | % of cash balance per trade (default: 1.0) |
+| `RISK_PER_TRADE` | % of cash balance per trade (override mode default) |
 | `CASH_ONLY` | `true` (default) — enforce cash-only, no shorts |
 
-## Stress Test Mode (Paper)
+## Trading Modes
+
+Set `TRADING_MODE` in `.env`:
 
 ```bash
-# Super aggressive paper mode — forces complex options orders, tests every order type
-PAPER_AGGRESSIVE=true python __main__.py
+# Normal paper trading (default)
+TRADING_MODE=paper python __main__.py
+
+# Stress-test mode — forces complex options, tests every order type
+TRADING_MODE=aggressive_paper python __main__.py
+
+# Live trading — real money, strict rules, port 7496
+TRADING_MODE=live python __main__.py
 ```
 
-When `PAPER_AGGRESSIVE=true`:
-- Risk per trade: **5%** of cash (vs 1% normal)
-- Min R:R: **1.5:1** (vs 2:1 normal)
-- Min confidence: **50%** (vs 65% normal)
-- Forces complex options: spreads, iron condors, calendars, straddles, diagonals
-- Auto-suggests spread upgrades when simple long calls/puts are selected
-- Evaluates 3–5 setups per cycle (vs 1 normal)
-- Tests all order types: bracket, trailing stop, adaptive, midprice, VWAP
-- 42-symbol watchlist scanned every cycle
+| Setting | `aggressive_paper` | `paper` | `live` |
+|---------|-------------------|---------|--------|
+| Risk/trade | 5% | 1% | 1% |
+| Min R:R | 1.5:1 | 2:1 | 2.5:1 |
+| Min confidence | 50% | 65% | 70% |
+| IBKR port | 7497 (paper) | 7497 (paper) | 7496 (live) |
+| Complex options | Forced on every edge | Normal | Conservative |
+| Auto-suggest spreads | Yes | No | No |
+| Tickers evaluated | 3–5 per cycle | 1–2 | 1 |
+| 42-symbol scan | Every cycle | Every cycle | Every cycle |
 
 ## Risk Rules
 
-- Max **RISK_PER_TRADE%** of cash balance risk per trade (default 1.0%, configurable in `.env`)
+- Max **RISK_PER_TRADE%** of cash balance per trade (mode-dependent, overridable in `.env`)
 - **Cash-only** — no margin, no short selling (use long puts for bearish views)
-- Min **2:1** reward-to-risk ratio (1.5:1 in PAPER_AGGRESSIVE mode)
-- Min **65%** confidence required (50% in PAPER_AGGRESSIVE mode)
 - **15%** daily loss → emergency flatten
 - **$50** daily LLM cost ceiling → halt
 - Turn limit: nudge at turn 8, hard max at turn 10 per cycle

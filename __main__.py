@@ -117,7 +117,9 @@ def main():
 
     os.environ["IBKR_ACCOUNT_TYPE"] = args.account
     if args.account == "live":
-        logger.warning("*** LIVE TRADING MODE ***")
+        logger.warning("*** LIVE TRADING MODE — real money ***")
+        if not os.environ.get("TRADING_MODE"):
+            os.environ["TRADING_MODE"] = "live"
 
     validate_startup()
 

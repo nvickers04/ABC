@@ -36,6 +36,7 @@ from core.config import (
     LLM_TEMPERATURE,
     LLM_SEED,
     LLM_MAX_TOKENS,
+    TRADING_MODE,
     PAPER_AGGRESSIVE,
     MIN_RR_RATIO,
     MIN_CONFIDENCE_PCT,
@@ -634,8 +635,9 @@ async def run_agent():
     logger.info("=" * 60)
     logger.info("GROK 4.20 TRADER — Pure ReAct")
     logger.info(f"Risk per trade: {RISK_PER_TRADE*100:.1f}%  |  Min R:R: {MIN_RR_RATIO}:1  |  Min conf: {MIN_CONFIDENCE_PCT}%")
+    logger.info(f"Trading mode: {TRADING_MODE}")
     if PAPER_AGGRESSIVE:
-        logger.info(">>> SUPER AGGRESSIVE PAPER MODE ACTIVE <<<")
+        logger.info(">>> AGGRESSIVE PAPER MODE — stress testing complex orders <<<")
     logger.info("=" * 60)
 
     # Connect broker

@@ -12,6 +12,45 @@ logger = logging.getLogger(__name__)
 _VIX_ALIASES = {"VIX", "^VIX", "$VIX", "VIX9D"}
 
 
+def _normalize_resolution(value: Any) -> str:
+    """Normalize resolution aliases to canonical code."""
+    raw = str(value or "D").strip().upper()
+    aliases = {
+        "DAILY": "D", "DAY": "D", "1D": "D", "D": "D",
+        "HOURLY": "H", "HOUR": "H", "60": "H", "1H": "H", "H": "H",
+        "5MIN": "5", "5M": "5", "5": "5",
+        "15MIN": "15", "15M": "15", "15": "15",
+        "1MIN": "1", "1M": "1", "1": "1",
+        "WEEKLY": "W", "WEEK": "W", "1W": "W", "W": "W",
+        "MONTHLY": "M", "MONTH": "M", "1MO": "M", "M": "M",
+    }
+    return aliases.get(raw, raw)
+
+
+def _parse_atr_period_and_resolution(params: dict) -> tuple[int, str]:
+    """Parse ATR period safely, never int()-parsing non-numeric timeframe strings."""
+    raw_period = params.get("period", 14)
+    raw_resolution = params.get("resolution")
+
+    if raw_resolution is None and isinstance(raw_period, str):
+        token = raw_period.strip()
+        if token and not token.replace(".", "", 1).isdigit():
+            raw_resolution = token
+            raw_period = 14
+
+    if raw_period is None:
+        period = 14
+    elif isinstance(raw_period, (int, float)):
+        period = int(raw_period)
+    else:
+        token = str(raw_period).strip()
+        period = int(float(token)) if token.replace(".", "", 1).isdigit() else 14
+
+    period = max(1, period)
+    resolution = _normalize_resolution(raw_resolution or "D")
+    return period, resolution
+
+
 async def handle_quote(executor, params: dict) -> Any:
     symbol = params.get("symbol")
     if not symbol:
@@ -186,13 +225,14 @@ async def handle_atr(executor, params: dict) -> Any:
     if not symbol:
         return {"error": "symbol required"}
     try:
-        period = int(params.get("period", 14))
+        period, resolution = _parse_atr_period_and_resolution(params)
         result = executor.data_provider.get_atr(symbol, period)
         if result:
             data = asdict(result)
             quote = executor.data_provider.get_quote(symbol)
             if quote and quote.last and quote.last > 0:
                 data["atr_pct"] = round(result.value / quote.last * 100, 2)
+            data["resolution"] = resolution
             data["is_realtime"] = True
             data["data_warning"] = None
             data["timestamp"] = datetime.datetime.utcnow().strftime('%Y-%m-%dT%H:%M:%SZ')

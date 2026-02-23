@@ -141,6 +141,33 @@ def _cost_smart(executor, params, price_key="limit_price"):
     return _est
 
 
+def _infer_bracket_entry_price(executor, params) -> Optional[float]:
+    """Infer bracket entry price from explicit params or live quote."""
+    explicit_price = params.get("entry_price")
+    if explicit_price is None:
+        explicit_price = params.get("limit_price")
+    if explicit_price is not None:
+        return _safe_float(explicit_price)
+
+    symbol = params.get("symbol")
+    side = str(params.get("side", "")).upper()
+    if not symbol:
+        return None
+
+    try:
+        quote = executor.data_provider.get_quote(symbol)
+    except Exception:
+        quote = None
+
+    if not quote:
+        return None
+    if side == "BUY":
+        return quote.ask or quote.last or quote.bid
+    if side == "SELL":
+        return quote.bid or quote.last or quote.ask
+    return quote.last or quote.ask or quote.bid
+
+
 # =============================================================================
 # BASIC ORDERS
 # =============================================================================
@@ -191,15 +218,33 @@ async def handle_trailing_stop(executor, params: dict) -> Any:
 
 
 async def handle_bracket_order(executor, params: dict) -> Any:
+    side = str(params.get("side", "")).upper()
+    direction = "LONG" if side == "BUY" else "SHORT"
+
+    def _validate_bracket():
+        entry = _infer_bracket_entry_price(executor, params)
+        if entry is None:
+            return {
+                "error": "Required: symbol, side, quantity, stop_loss, take_profit (and either entry_price/limit_price or live quote)"
+            }
+        return None
+
+    def _estimate_bracket_cost():
+        entry = _infer_bracket_entry_price(executor, params)
+        qty = params.get("quantity")
+        if entry is None or qty is None:
+            return None
+        return float(entry) * _safe_int(qty)
+
     direction = "LONG" if params.get("side", "").upper() == "BUY" else "SHORT"
     return await _run_order(executor, params,
-        required=["symbol", "side", "quantity", "limit_price",
-                  "stop_loss", "take_profit"],
+        required=["symbol", "side", "quantity", "stop_loss", "take_profit"],
+        extra_validate=_validate_bracket,
         invoke=lambda: executor.gateway.place_bracket_order(
             params["symbol"], _safe_int(params["quantity"]), direction,
-            _safe_float(params["limit_price"]), _safe_float(params["stop_loss"]),
+            _infer_bracket_entry_price(executor, params), _safe_float(params["stop_loss"]),
             _safe_float(params["take_profit"])),
-        estimate_cash=_cost_price(params, "limit_price"))
+        estimate_cash=_estimate_bracket_cost)
 
 
 # =============================================================================

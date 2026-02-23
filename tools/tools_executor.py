@@ -515,17 +515,54 @@ class ToolExecutor:
                 pass
         if cash <= 0:
             return {
-                "error": f"INSUFFICIENT CASH: Order requires ~${estimated_cost:,.2f} "
-                         f"but cash balance is ${cash:,.2f}. "
-                         f"This is a CASH-ONLY account — no margin buying allowed."
+                "error": f"CASH-ONLY: insufficient cash. "
+                         f"Required: ~${estimated_cost:,.2f}, Available cash: ${cash:,.2f}"
             }
         if estimated_cost > cash:
             return {
-                "error": f"INSUFFICIENT CASH: Order requires ~${estimated_cost:,.2f} "
-                         f"but only ${cash:,.2f} cash available. "
-                         f"This is a CASH-ONLY account — no margin buying allowed."
+                "error": f"CASH-ONLY: insufficient cash. "
+                         f"Required: ~${estimated_cost:,.2f}, Available cash: ${cash:,.2f}"
             }
         return None
+
+    def _standardize_tool_payload(self, result: Any) -> dict:
+        """Normalize all tool outputs to the 4.20-ready envelope shape."""
+        if isinstance(result, dict):
+            if all(k in result for k in ("success", "data", "error", "is_realtime", "data_warning")):
+                payload = dict(result)
+                payload["success"] = bool(payload.get("success"))
+                payload["error"] = str(payload["error"]) if payload.get("error") is not None else None
+                payload["is_realtime"] = bool(payload.get("is_realtime", False))
+                return payload
+
+            error_text = result.get("error")
+            success = bool(result.get("success")) if "success" in result else (error_text is None)
+            is_realtime = bool(result.get("is_realtime", False))
+            data_warning = result.get("data_warning")
+
+            if "data" in result:
+                data = result.get("data")
+            elif error_text is None:
+                data = result
+            else:
+                extra = {k: v for k, v in result.items() if k not in {"error", "success", "is_realtime", "data_warning"}}
+                data = extra if extra else None
+
+            return {
+                "success": success,
+                "data": data,
+                "error": str(error_text) if error_text is not None else None,
+                "is_realtime": is_realtime,
+                "data_warning": data_warning,
+            }
+
+        return {
+            "success": True,
+            "data": result,
+            "error": None,
+            "is_realtime": False,
+            "data_warning": None,
+        }
 
     def _plan_order(
         self,
@@ -1613,20 +1650,28 @@ class ToolExecutor:
                 )
 
             result = await self._dispatch(action, params)
+            payload = self._standardize_tool_payload(result)
 
             return ToolResult(
                 action=action,
-                data=result,
-                success='error' not in (result if isinstance(result, dict) else {}),
-                raw_json=json.dumps(result, indent=2, default=str),
+                data=payload,
+                success=bool(payload.get("success")),
+                raw_json=json.dumps(payload, indent=2, default=str),
             )
         except Exception as e:
             logger.error(f"Tool error: {action} - {e}")
+            payload = {
+                "success": False,
+                "data": None,
+                "error": str(e),
+                "is_realtime": False,
+                "data_warning": None,
+            }
             return ToolResult(
                 action=action,
-                data={"error": str(e)},
+                data=payload,
                 success=False,
-                raw_json=json.dumps({"error": str(e)}),
+                raw_json=json.dumps(payload),
             )
 
     async def _dispatch(self, action: str, params: dict) -> Any:

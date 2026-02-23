@@ -116,3 +116,14 @@ TRADING_MODE=live python __main__.py
 
 Currently using `grok-4-1-fast-reasoning` via xAI's OpenAI-compatible API.  
 Change `DEFAULT_MODEL` in `core/grok_llm.py` when Grok 4.20 is available.
+
+## Tools: 4.20-ready
+
+Tool interfaces are now normalized for Grok 4.20 usage:
+
+- ATR accepts string resolutions (for example `daily`, `D`, `5`) without failing on `int()` parsing.
+- `bracket_order` accepts `stop_loss` + `take_profit` (entry price inferred from explicit input or live quote).
+- Options tools normalize rights/side aliases (`C`/`CALL`, `P`/`PUT`) internally.
+- Options pre-validation checks expiration/strike existence before IBKR placement and returns clean contract-not-found errors.
+- Tool outputs are standardized to: `success`, `data`, `error`, `is_realtime`, `data_warning`.
+- Cash-only order failures return explicit `CASH-ONLY: insufficient cash` with available cash shown.

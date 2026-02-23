@@ -31,6 +31,71 @@ def _normalize_expiration(exp: str) -> str:
     return exp
 
 
+def _hyphenate_expiration(exp: str) -> str:
+    """Convert YYYYMMDD to YYYY-MM-DD for MarketData chain lookups."""
+    normalized = _normalize_expiration(exp)
+    if len(normalized) == 8 and normalized.isdigit():
+        return f"{normalized[:4]}-{normalized[4:6]}-{normalized[6:8]}"
+    return normalized
+
+
+def _normalize_option_right(right: Any) -> str | None:
+    """Accept C/CALL and P/PUT; normalize to C/P."""
+    token = str(right or "").strip().upper()
+    if token in ("C", "CALL"):
+        return "C"
+    if token in ("P", "PUT"):
+        return "P"
+    return None
+
+
+def _normalize_chain_side(side: Any) -> str | None:
+    """Normalize options side aliases to call/put."""
+    token = str(side or "").strip().upper()
+    if token in ("C", "CALL"):
+        return "call"
+    if token in ("P", "PUT"):
+        return "put"
+    return None
+
+
+def _format_strike_label(strike: Any) -> str:
+    try:
+        return f"{float(strike):g}"
+    except Exception:
+        return str(strike)
+
+
+def _cash_only_insufficient_msg(available_cash: float, required_cash: float | None = None) -> str:
+    base = f"CASH-ONLY: insufficient cash. Available cash: ${available_cash:,.2f}"
+    if required_cash is None:
+        return base
+    return f"{base}, required: ~${required_cash:,.2f}"
+
+
+def _option_contract_exists(executor, symbol: str, expiration: str, strike: float, right: str) -> bool:
+    """Pre-validate contract existence before IBKR order call."""
+    side = "call" if right == "C" else "put"
+    chain = executor.data_provider.get_option_chain(
+        symbol.upper(),
+        expiration=_hyphenate_expiration(expiration),
+        side=side,
+    )
+    if not chain or not chain.contracts:
+        return False
+
+    normalized_exp = _normalize_expiration(expiration)
+    target_strike = float(strike)
+    for contract in chain.contracts:
+        if _normalize_expiration(contract.expiration) != normalized_exp:
+            continue
+        if contract.side != side:
+            continue
+        if abs(float(contract.strike) - target_strike) < 0.01:
+            return True
+    return False
+
+
 def _make_leg_key(symbol: str, right: str, strike: float, expiration: str) -> str:
     """Build a position key matching IBKR callback format: SYMBOL_RIGHT_STRIKE_EXPIRY."""
     return f"{symbol}_{right}_{strike}_{expiration}"
@@ -52,26 +117,31 @@ def _register_spread_if_success(result: dict, underlying: str, strategy: str,
 async def handle_buy_option(executor, params: dict) -> Any:
     if not executor.gateway:
         return {"error": "broker not connected"}
-    symbol = params.get("symbol")
-    expiration = params.get("expiration")
+    symbol = str(params.get("symbol") or "").upper()
+    expiration = _normalize_expiration(params.get("expiration"))
     strike = params.get("strike")
-    right = params.get("right")
+    right = _normalize_option_right(params.get("right"))
     quantity = params.get("quantity", 1)
     if not all([symbol, expiration, strike, right]):
-        return {"error": "Required: symbol, expiration ('YYYYMMDD'), strike, right ('C'/'P')"}
+        return {"error": "Required: symbol, expiration ('YYYYMMDD'), strike, right ('C'/'CALL'/'P'/'PUT')"}
     pdt = executor._check_pdt('BUY')
     if pdt:
         return pdt
-    if executor.gateway and executor.gateway.cash_value <= 0:
-        return {"error": "INSUFFICIENT CASH: No available cash for options purchase."}
-    logger.info(f"BUY OPTION: {symbol} {right.upper()}{strike} exp={expiration} qty={quantity}")
-    result = await executor.gateway.buy_option(symbol, expiration, float(strike), right.upper(), int(quantity))
+    available_cash = executor.gateway.cash_value if executor.gateway else 0.0
+    if available_cash <= 0:
+        return {"error": _cash_only_insufficient_msg(available_cash)}
+
+    if not _option_contract_exists(executor, symbol, expiration, float(strike), right):
+        return {"error": f"Contract not found for {symbol} {_format_strike_label(strike)}{right} {expiration}"}
+
+    logger.info(f"BUY OPTION: {symbol} {right}{strike} exp={expiration} qty={quantity}")
+    result = await executor.gateway.buy_option(symbol, expiration, float(strike), right, int(quantity))
     logger.info(f"BUY OPTION RESULT: {symbol} -> {result}")
     await executor._refresh_state()
     # In aggressive_paper mode: suggest upgrading to a spread
     from core.config import PAPER_AGGRESSIVE
     if PAPER_AGGRESSIVE and isinstance(result, dict) and result.get("success"):
-        r = right.upper()
+        r = right
         if r == "C":
             result["aggressive_suggestion"] = (
                 f"PAPER TEST: Consider upgrading to a vertical_spread "
@@ -134,7 +204,7 @@ async def handle_protective_put(executor, params: dict) -> Any:
     if not all([symbol, expiration, strike]):
         return {"error": "Required: symbol, expiration ('YYYYMMDD'), strike"}
     if executor.gateway and executor.gateway.cash_value <= 0:
-        return {"error": "INSUFFICIENT CASH: No available cash for protective put purchase."}
+        return {"error": _cash_only_insufficient_msg(executor.gateway.cash_value)}
     logger.info(f"PROTECTIVE PUT: {symbol} strike={strike} exp={expiration} shares={shares}")
     result = await executor.gateway.place_protective_put(symbol, expiration, float(strike), int(shares))
     logger.info(f"PROTECTIVE PUT RESULT: {symbol} -> {result}")
@@ -153,7 +223,7 @@ async def handle_vertical_spread(executor, params: dict) -> Any:
     expiration = params.get("expiration")
     long_strike = params.get("long_strike")
     short_strike = params.get("short_strike")
-    right = params.get("right")
+    right = _normalize_option_right(params.get("right"))
     quantity = params.get("quantity", 1)
     if not all([symbol, expiration, long_strike, short_strike, right]):
         return {"error": "Required: symbol, expiration, long_strike, short_strike, right ('C'/'P')"}
@@ -164,13 +234,13 @@ async def handle_vertical_spread(executor, params: dict) -> Any:
     cash = executor._check_cash(max_debit)
     if cash:
         return cash
-    logger.info(f"VERTICAL SPREAD: {symbol} {right.upper()} long={long_strike} short={short_strike} exp={expiration} qty={quantity}")
+    logger.info(f"VERTICAL SPREAD: {symbol} {right} long={long_strike} short={short_strike} exp={expiration} qty={quantity}")
     result = await executor.gateway.place_vertical_spread(
-        symbol, expiration, float(long_strike), float(short_strike), right.upper(), int(quantity)
+        symbol, expiration, float(long_strike), float(short_strike), right, int(quantity)
     )
     logger.info(f"VERTICAL SPREAD RESULT: {symbol} -> {result}")
     await executor._refresh_state()
-    r = right.upper()
+    r = right
     leg_keys = [
         _make_leg_key(symbol, r, float(long_strike), expiration),
         _make_leg_key(symbol, r, float(short_strike), expiration),
@@ -260,7 +330,7 @@ async def handle_straddle(executor, params: dict) -> Any:
         return pdt
     estimated_debit = float(strike) * 0.10 * 100 * int(quantity)
     if executor.gateway and executor.gateway.cash_value < estimated_debit:
-        return {"error": f"INSUFFICIENT CASH: Straddle estimated to cost ~${estimated_debit:,.0f} but only ${executor.gateway.cash_value:,.2f} available."}
+        return {"error": _cash_only_insufficient_msg(executor.gateway.cash_value, estimated_debit)}
     s = float(strike)
     logger.info(f"STRADDLE: {symbol} strike={s} exp={expiration} qty={quantity}")
     result = await executor.gateway.place_straddle(symbol, expiration, s, int(quantity))
@@ -290,7 +360,7 @@ async def handle_strangle(executor, params: dict) -> Any:
     avg_strike = (float(put_strike) + float(call_strike)) / 2
     estimated_debit = avg_strike * 0.08 * 100 * int(quantity)
     if executor.gateway and executor.gateway.cash_value < estimated_debit:
-        return {"error": f"INSUFFICIENT CASH: Strangle estimated to cost ~${estimated_debit:,.0f} but only ${executor.gateway.cash_value:,.2f} available."}
+        return {"error": _cash_only_insufficient_msg(executor.gateway.cash_value, estimated_debit)}
     logger.info(f"STRANGLE: {symbol} puts={put_strike} calls={call_strike} exp={expiration} qty={quantity}")
     result = await executor.gateway.place_strangle(symbol, expiration, float(put_strike), float(call_strike), int(quantity))
     logger.info(f"STRANGLE RESULT: {symbol} -> {result}")
@@ -332,7 +402,7 @@ async def handle_calendar_spread(executor, params: dict) -> Any:
     strike = params.get("strike")
     near_exp = params.get("near_expiration")
     far_exp = params.get("far_expiration")
-    right = params.get("right", "C")
+    right = _normalize_option_right(params.get("right", "C"))
     quantity = params.get("quantity", 1)
     if not all([symbol, strike, near_exp, far_exp]):
         return {"error": "Required: symbol, strike, near_expiration, far_expiration"}
@@ -341,12 +411,12 @@ async def handle_calendar_spread(executor, params: dict) -> Any:
         return pdt
     estimated_debit = float(strike) * 0.05 * 100 * int(quantity)
     if executor.gateway and executor.gateway.cash_value < estimated_debit:
-        return {"error": f"INSUFFICIENT CASH: Calendar spread estimated to cost ~${estimated_debit:,.0f} but only ${executor.gateway.cash_value:,.2f} available."}
+        return {"error": _cash_only_insufficient_msg(executor.gateway.cash_value, estimated_debit)}
     logger.info(f"CALENDAR SPREAD: {symbol} strike={strike} near={near_exp} far={far_exp} {right} qty={quantity}")
-    result = await executor.gateway.place_calendar_spread(symbol, float(strike), near_exp, far_exp, right.upper(), int(quantity))
+    result = await executor.gateway.place_calendar_spread(symbol, float(strike), near_exp, far_exp, right, int(quantity))
     logger.info(f"CALENDAR SPREAD RESULT: {symbol} -> {result}")
     await executor._refresh_state()
-    r = right.upper()
+    r = right
     s = float(strike)
     leg_keys = [
         _make_leg_key(symbol, r, s, near_exp),
@@ -364,7 +434,7 @@ async def handle_diagonal_spread(executor, params: dict) -> Any:
     far_strike = params.get("far_strike")
     near_exp = params.get("near_expiration")
     far_exp = params.get("far_expiration")
-    right = params.get("right", "C")
+    right = _normalize_option_right(params.get("right", "C"))
     quantity = params.get("quantity", 1)
     if not all([symbol, near_strike, far_strike, near_exp, far_exp]):
         return {"error": "Required: symbol, near_strike, far_strike, near_expiration, far_expiration"}
@@ -378,11 +448,11 @@ async def handle_diagonal_spread(executor, params: dict) -> Any:
             return cash
     logger.info(f"DIAGONAL SPREAD: {symbol} near={near_strike}/{near_exp} far={far_strike}/{far_exp} {right} qty={quantity}")
     result = await executor.gateway.place_diagonal_spread(
-        symbol, float(near_strike), float(far_strike), near_exp, far_exp, right.upper(), int(quantity)
+        symbol, float(near_strike), float(far_strike), near_exp, far_exp, right, int(quantity)
     )
     logger.info(f"DIAGONAL SPREAD RESULT: {symbol} -> {result}")
     await executor._refresh_state()
-    r = right.upper()
+    r = right
     leg_keys = [
         _make_leg_key(symbol, r, float(near_strike), near_exp),
         _make_leg_key(symbol, r, float(far_strike), far_exp),
@@ -399,7 +469,7 @@ async def handle_butterfly(executor, params: dict) -> Any:
     lower_strike = params.get("lower_strike")
     middle_strike = params.get("middle_strike")
     upper_strike = params.get("upper_strike")
-    right = params.get("right", "C")
+    right = _normalize_option_right(params.get("right", "C"))
     quantity = params.get("quantity", 1)
     if not all([symbol, expiration, lower_strike, middle_strike, upper_strike]):
         return {"error": "Required: symbol, expiration, lower_strike, middle_strike, upper_strike. Optional: right ('C'/'P'), quantity"}
@@ -415,11 +485,11 @@ async def handle_butterfly(executor, params: dict) -> Any:
     logger.info(f"BUTTERFLY: {symbol} {lower_strike}/{middle_strike}/{upper_strike} {right} exp={expiration} qty={quantity}")
     result = await executor.gateway.place_butterfly(
         symbol, expiration, float(lower_strike), float(middle_strike), float(upper_strike),
-        right.upper(), int(quantity)
+        right, int(quantity)
     )
     logger.info(f"BUTTERFLY RESULT: {symbol} -> {result}")
     await executor._refresh_state()
-    r = right.upper()
+    r = right
     leg_keys = [
         _make_leg_key(symbol, r, float(lower_strike), expiration),
         _make_leg_key(symbol, r, float(middle_strike), expiration),
@@ -436,7 +506,7 @@ async def handle_ratio_spread(executor, params: dict) -> Any:
     expiration = params.get("expiration")
     long_strike = params.get("long_strike")
     short_strike = params.get("short_strike")
-    right = params.get("right", "C")
+    right = _normalize_option_right(params.get("right", "C"))
     ratio = params.get("ratio", [1, 2])
     quantity = params.get("quantity", 1)
     if not all([symbol, expiration, long_strike, short_strike]):
@@ -444,11 +514,11 @@ async def handle_ratio_spread(executor, params: dict) -> Any:
     logger.info(f"RATIO SPREAD: {symbol} long={long_strike} short={short_strike} {right} ratio={ratio} exp={expiration} qty={quantity}")
     result = await executor.gateway.place_ratio_spread(
         symbol, expiration, float(long_strike), float(short_strike),
-        right.upper(), tuple(ratio), int(quantity)
+        right, tuple(ratio), int(quantity)
     )
     logger.info(f"RATIO SPREAD RESULT: {symbol} -> {result}")
     await executor._refresh_state()
-    r = right.upper()
+    r = right
     leg_keys = [
         _make_leg_key(symbol, r, float(long_strike), expiration),
         _make_leg_key(symbol, r, float(short_strike), expiration),
@@ -498,7 +568,7 @@ async def handle_close_option(executor, params: dict) -> Any:
     symbol = params.get("symbol")
     expiration = params.get("expiration")
     strike = params.get("strike")
-    right = params.get("right")
+    right = _normalize_option_right(params.get("right"))
     limit_price = params.get("limit_price")
     force = params.get("force", False)
     if not all([symbol, expiration, strike, right]):
@@ -526,7 +596,7 @@ async def handle_roll_option(executor, params: dict) -> Any:
     old_strike = params.get("old_strike")
     new_exp = params.get("new_expiration")
     new_strike = params.get("new_strike")
-    right = params.get("right")
+    right = _normalize_option_right(params.get("right"))
     quantity = params.get("quantity", 1)
     if not all([symbol, old_exp, old_strike, new_exp, new_strike, right]):
         return {"error": "Required: symbol, old_expiration, old_strike, new_expiration, new_strike, right"}
@@ -580,15 +650,12 @@ async def handle_option_chain(executor, params: dict) -> Any:
             return {"error": f"Invalid expiration format '{expiration}'. Use YYYYMMDD or YYYY-MM-DD."}
     
     # --- Normalize side: C/P -> call/put ---
-    side = params.get("side")
+    side = params.get("side", params.get("right"))
     if side:
-        side = str(side).strip().lower()
-        if side in ('c', 'call'):
-            side = 'call'
-        elif side in ('p', 'put'):
-            side = 'put'
-        else:
+        normalized_side = _normalize_chain_side(side)
+        if normalized_side is None:
             return {"error": f"Invalid side '{side}'. Use 'call' or 'put'."}
+        side = normalized_side
     
     # --- Build DTE range (None if not specified) ---
     dte_min = params.get("dte_min")
@@ -684,16 +751,18 @@ async def handle_option_greeks(executor, params: dict) -> Any:
     symbol = params.get("symbol")
     expiration = params.get("expiration")
     strike = params.get("strike")
-    right = params.get("right")
+    right = _normalize_option_right(params.get("right"))
     if not all([symbol, expiration, strike, right]):
-        return {"error": "Required: symbol, expiration ('YYYYMMDD'), strike, right ('C'/'P')"}
+        return {"error": "Required: symbol, expiration ('YYYYMMDD'), strike, right ('C'/'CALL'/'P'/'PUT')"}
 
     target_strike = float(strike)
 
     # Try data_provider first (MarketData.app — works without broker)
     try:
         chain = executor.data_provider.get_option_chain(
-            symbol, expiration=expiration, side=right.upper()
+            symbol,
+            expiration=_hyphenate_expiration(expiration),
+            side=("call" if right == "C" else "put")
         )
         if chain and chain.contracts:
             for c in chain.contracts:
@@ -702,7 +771,7 @@ async def handle_option_greeks(executor, params: dict) -> Any:
                         "symbol": c.option_symbol or f"{symbol} {expiration} {strike} {right}",
                         "strike": c.strike,
                         "expiration": c.expiration,
-                        "right": right.upper(),
+                        "right": right,
                         "delta": c.delta,
                         "gamma": c.gamma,
                         "theta": c.theta,

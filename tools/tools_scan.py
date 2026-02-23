@@ -23,7 +23,7 @@ SCAN_SYMBOLS = [
     # Volatility / hedging
     "UVXY", "GLD", "TLT",
     # Other liquid movers
-    "NFLX", "CRM", "COIN", "PLTR", "SNAP", "BABA", "UBER", "SQ", "SHOP",
+    "NFLX", "CRM", "COIN", "PLTR", "SNAP", "BABA", "UBER", "SHOP",
 ]
 
 

@@ -528,14 +528,19 @@ Account state above. Use research() to find opportunities, then analyze and trad
                     # "done" ends the cycle
                     if action in ("done", "wait", "FINAL_DECISION"):
                         summary = action_data.get('summary', action_data.get('reason', action_data.get('reasoning', '')))[:200]
-                        logger.info(f"Decision: done | {summary}")
+                        cooldown = action_data.get('cooldown', CYCLE_SLEEP_SECONDS)
+                        try:
+                            cooldown = max(5, min(int(cooldown), 3600))  # 5s–1hr bounds
+                        except (TypeError, ValueError):
+                            cooldown = CYCLE_SLEEP_SECONDS
+                        logger.info(f"Decision: done ({cooldown}s) | {summary}")
                         cycle_actions.append("done")
                         self._last_cycle_summary = (
                             f"Cycle {self._cycle_id}: {len(cycle_actions)} actions — "
                             + ", ".join(cycle_actions[-5:])
                         )
                         self._append_snapshot(f"C{self._cycle_id}: done")
-                        return CYCLE_SLEEP_SECONDS
+                        return cooldown
 
                     else:
                         # ── Execute tool action ────────────────
@@ -686,9 +691,8 @@ async def run_agent():
 
         try:
             wait_seconds = await agent.run_cycle()
-            cooldown = min(wait_seconds, CYCLE_SLEEP_SECONDS) if wait_seconds < 999999 else wait_seconds
-            logger.info(f"Cooldown: {cooldown}s")
-            await asyncio.sleep(cooldown)
+            logger.info(f"Cooldown: {wait_seconds}s")
+            await asyncio.sleep(wait_seconds)
 
         except KeyboardInterrupt:
             logger.info("Shutting down...")

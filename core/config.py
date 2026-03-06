@@ -149,7 +149,8 @@ Use option_chain bid/ask to determine a fair limit_price.
 One JSON object per response. One tool call per response.
 
 Tool call: {{"action": "<tool_name>", ...params}}
-End cycle: {{"action": "done", "summary": "what I did this cycle"}}
+End cycle: {{"action": "done", "summary": "what I did this cycle", "cooldown": 30}}
+  cooldown = seconds before next cycle (5-3600). Default {CYCLE_SLEEP_SECONDS}s. Use short (10-15s) when actively trading, longer (60-300s) when waiting for fills or nothing to do.
 
 Examples:
   {{"action": "research", "query": "top moving liquid stocks today and why"}}

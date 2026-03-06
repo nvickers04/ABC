@@ -29,13 +29,10 @@ Usage:
     budget = tracker.get_budget_summary()
 """
 
-import json
 import logging
-from dataclasses import dataclass, field, asdict
+from dataclasses import dataclass, asdict
 from datetime import datetime, date
-from pathlib import Path
 from typing import Any, Dict, List, Optional
-from enum import Enum
 
 logger = logging.getLogger(__name__)
 
@@ -48,22 +45,16 @@ PROFIT_ALLOCATION_PCT = 0.50  # 50% of profits go to LLM credits
 
 # Cost per 1M tokens (approximate, update as pricing changes)
 MODEL_COSTS = {
-    # xAI Grok
+    # xAI Grok 4.20 Beta (short context 0-200K)
+    "grok-4.20-experimental-beta-0304-reasoning": {"input": 2.00, "output": 6.00},
+    "grok-4.20-experimental-beta-0304-non-reasoning": {"input": 2.00, "output": 6.00},
+    "grok-4.20-multi-agent-experimental-beta-0304": {"input": 2.00, "output": 6.00},
+    # xAI Grok (legacy)
     "grok-2": {"input": 2.00, "output": 10.00},
     "grok-2-mini": {"input": 0.30, "output": 0.50},
     "grok-3": {"input": 3.00, "output": 15.00},
     "grok-3-fast": {"input": 1.00, "output": 5.00},
     "grok-4-1-fast-reasoning": {"input": 0.15, "output": 0.60},
-    
-    # OpenAI (for reference)
-    "gpt-4o": {"input": 2.50, "output": 10.00},
-    "gpt-4o-mini": {"input": 0.15, "output": 0.60},
-    "gpt-4-turbo": {"input": 10.00, "output": 30.00},
-    
-    # Anthropic (for reference)
-    "claude-3-opus": {"input": 15.00, "output": 75.00},
-    "claude-3-sonnet": {"input": 3.00, "output": 15.00},
-    "claude-3-haiku": {"input": 0.25, "output": 1.25},
     
     # Default fallback
     "default": {"input": 2.00, "output": 10.00},

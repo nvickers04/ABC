@@ -12,7 +12,12 @@ async def handle_cancel_order(executor, params: dict) -> Any:
     order_id = params.get("order_id")
     if not order_id:
         return {"error": "order_id required"}
-    return await executor.gateway.cancel_order(order_id)
+    # Sanitize: LLM copies '#' prefix from state context (e.g. "#1922")
+    try:
+        clean_id = int(str(order_id).strip().lstrip('#'))
+    except (ValueError, TypeError):
+        return {"error": f"Invalid order_id: {order_id}"}
+    return await executor.gateway.cancel_order(clean_id)
 
 
 async def handle_cancel_stops(executor, params: dict) -> Any:

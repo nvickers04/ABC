@@ -96,20 +96,6 @@ def _option_contract_exists(executor, symbol: str, expiration: str, strike: floa
     return False
 
 
-def _make_leg_key(symbol: str, right: str, strike: float, expiration: str) -> str:
-    """Build a position key matching IBKR callback format: SYMBOL_RIGHT_STRIKE_EXPIRY."""
-    return f"{symbol}_{right}_{strike}_{expiration}"
-
-
-def _register_spread_if_success(result: dict, underlying: str, strategy: str,
-                                 leg_keys: list):
-    """Register a spread group after a successful placement (no-op without LiveState)."""
-    if not result or not result.get("success"):
-        return
-    # Spread group tracking removed with LiveState deletion
-    logger.debug(f"Spread placed: {strategy} on {underlying}, legs={leg_keys}")
-
-
 # =========================================================================
 # SINGLE LEG
 # =========================================================================
@@ -235,18 +221,13 @@ async def handle_vertical_spread(executor, params: dict) -> Any:
     if cash:
         return cash
     logger.info(f"VERTICAL SPREAD: {symbol} {right} long={long_strike} short={short_strike} exp={expiration} qty={quantity}")
+    limit_price = params.get("limit_price")
     result = await executor.gateway.place_vertical_spread(
-        symbol, expiration, float(long_strike), float(short_strike), right, int(quantity)
+        symbol, expiration, float(long_strike), float(short_strike), right, int(quantity),
+        limit_price=float(limit_price) if limit_price is not None else None
     )
     logger.info(f"VERTICAL SPREAD RESULT: {symbol} -> {result}")
     await executor._refresh_state()
-    r = right
-    leg_keys = [
-        _make_leg_key(symbol, r, float(long_strike), expiration),
-        _make_leg_key(symbol, r, float(short_strike), expiration),
-    ]
-    strategy = f"{'Bull' if r == 'C' else 'Bear'} {'Call' if r == 'C' else 'Put'} Spread"
-    _register_spread_if_success(result, symbol, strategy, leg_keys)
     return result
 
 
@@ -269,18 +250,13 @@ async def handle_iron_condor(executor, params: dict) -> Any:
     if cash:
         return cash
     logger.info(f"IRON CONDOR: {symbol} puts={put_long}/{put_short} calls={call_short}/{call_long} exp={expiration} qty={quantity}")
+    limit_price = params.get("limit_price")
     result = await executor.gateway.place_iron_condor(
-        symbol, expiration, float(put_long), float(put_short), float(call_short), float(call_long), int(quantity)
+        symbol, expiration, float(put_long), float(put_short), float(call_short), float(call_long), int(quantity),
+        limit_price=float(limit_price) if limit_price is not None else None
     )
     logger.info(f"IRON CONDOR RESULT: {symbol} -> {result}")
     await executor._refresh_state()
-    leg_keys = [
-        _make_leg_key(symbol, 'P', float(put_long), expiration),
-        _make_leg_key(symbol, 'P', float(put_short), expiration),
-        _make_leg_key(symbol, 'C', float(call_short), expiration),
-        _make_leg_key(symbol, 'C', float(call_long), expiration),
-    ]
-    _register_spread_if_success(result, symbol, 'Iron Condor', leg_keys)
     return result
 
 
@@ -301,18 +277,13 @@ async def handle_iron_butterfly(executor, params: dict) -> Any:
     cs = float(center_strike)
     ww = float(wing_width)
     logger.info(f"IRON BUTTERFLY: {symbol} center={cs} wing={ww} exp={expiration} qty={quantity}")
+    limit_price = params.get("limit_price")
     result = await executor.gateway.place_iron_butterfly(
-        symbol, expiration, cs, ww, int(quantity)
+        symbol, expiration, cs, ww, int(quantity),
+        limit_price=float(limit_price) if limit_price is not None else None
     )
     logger.info(f"IRON BUTTERFLY RESULT: {symbol} -> {result}")
     await executor._refresh_state()
-    leg_keys = [
-        _make_leg_key(symbol, 'P', cs - ww, expiration),
-        _make_leg_key(symbol, 'P', cs, expiration),
-        _make_leg_key(symbol, 'C', cs, expiration),
-        _make_leg_key(symbol, 'C', cs + ww, expiration),
-    ]
-    _register_spread_if_success(result, symbol, 'Iron Butterfly', leg_keys)
     return result
 
 
@@ -333,14 +304,13 @@ async def handle_straddle(executor, params: dict) -> Any:
         return {"error": _cash_only_insufficient_msg(executor.gateway.cash_value, estimated_debit)}
     s = float(strike)
     logger.info(f"STRADDLE: {symbol} strike={s} exp={expiration} qty={quantity}")
-    result = await executor.gateway.place_straddle(symbol, expiration, s, int(quantity))
+    limit_price = params.get("limit_price")
+    result = await executor.gateway.place_straddle(
+        symbol, expiration, s, int(quantity),
+        limit_price=float(limit_price) if limit_price is not None else None
+    )
     logger.info(f"STRADDLE RESULT: {symbol} -> {result}")
     await executor._refresh_state()
-    leg_keys = [
-        _make_leg_key(symbol, 'C', s, expiration),
-        _make_leg_key(symbol, 'P', s, expiration),
-    ]
-    _register_spread_if_success(result, symbol, 'Straddle', leg_keys)
     return result
 
 
@@ -362,14 +332,13 @@ async def handle_strangle(executor, params: dict) -> Any:
     if executor.gateway and executor.gateway.cash_value < estimated_debit:
         return {"error": _cash_only_insufficient_msg(executor.gateway.cash_value, estimated_debit)}
     logger.info(f"STRANGLE: {symbol} puts={put_strike} calls={call_strike} exp={expiration} qty={quantity}")
-    result = await executor.gateway.place_strangle(symbol, expiration, float(put_strike), float(call_strike), int(quantity))
+    limit_price = params.get("limit_price")
+    result = await executor.gateway.place_strangle(
+        symbol, expiration, float(put_strike), float(call_strike), int(quantity),
+        limit_price=float(limit_price) if limit_price is not None else None
+    )
     logger.info(f"STRANGLE RESULT: {symbol} -> {result}")
     await executor._refresh_state()
-    leg_keys = [
-        _make_leg_key(symbol, 'P', float(put_strike), expiration),
-        _make_leg_key(symbol, 'C', float(call_strike), expiration),
-    ]
-    _register_spread_if_success(result, symbol, 'Strangle', leg_keys)
     return result
 
 
@@ -387,11 +356,6 @@ async def handle_collar(executor, params: dict) -> Any:
     result = await executor.gateway.place_collar(symbol, expiration, float(put_strike), float(call_strike), int(shares))
     logger.info(f"COLLAR RESULT: {symbol} -> {result}")
     await executor._refresh_state()
-    leg_keys = [
-        _make_leg_key(symbol, 'P', float(put_strike), expiration),
-        _make_leg_key(symbol, 'C', float(call_strike), expiration),
-    ]
-    _register_spread_if_success(result, symbol, 'Collar', leg_keys)
     return result
 
 
@@ -413,16 +377,13 @@ async def handle_calendar_spread(executor, params: dict) -> Any:
     if executor.gateway and executor.gateway.cash_value < estimated_debit:
         return {"error": _cash_only_insufficient_msg(executor.gateway.cash_value, estimated_debit)}
     logger.info(f"CALENDAR SPREAD: {symbol} strike={strike} near={near_exp} far={far_exp} {right} qty={quantity}")
-    result = await executor.gateway.place_calendar_spread(symbol, float(strike), near_exp, far_exp, right, int(quantity))
+    limit_price = params.get("limit_price")
+    result = await executor.gateway.place_calendar_spread(
+        symbol, float(strike), near_exp, far_exp, right, int(quantity),
+        limit_price=float(limit_price) if limit_price is not None else None
+    )
     logger.info(f"CALENDAR SPREAD RESULT: {symbol} -> {result}")
     await executor._refresh_state()
-    r = right
-    s = float(strike)
-    leg_keys = [
-        _make_leg_key(symbol, r, s, near_exp),
-        _make_leg_key(symbol, r, s, far_exp),
-    ]
-    _register_spread_if_success(result, symbol, 'Calendar Spread', leg_keys)
     return result
 
 
@@ -447,17 +408,13 @@ async def handle_diagonal_spread(executor, params: dict) -> Any:
         if cash:
             return cash
     logger.info(f"DIAGONAL SPREAD: {symbol} near={near_strike}/{near_exp} far={far_strike}/{far_exp} {right} qty={quantity}")
+    limit_price = params.get("limit_price")
     result = await executor.gateway.place_diagonal_spread(
-        symbol, float(near_strike), float(far_strike), near_exp, far_exp, right, int(quantity)
+        symbol, float(near_strike), float(far_strike), near_exp, far_exp, right, int(quantity),
+        limit_price=float(limit_price) if limit_price is not None else None
     )
     logger.info(f"DIAGONAL SPREAD RESULT: {symbol} -> {result}")
     await executor._refresh_state()
-    r = right
-    leg_keys = [
-        _make_leg_key(symbol, r, float(near_strike), near_exp),
-        _make_leg_key(symbol, r, float(far_strike), far_exp),
-    ]
-    _register_spread_if_success(result, symbol, 'Diagonal Spread', leg_keys)
     return result
 
 
@@ -483,19 +440,14 @@ async def handle_butterfly(executor, params: dict) -> Any:
         if cash:
             return cash
     logger.info(f"BUTTERFLY: {symbol} {lower_strike}/{middle_strike}/{upper_strike} {right} exp={expiration} qty={quantity}")
+    limit_price = params.get("limit_price")
     result = await executor.gateway.place_butterfly(
         symbol, expiration, float(lower_strike), float(middle_strike), float(upper_strike),
-        right, int(quantity)
+        right, int(quantity),
+        limit_price=float(limit_price) if limit_price is not None else None
     )
     logger.info(f"BUTTERFLY RESULT: {symbol} -> {result}")
     await executor._refresh_state()
-    r = right
-    leg_keys = [
-        _make_leg_key(symbol, r, float(lower_strike), expiration),
-        _make_leg_key(symbol, r, float(middle_strike), expiration),
-        _make_leg_key(symbol, r, float(upper_strike), expiration),
-    ]
-    _register_spread_if_success(result, symbol, 'Butterfly', leg_keys)
     return result
 
 
@@ -518,12 +470,6 @@ async def handle_ratio_spread(executor, params: dict) -> Any:
     )
     logger.info(f"RATIO SPREAD RESULT: {symbol} -> {result}")
     await executor._refresh_state()
-    r = right
-    leg_keys = [
-        _make_leg_key(symbol, r, float(long_strike), expiration),
-        _make_leg_key(symbol, r, float(short_strike), expiration),
-    ]
-    _register_spread_if_success(result, symbol, 'Ratio Spread', leg_keys)
     return result
 
 
@@ -549,12 +495,6 @@ async def handle_jade_lizard(executor, params: dict) -> Any:
     )
     logger.info(f"JADE LIZARD RESULT: {symbol} -> {result}")
     await executor._refresh_state()
-    leg_keys = [
-        _make_leg_key(symbol, 'P', float(put_strike), expiration),
-        _make_leg_key(symbol, 'C', float(call_short_strike), expiration),
-        _make_leg_key(symbol, 'C', float(call_long_strike), expiration),
-    ]
-    _register_spread_if_success(result, symbol, 'Jade Lizard', leg_keys)
     return result
 
 

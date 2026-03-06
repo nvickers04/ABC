@@ -96,8 +96,17 @@ class IBKRQueriesMixin:
             # Force refresh to get accurate data
             await self.refresh_positions()
 
+            # Brief pause to let TWS sync position/portfolio data after refresh.
+            # Without this, portfolio() can return empty right after new fills.
+            await asyncio.sleep(0.3)
+
             # Use portfolio() instead of positions() to get unrealized P/L
             portfolio_items = self.ib.portfolio()
+
+            # Retry once if empty — TWS sometimes needs an extra moment after fills
+            if not portfolio_items:
+                await asyncio.sleep(0.5)
+                portfolio_items = self.ib.portfolio()
             positions = []
             
             for item in portfolio_items:
@@ -151,26 +160,6 @@ class IBKRQueriesMixin:
             if p.get('symbol', '').upper() == symbol.upper():
                 return p
         return None
-
-    async def get_stock_positions(self) -> List[Dict[str, Any]]:
-        """Get only stock positions (filters out options)."""
-        positions = await self.get_positions()
-        return [p for p in positions if p.get('sec_type', 'STK') == 'STK']
-
-    async def get_options_positions(self) -> List[Dict[str, Any]]:
-        """
-        Get options positions with full contract details.
-        
-        Returns list of options positions including:
-        - symbol: Underlying symbol
-        - strike, expiration, right: Option contract details
-        - quantity: Number of contracts (negative = short)
-        - avg_cost: Entry price per contract
-        - market_price: Current price
-        - unrealized_pnl: Current P/L
-        """
-        positions = await self.get_positions()
-        return [p for p in positions if p.get('sec_type') == 'OPT']
 
     # ========== ACCOUNT QUERIES ==========
 
@@ -454,16 +443,27 @@ class IBKRQueriesMixin:
                 if lmt_price > 1e300:  # Unset sentinel value
                     lmt_price = None
                     
-                orders.append({
+                # For trailing stops, show the configured trail % instead of
+                # the computed auxPrice (which TWS sets to a large $ value).
+                trail_pct = getattr(t.order, 'trailingPercent', None)
+                aux = t.order.auxPrice
+                if t.order.orderType == 'TRAIL' and trail_pct:
+                    aux = None  # suppress misleading computed aux
+
+                order_data = {
                     'order_id': t.order.orderId,
                     'symbol': t.contract.symbol,
+                    'sec_type': t.contract.secType or 'STK',
                     'action': t.order.action,
                     'quantity': t.order.totalQuantity,
                     'order_type': t.order.orderType,
-                    'aux_price': t.order.auxPrice,
+                    'aux_price': aux,
                     'lmt_price': lmt_price,
-                    'status': status
-                })
+                    'status': status,
+                }
+                if trail_pct:
+                    order_data['trail_percent'] = trail_pct
+                orders.append(order_data)
             return orders
         except Exception as e:
             logger.error(f"Failed to get open orders: {e}")
@@ -513,116 +513,6 @@ class IBKRQueriesMixin:
         """
         with self._execution_lock:
             return list(self._executions.get(symbol, []))
-
-    def get_exit_price_for_symbol(self, symbol: str, direction: str) -> Optional[float]:
-        """
-        Get the actual exit price for a closed position.
-
-        Args:
-            symbol: Ticker symbol
-            direction: 'LONG' or 'SHORT' - determines which side is the exit
-
-        Returns:
-            Weighted average exit price, or None if no exit found
-        """
-        executions = self.get_executions_for_symbol(symbol)
-        if not executions:
-            return None
-
-        # For LONG positions, exit is 'SLD' (sold)
-        # For SHORT positions, exit is 'BOT' (bought to cover)
-        exit_side = 'SLD' if direction == 'LONG' else 'BOT'
-
-        exit_execs = [e for e in executions if e['side'] == exit_side]
-        if not exit_execs:
-            return None
-
-        # Calculate weighted average exit price
-        total_value = sum(e['price'] * e['shares'] for e in exit_execs)
-        total_shares = sum(e['shares'] for e in exit_execs)
-
-        return total_value / total_shares if total_shares > 0 else None
-
-    def calculate_realized_pnl(self, symbol: str, direction: str) -> Dict[str, Any]:
-        """
-        Calculate realized P/L for a symbol using actual execution data.
-
-        Args:
-            symbol: Ticker symbol
-            direction: 'LONG' or 'SHORT'
-
-        Returns:
-            Dict with realized_pnl, entry_price, exit_price, shares, etc.
-        """
-        executions = self.get_executions_for_symbol(symbol)
-        if not executions:
-            return {'error': 'No executions found', 'symbol': symbol}
-
-        # Separate entries and exits based on direction
-        if direction == 'LONG':
-            entry_side, exit_side = 'BOT', 'SLD'
-        else:
-            entry_side, exit_side = 'SLD', 'BOT'
-
-        entries = [e for e in executions if e['side'] == entry_side]
-        exits = [e for e in executions if e['side'] == exit_side]
-
-        if not entries or not exits:
-            return {
-                'error': 'Incomplete trade data',
-                'symbol': symbol,
-                'entries': len(entries),
-                'exits': len(exits)
-            }
-
-        # Calculate weighted average entry and exit prices
-        entry_value = sum(e['price'] * e['shares'] for e in entries)
-        entry_shares = sum(e['shares'] for e in entries)
-        avg_entry = entry_value / entry_shares if entry_shares > 0 else 0
-
-        exit_value = sum(e['price'] * e['shares'] for e in exits)
-        exit_shares = sum(e['shares'] for e in exits)
-        avg_exit = exit_value / exit_shares if exit_shares > 0 else 0
-
-        # Calculate P/L (use the smaller of entry/exit shares for closed portion)
-        closed_shares = min(entry_shares, exit_shares)
-
-        if direction == 'LONG':
-            realized_pnl = (avg_exit - avg_entry) * closed_shares
-        else:
-            realized_pnl = (avg_entry - avg_exit) * closed_shares
-
-        # Total commissions
-        total_commission = sum(e.get('commission', 0) for e in entries + exits)
-        net_pnl = realized_pnl - total_commission
-
-        return {
-            'symbol': symbol,
-            'direction': direction,
-            'entry_price': round(avg_entry, 4),
-            'exit_price': round(avg_exit, 4),
-            'shares': closed_shares,
-            'gross_pnl': round(realized_pnl, 2),
-            'commission': round(total_commission, 2),
-            'net_pnl': round(net_pnl, 2),
-            'pnl_pct': round((avg_exit / avg_entry - 1) * 100, 2) if direction == 'LONG' and avg_entry > 0 else
-                       round((avg_entry / avg_exit - 1) * 100, 2) if avg_exit > 0 else 0,
-            'entry_executions': len(entries),
-            'exit_executions': len(exits)
-        }
-
-    def clear_executions(self, symbol: Optional[str] = None):
-        """
-        Clear cached executions.
-
-        Args:
-            symbol: If provided, clear only that symbol. Otherwise clear all.
-        """
-        with self._execution_lock:
-            if symbol:
-                self._executions.pop(symbol, None)
-            else:
-                self._executions.clear()
 
     async def get_stop_orders(self, symbol: Optional[str] = None) -> List[Dict[str, Any]]:
         """
@@ -728,60 +618,3 @@ class IBKRQueriesMixin:
             logger.error(f"Failed to get completed trades: {e}")
             return []
 
-    async def get_entry_time_for_symbol(
-        self, 
-        symbol: str, 
-        direction: str = 'LONG'
-    ) -> Optional[datetime]:
-        """
-        Get the entry time for a position from IBKR execution data.
-        
-        Queries both completed orders (survives restarts) and current 
-        session fills to find the earliest BUY (for LONG) or SELL 
-        (for SHORT) execution for this symbol.
-        
-        Args:
-            symbol: Stock ticker symbol
-            direction: 'LONG' or 'SHORT' - determines entry side
-            
-        Returns:
-            datetime of earliest entry execution, or None if not found.
-            Returns timezone-aware UTC datetime.
-        """
-        entry_side = 'BOT' if direction == 'LONG' else 'SLD'
-        entry_times: List[datetime] = []
-        
-        # 1. Check current session fills first (fastest)
-        try:
-            fills = self.ib.fills()
-            for fill in fills:
-                if (fill.contract.symbol == symbol and 
-                    fill.execution.side == entry_side and
-                    fill.execution.time):
-                    entry_times.append(fill.execution.time)
-        except Exception as e:
-            logger.warning(f"Failed to get session fills for {symbol}: {e}")
-        
-        # 2. Check completed orders (includes prior sessions)
-        try:
-            completed_trades = await self.get_completed_trades(api_only=False)
-            for trade in completed_trades:
-                if trade['symbol'] != symbol:
-                    continue
-                    
-                for fill in trade.get('fills', []):
-                    if fill.get('side') == entry_side and fill.get('time'):
-                        # Parse ISO format back to datetime
-                        fill_time = datetime.fromisoformat(fill['time'])
-                        entry_times.append(fill_time)
-        except Exception as e:
-            logger.warning(f"Failed to get completed trades for {symbol}: {e}")
-        
-        if not entry_times:
-            logger.debug(f"No entry executions found for {symbol} ({direction})")
-            return None
-        
-        # Return earliest entry time
-        earliest = min(entry_times)
-        logger.debug(f"Entry time for {symbol}: {earliest.isoformat()}")
-        return earliest

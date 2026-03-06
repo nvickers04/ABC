@@ -1361,27 +1361,3 @@ def get_data_provider() -> DataProvider:
     if _provider is None:
         _provider = DataProvider()
     return _provider
-
-
-# ============================================================
-# CONVENIENCE FUNCTIONS (for migration)
-# ============================================================
-
-def get_quote(symbol: str) -> Optional[Quote]:
-    """Convenience function to get a quote."""
-    return get_data_provider().get_quote(symbol)
-
-
-def get_atr(symbol: str, period: int = 14) -> Optional[ATRResult]:
-    """Convenience function to get ATR."""
-    return get_data_provider().get_atr(symbol, period)
-
-
-def get_candles(symbol: str, resolution: str = 'D', days_back: int = 30) -> Optional[Candles]:
-    """Convenience function to get candles."""
-    return get_data_provider().get_candles(symbol, resolution, days_back)
-
-
-def get_price(symbol: str) -> Optional[float]:
-    """Convenience function to get current price."""
-    return get_data_provider().get_price(symbol)

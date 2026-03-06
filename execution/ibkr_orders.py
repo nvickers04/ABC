@@ -108,6 +108,23 @@ class IBKROrdersMixin:
 
             trade = self.ib.placeOrder(contract, order)
 
+            # Brief pause to let IBKR validate the order server-side
+            await asyncio.sleep(0.5)
+            self.ib.sleep(0)  # sync call — flushes IBKR event queue
+
+            # Check if IBKR immediately rejected/cancelled the order
+            status = trade.orderStatus.status
+            if status in ('Cancelled', 'ApiCancelled'):
+                # Extract error from trade log if available
+                err_msg = 'Order rejected by broker'
+                for entry in trade.log:
+                    if entry.errorCode:
+                        err_msg = entry.message or f'IBKR error {entry.errorCode}'
+                        break
+                name = order_name or order_type
+                logger.error(f"{name} order REJECTED for {symbol}: {err_msg}")
+                return {'error': err_msg, 'symbol': symbol, 'order_id': trade.order.orderId}
+
             name = order_name or order_type
             price_info = f" @ ${limit_price:.2f}" if limit_price else ""
             price_info = price_info or (f" @ ${aux_price:.2f}" if aux_price else "")
@@ -133,7 +150,7 @@ class IBKROrdersMixin:
             return result
 
         except Exception as e:
-            logger.error(f"{order_type} order failed for {symbol}: {e}")
+            logger.error(f"{order_type} order failed for {symbol}: {e}", exc_info=True)
             return {'error': str(e), 'symbol': symbol}
 
     async def _place_order_with_fill(
@@ -326,13 +343,38 @@ class IBKROrdersMixin:
                         self.ib.cancelOrder(entry_trade.order)
                 except Exception:
                     pass  # Order may already be cancelled
-                return {
+
+                # Fetch current bid/ask so agent can make informed retry decision
+                current_bid, current_ask = None, None
+                try:
+                    ticker = self.ib.reqMktData(contract, '', snapshot=True, regulatorySnapshot=False)
+                    await asyncio.sleep(0.5)
+                    self.ib.sleep(0)
+                    current_bid = ticker.bid if ticker.bid and ticker.bid > 0 else None
+                    current_ask = ticker.ask if ticker.ask and ticker.ask > 0 else None
+                    self.ib.cancelMktData(contract)
+                except Exception:
+                    pass
+
+                result = {
                     'success': False,
                     'filled': False,
                     'reason': f"Entry order {fill_result['status']} - no fill at ${limit_price:.2f}",
                     'symbol': symbol,
-                    'direction': direction
+                    'direction': direction,
                 }
+                if current_bid is not None:
+                    result['current_bid'] = current_bid
+                if current_ask is not None:
+                    result['current_ask'] = current_ask
+                if current_bid and current_ask:
+                    result['spread'] = round(current_ask - current_bid, 2)
+                    result['hint'] = (
+                        f"Limit was ${limit_price:.2f}, market is now "
+                        f"${current_bid:.2f}/${current_ask:.2f}. "
+                        f"Consider limit_order closer to ask, or market_order with stop protection."
+                    )
+                return result
 
             # STEP 2: Entry filled - now place OCA protective orders
             actual_fill_price = fill_result['avg_fill_price']
@@ -586,7 +628,7 @@ class IBKROrdersMixin:
 
         return await self._place_order(
             symbol, action, quantity, IBKROrderType.TRAIL.value, tif='GTC',
-            aux_price=trail_amount if not trail_percent else None,
+            aux_price=trail_amount if not trail_percent else 0,
             order_name='Trailing stop',
             extra_result={'direction': direction, 'trail_amount': trail_amount, 'trail_percent': trail_percent},
             **order_attrs
@@ -739,28 +781,6 @@ class IBKROrdersMixin:
             logger.error(f"Failed to modify order {order_id}: {e}")
             return {'error': str(e)}
 
-    # ========== ORDER STATE TRACKING ==========
-
-    def get_order_state(self, order_id: int) -> Optional[Dict[str, Any]]:
-        """Get tracked state for an order."""
-        with self._order_state_lock:
-            state = self._order_states.get(order_id)
-            return state.to_dict() if state else None
-
-    def get_bracket_group(self, group_id: str) -> Optional[Dict[str, Any]]:
-        """Get tracked state for a bracket group."""
-        with self._order_state_lock:
-            group = self._bracket_groups.get(group_id)
-            return group.to_dict() if group else None
-
-    def get_active_bracket_groups(self) -> list:
-        """Get all active bracket groups."""
-        with self._order_state_lock:
-            return [
-                g.to_dict() for g in self._bracket_groups.values()
-                if g.status == 'active'
-            ]
-
     # ========== ADVANCED ORDER TYPES ==========
 
     async def place_trailing_stop_limit(
@@ -901,10 +921,10 @@ class IBKROrdersMixin:
 
     async def place_twap(
         self, symbol: str, action: str, quantity: int,
-        start_time: str = None, end_time: str = None, randomize_pct: float = 55.0
+        start_time: str = None, end_time: str = None
     ) -> Dict[str, Any]:
         """Place TWAP algo order. Spreads execution evenly over time."""
-        algo_params = [TagValue('strategyType', 'Marketable'), TagValue('allowPastEndTime', '1')]
+        algo_params = [TagValue('allowPastEndTime', '1')]
         if start_time:
             algo_params.append(TagValue('startTime', start_time))
         if end_time:

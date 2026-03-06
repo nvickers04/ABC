@@ -1,32 +1,40 @@
 """
-Grok LLM Integration — xAI API Connection (Minimal)
+Grok LLM Integration — xAI SDK (Native gRPC)
 
-Thin wrapper around xAI's OpenAI-compatible API.
-The agent loop in agent.py calls self.grok.client directly.
+Uses the official xai-sdk (>= 1.8.0) for all model communication.
+The agent loop in agent.py uses self.grok.client.chat.create() to build
+conversations and chat.sample() to get responses.
+
+Models:
+    REASONING_MODEL  — single-agent with chain-of-thought (trading loop)
+    MULTI_AGENT_MODEL — 4/16 agent research swarm (built-in tools only)
 
 Usage:
     llm = get_grok_llm()
-    response = await llm.client.chat.completions.create(...)
+    chat = llm.client.chat.create(model=llm.model, messages=[...])
+    response = await chat.sample()
+    print(response.content)
 """
 
 import logging
 import os
 from typing import Optional
 
-from openai import AsyncOpenAI
+from xai_sdk import AsyncClient
 
 logger = logging.getLogger(__name__)
 
-# model="grok-4-1-fast-reasoning" → change to exact Grok 4.20 name when available in console
-DEFAULT_MODEL = "grok-4-1-fast-reasoning"
+# ── Model Slugs (beta — may change without notice) ─────────────
+REASONING_MODEL = "grok-4.20-experimental-beta-0304-reasoning"
+MULTI_AGENT_MODEL = "grok-4.20-multi-agent-experimental-beta-0304"
 
 
 class GrokLLM:
-    """Direct Grok LLM integration for trading decisions."""
+    """Direct Grok LLM integration via xAI SDK (AsyncClient)."""
 
     def __init__(
         self,
-        model: str = DEFAULT_MODEL,
+        model: str = REASONING_MODEL,
         temperature: float = 0.0,
         max_tokens: int = 8192,
     ):
@@ -38,10 +46,7 @@ class GrokLLM:
         if not api_key:
             logger.warning("No XAI_API_KEY or GROK_API_KEY found in environment")
 
-        self.client = AsyncOpenAI(
-            api_key=api_key,
-            base_url="https://api.x.ai/v1",
-        )
+        self.client = AsyncClient(api_key=api_key)
 
         logger.info(f"GrokLLM initialized (model={model}, temp={temperature})")
 
@@ -58,4 +63,9 @@ def get_grok_llm() -> GrokLLM:
     return _grok_llm
 
 
-__all__ = ["GrokLLM", "get_grok_llm", "DEFAULT_MODEL"]
+__all__ = [
+    "GrokLLM",
+    "get_grok_llm",
+    "REASONING_MODEL",
+    "MULTI_AGENT_MODEL",
+]

@@ -733,6 +733,20 @@ class IBKROptionsMixin:
                        f"{contract.strike}{contract.right} {contract.lastTradeDateOrContractMonth} "
                        f"{'LMT@' + str(limit_price) if limit_price else 'MKT'} [{reason}]")
 
+            # Brief pause to let IBKR validate the order server-side
+            await asyncio.sleep(0.5)
+
+            # Check if IBKR immediately rejected/cancelled the order
+            status = trade.orderStatus.status
+            if status in ('Cancelled', 'ApiCancelled'):
+                err_msg = 'Option close order rejected by broker'
+                for entry in trade.log:
+                    if entry.errorCode:
+                        err_msg = entry.message or f'IBKR error {entry.errorCode}'
+                        break
+                logger.error(f"Close option REJECTED for {symbol} {contract.strike}{contract.right}: {err_msg}")
+                return {'error': err_msg, 'symbol': symbol, 'order_id': trade.order.orderId}
+
             return {
                 'success': True,
                 'order_id': trade.order.orderId,
@@ -743,6 +757,7 @@ class IBKROptionsMixin:
                 'right': contract.right,
                 'expiration': contract.lastTradeDateOrContractMonth,
                 'reason': reason,
+                'status': status,
                 'timestamp': datetime.now(timezone.utc).isoformat()
             }
 

@@ -12,7 +12,7 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Optional
+from typing import Dict, List
 
 logger = logging.getLogger(__name__)
 
@@ -254,8 +254,6 @@ _TOOL_CAPABILITY_MAP: Dict[str, List[tuple]] = {
     # --- Queries ---
     'get_positions':            [('query', 'positions')],
     'get_position':             [('query', 'positions')],
-    'get_stock_positions':      [('query', 'positions')],
-    'get_options_positions':    [('query', 'positions')],
     'get_account_summary':      [('query', 'account_summary')],
     'get_available_funds':      [('query', 'account_summary')],
     'get_open_orders':          [('query', 'open_orders')],

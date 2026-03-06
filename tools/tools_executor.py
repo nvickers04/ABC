@@ -7,6 +7,7 @@ The agent decides what to call and with what parameters.
 AVAILABLE TOOLS (for agent prompt):
 
 === RESEARCH ===
+research: {query, deep?=false} -> multi-agent web + X search (4 agents default, 16 if deep=true). Use for macro, sentiment, news, earnings, sector analysis.
 quote: {symbol} -> price, bid, ask, volume, change_pct
 market_scan: {symbols?} -> top movers from liquid watchlist
 candles: {symbol, days?=30, resolution?='D'} -> OHLCV data (resolution: D=daily, H=hourly, 5=5min, 15=15min, 1=1min, W=weekly, M=monthly)
@@ -151,6 +152,7 @@ from tools.tools_stats import HANDLERS as _STATS
 from tools.tools_sizing import HANDLERS as _SIZING
 from tools.tools_instruments import HANDLERS as _INSTRUMENTS
 from tools.tools_scan import HANDLERS as _SCAN
+from tools.tools_multiagent import HANDLERS as _MULTIAGENT
 
 _REGISTRY: dict[str, Any] = {}
 _REGISTRY.update(_RESEARCH)
@@ -161,6 +163,7 @@ _REGISTRY.update(_STATS)
 _REGISTRY.update(_SIZING)
 _REGISTRY.update(_INSTRUMENTS)
 _REGISTRY.update(_SCAN)
+_REGISTRY.update(_MULTIAGENT)
 
 
 # ── plan_order / enter_option handler wrappers ────────────────
@@ -210,6 +213,9 @@ _ALIASES: dict[str, str] = {
     "get_atr": "atr",
     "get_account": "account",
     "get_positions": "positions",
+    "web_search": "research",
+    "x_search": "research",
+    "deep_research": "research",
     "scan": "market_scan",
     "get_news": "news",
     "econ_calendar": "economic_calendar",
@@ -346,10 +352,11 @@ class ToolExecutor:
         "strangle":         (0.25, 21, 45),
     }
 
-    def __init__(self, gateway, data_provider, market_hours_provider=None):
+    def __init__(self, gateway, data_provider, market_hours_provider=None, cost_tracker=None):
         self.gateway = gateway
         self.data_provider = data_provider
         self.market_hours_provider = market_hours_provider
+        self.cost_tracker = cost_tracker
         self._protective_order_actions = {"stop_order", "stop_limit", "trailing_stop", "trailing_stop_limit"}
         self._deferred_stops = []
         self._recent_orders: dict[str, float] = {}  # fingerprint → timestamp for idempotency
@@ -1010,7 +1017,7 @@ class ToolExecutor:
 
         Gathers market data, picks the optimal contract(s) for the requested
         strategy, and returns a plan with dispatch_action + dispatch_params
-        ready for _safe_dispatch().
+        ready for _dispatch().
         """
         if strategy not in self._OPTION_STRATEGY_DEFAULTS:
             return {
@@ -1495,35 +1502,6 @@ class ToolExecutor:
                 },
             }
 
-    def _get_pending_entry_summary(self) -> list:
-        """Get summary of pending entry orders (unfilled orders with no position).
-        
-        Helps prevent the agent from re-ordering symbols it already has
-        pending orders for.
-        """
-        # Get open orders that don't correspond to any position (orphan entries)
-        try:
-            orders = self.gateway.get_cached_trades() if self.gateway else []
-            positions = self.gateway.get_cached_portfolio() if self.gateway else []
-            pos_symbols = {item.contract.symbol.upper() for item in positions if item.position != 0}
-            entry_types = {'LMT', 'MKT', 'MIDPRICE', 'REL', 'MOC', 'MOO', 'LOC', 'LOO'}
-            pending = []
-            for t in orders:
-                sym = t.contract.symbol.upper()
-                otype = t.order.orderType
-                if sym not in pos_symbols and otype in entry_types:
-                    pending.append({
-                        "symbol": sym,
-                        "order_id": t.order.orderId,
-                        "action": t.order.action,
-                        "quantity": int(t.order.totalQuantity),
-                        "order_type": otype,
-                        "limit_price": t.order.lmtPrice if t.order.lmtPrice < 1e300 else None,
-                    })
-            return pending
-        except Exception:
-            return []
-
     def _order_fingerprint(self, action: str, params: dict) -> str:
         """Build a dedup fingerprint for an order action."""
         parts = [
@@ -1563,33 +1541,6 @@ class ToolExecutor:
         # Record this order
         self._recent_orders[fp] = now
         return None
-
-    async def _safe_dispatch(self, action: str, params: dict) -> tuple:
-        """Dispatch with exception safety. Returns (result_dict, success_bool)."""
-        try:
-            # Idempotency guard — block duplicate orders within 60s
-            dup = self._check_idempotency(action, params)
-            if dup is not None:
-                return dup, False
-
-            result = await self._dispatch(action, params)
-            success = isinstance(result, dict) and "error" not in result
-
-            if success and action in self._protective_order_actions and isinstance(result, dict):
-                order_id = result.get("order_id")
-                if order_id:
-                    verify_result, verify_success = await self._verify_order_active(
-                        int(order_id),
-                        symbol=str(params.get("symbol", result.get("symbol", ""))).upper() or None,
-                    )
-                    if not verify_success:
-                        return verify_result, False
-                    result["post_submit_status"] = verify_result.get("status")
-
-            return result, success
-        except Exception as e:
-            logger.error(f"Gateway dispatch failed: {action} - {e}")
-            return {"error": str(e)}, False
 
     async def _verify_order_active(self, order_id: int, symbol: str | None = None, wait_seconds: float = 0.6) -> tuple[dict, bool]:
         """Verify newly-submitted order remains active after a short broker-processing window."""

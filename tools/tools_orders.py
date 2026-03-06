@@ -37,10 +37,11 @@ def _safe_float(val) -> float:
 
 
 def _safe_int(val) -> int:
-    """Extract int from value, handling dict wrapping from LLM."""
+    """Extract int from value, handling dict wrapping and '#' prefix from LLM."""
     if isinstance(val, (int, float)):
         return int(val)
     if isinstance(val, str):
+        val = val.strip().lstrip('#')
         return int(float(val))
     if isinstance(val, dict):
         for key in ("quantity", "size", "shares", "count", "value"):
@@ -218,6 +219,15 @@ async def handle_trailing_stop(executor, params: dict) -> Any:
 
 
 async def handle_bracket_order(executor, params: dict) -> Any:
+    # ── Param aliases: LLM often sends direction/stop_price/target_price ──
+    if "direction" in params and "side" not in params:
+        _dir = str(params.pop("direction")).upper()
+        params["side"] = "BUY" if _dir in ("LONG", "BUY") else "SELL"
+    if "stop_price" in params and "stop_loss" not in params:
+        params["stop_loss"] = params.pop("stop_price")
+    if "target_price" in params and "take_profit" not in params:
+        params["take_profit"] = params.pop("target_price")
+
     side = str(params.get("side", "")).upper()
     direction = "LONG" if side == "BUY" else "SHORT"
 
@@ -255,6 +265,9 @@ async def handle_modify_stop(executor, params: dict) -> Any:
     """Modify existing stop — no PDT, no cash, no refresh."""
     if not executor.gateway:
         return {"error": "broker not connected"}
+    # Alias: LLM often sends stop_price instead of new_stop_price
+    if "stop_price" in params and "new_stop_price" not in params:
+        params["new_stop_price"] = params.pop("stop_price")
     if not params.get("order_id") or not params.get("new_stop_price"):
         return {"error": "Required: order_id, new_stop_price"}
     return await executor.gateway.modify_stop_price(

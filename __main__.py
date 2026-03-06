@@ -47,7 +47,8 @@ def setup_logging(verbose: bool = False):
     root.addHandler(file_handler)
 
     # Silence noisy libraries
-    for lib in ("httpx", "httpcore", "openai", "ib_insync.wrapper",
+    for lib in ("httpx", "httpcore", "grpc", "xai_sdk",
+               "ib_insync.wrapper",
                "ib_insync.ib", "ib_insync.client", "ib_insync.decoder",
                "ib_insync.connection", "ib_insync.flexreport", "ib_insync.order",
                "asyncio", "urllib3", "charset_normalizer",
@@ -82,17 +83,19 @@ def validate_startup():
 async def test_grok():
     """Test Grok LLM connection."""
     from core.grok_llm import get_grok_llm
+    from xai_sdk.chat import user as sdk_user
 
     print("Testing Grok connection...")
     llm = get_grok_llm()
 
-    response = await llm.client.chat.completions.create(
+    chat = llm.client.chat.create(
         model=llm.model,
-        messages=[{"role": "user", "content": "Say 'connected' if you can read this."}],
+        messages=[sdk_user("Say 'connected' if you can read this.")],
         max_tokens=50,
     )
+    response = await chat.sample()
 
-    print(f"Response: {response.choices[0].message.content}")
+    print(f"Response: {response.content}")
     print("✓ Grok connected successfully")
 
 

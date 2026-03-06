@@ -9,7 +9,6 @@ AVAILABLE TOOLS (for agent prompt):
 === RESEARCH ===
 research: {query, deep?=false} -> multi-agent web + X search (4 agents default, 16 if deep=true). Use for macro, sentiment, news, earnings, sector analysis.
 quote: {symbol} -> price, bid, ask, volume, change_pct
-market_scan: {symbols?} -> top movers from liquid watchlist
 candles: {symbol, days?=30, resolution?='D'} -> OHLCV data (resolution: D=daily, H=hourly, 5=5min, 15=15min, 1=1min, W=weekly, M=monthly)
 fundamentals: {symbol} -> sector, industry, market_cap, pe_ratio, earnings_date
 earnings: {symbol} -> next_earnings_date, days_until_earnings
@@ -151,7 +150,6 @@ from tools.tools_options import HANDLERS as _OPTIONS, _normalize_expiration
 from tools.tools_stats import HANDLERS as _STATS
 from tools.tools_sizing import HANDLERS as _SIZING
 from tools.tools_instruments import HANDLERS as _INSTRUMENTS
-from tools.tools_scan import HANDLERS as _SCAN
 from tools.tools_multiagent import HANDLERS as _MULTIAGENT
 
 _REGISTRY: dict[str, Any] = {}
@@ -162,7 +160,6 @@ _REGISTRY.update(_OPTIONS)
 _REGISTRY.update(_STATS)
 _REGISTRY.update(_SIZING)
 _REGISTRY.update(_INSTRUMENTS)
-_REGISTRY.update(_SCAN)
 _REGISTRY.update(_MULTIAGENT)
 
 
@@ -216,7 +213,7 @@ _ALIASES: dict[str, str] = {
     "web_search": "research",
     "x_search": "research",
     "deep_research": "research",
-    "scan": "market_scan",
+
     "get_news": "news",
     "econ_calendar": "economic_calendar",
     "calendar": "economic_calendar",

@@ -7,7 +7,7 @@ Architecture:
   - The reasoning model decides when to call research() — no separate coordination
 
 Grok chains actions until it signals 'done' to refresh context.
-research() replaces market_scan as the primary discovery mechanism.
+research() is the primary discovery mechanism.
 """
 
 import ast
@@ -253,13 +253,6 @@ class TradingAgent:
         summary = self.cost_tracker.get_budget_summary()
         return summary.today_llm_cost >= MAX_DAILY_LLM_COST
 
-    def _end_cycle(self, reason: str) -> int:
-        """Log cycle end and return the cooldown."""
-        logger.info(f"Decision: done | {reason}")
-        self._last_cycle_summary = f"Cycle {self._cycle_id}: {reason[:80]}"
-        self._append_snapshot(f"C{self._cycle_id}: done")
-        return CYCLE_SLEEP_SECONDS
-
     async def _build_state_context(self) -> str:
         """Build the complete dynamic state context for the agent.
 
@@ -480,7 +473,7 @@ Account state above. Use research() to find opportunities, then analyze and trad
 
         # ── Inner ReAct loop ────────────────────────────────────
         turn = 0
-        consecutive_thinks = 0
+
         cycle_actions = []
 
         while True:
@@ -532,43 +525,20 @@ Account state above. Use research() to find opportunities, then analyze and trad
                 for action_data in json_objects:
                     action = action_data.get("action", "")
 
-                    # ── Meta-actions ────────────────────────────
-                    if action in ("wait", "FINAL_DECISION"):
-                        chat.append(response)
-                        return self._end_cycle(action_data.get('reason', action_data.get('reasoning', ''))[:200])
-
-                    elif action == "think":
-                        thought = action_data.get("thought", "")
-                        logger.debug(f"Think: {thought[:200]}")
-                        consecutive_thinks += 1
-                        chat.append(response)
-                        if consecutive_thinks >= 3:
-                            logger.info(f"Think-loop nudge after {consecutive_thinks} thinks")
-                            chat.append(sdk_user(
-                                "You have been thinking for multiple turns without new data. "
-                                "Call a tool or say {\"action\": \"done\"} to end this cycle."
-                            ))
-                        continue
-
-                    elif action == "feedback":
-                        issue = action_data.get("issue", "")
-                        logger.warning(f"FEEDBACK: {issue}")
-                        continue
-
-                    elif action == "done":
-                        reasoning = action_data.get("reasoning", "")
-                        logger.info(f"Decision: DONE | {reasoning[:200]}")
+                    # "done" ends the cycle
+                    if action in ("done", "wait", "FINAL_DECISION"):
+                        summary = action_data.get('summary', action_data.get('reason', action_data.get('reasoning', '')))[:200]
+                        logger.info(f"Decision: done | {summary}")
                         cycle_actions.append("done")
                         self._last_cycle_summary = (
                             f"Cycle {self._cycle_id}: {len(cycle_actions)} actions — "
                             + ", ".join(cycle_actions[-5:])
                         )
-                        self._append_snapshot(f"C{self._cycle_id}: DONE")
+                        self._append_snapshot(f"C{self._cycle_id}: done")
                         return CYCLE_SLEEP_SECONDS
 
                     else:
-                        # ── Execute ONE real tool action ────────
-                        consecutive_thinks = 0
+                        # ── Execute tool action ────────────────
                         last_result = await self.tools.execute(action, action_data)
                         sym = action_data.get('symbol', '')
 

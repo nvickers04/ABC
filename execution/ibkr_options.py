@@ -773,7 +773,7 @@ class IBKROptionsMixin:
                 'right': contract.right,
                 'expiration': contract.lastTradeDateOrContractMonth,
                 'reason': reason,
-                'status': status,
+                'status': trade.orderStatus.status,
                 'timestamp': datetime.now(timezone.utc).isoformat()
             }
 

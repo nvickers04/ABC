@@ -8,27 +8,41 @@ TRADING_MODE controls everything:
 """
 
 import os
+from typing import Literal
 
-# ── Trading Mode ────────────────────────────────────────────────
+# ── Load .env automatically (graceful fallback) ───────────────────────────────
+try:
+    from dotenv import load_dotenv
+    load_dotenv()  # Loads .env from project root if python-dotenv is installed
+except ImportError:
+    pass  # .env support optional (can be loaded in main script if preferred)
+
+# Type for better IDE support and static analysis
+TradingMode = Literal["aggressive_paper", "paper", "live"]
+
+# ── Trading Mode ────────────────────────────────────────────────────────────
 _raw_mode = os.getenv("TRADING_MODE", "paper").lower().strip()
-TRADING_MODE: str = _raw_mode if _raw_mode in ("aggressive_paper", "paper", "live") else "paper"
+TRADING_MODE: TradingMode = (
+    _raw_mode if _raw_mode in ("aggressive_paper", "paper", "live") else "paper"
+)
 
 # Backward compat — code that checks PAPER_AGGRESSIVE still works
 PAPER_AGGRESSIVE: bool = TRADING_MODE == "aggressive_paper"
 
-# ── Mode-specific defaults ──────────────────────────────────────
-_MODE_DEFAULTS: dict[str, dict[str, float]] = {
+# ── Mode-specific defaults ──────────────────────────────────────────────────
+MODE_DEFAULTS: dict[TradingMode, dict[str, float]] = {
     "aggressive_paper": {"risk": 5.0, "rr": 1.5},
     "paper":            {"risk": 1.0, "rr": 2.0},
     "live":             {"risk": 1.0, "rr": 2.5},
 }
-_defaults: dict[str, float] = _MODE_DEFAULTS[TRADING_MODE]
+
+_defaults = MODE_DEFAULTS[TRADING_MODE]
 
 RISK_PER_TRADE: float = float(os.getenv("RISK_PER_TRADE", str(_defaults["risk"]))) / 100.0
 MIN_RR_RATIO: float = float(os.getenv("MIN_RR", str(_defaults["rr"])))
 
-# ── Mode prompt text ────────────────────────────────────────────
-_MODE_TEXTS = {
+# ── Mode description (injected into system prompt) ──────────────────────────
+MODE_TEXTS: dict[TradingMode, str] = {
     "aggressive_paper": (
         "PAPER TEST MODE — BE AGGRESSIVE within session constraints.\n"
         "Find every edge, even marginal ones. Test complex options aggressively.\n"
@@ -47,9 +61,9 @@ _MODE_TEXTS = {
         "Only take high-conviction setups. Protect capital above all else."
     ),
 }
-_MODE_TEXT = _MODE_TEXTS[TRADING_MODE]
+MODE_DESCRIPTION = MODE_TEXTS[TRADING_MODE]
 
-# ── Risk Constants ──────────────────────────────────────────────
+# ── Risk Constants ──────────────────────────────────────────────────────────
 CYCLE_SLEEP_SECONDS = 60        # 1-minute cycles — fast iteration for paper
 MAX_DAILY_LOSS_PCT = 15.0       # Emergency flatten threshold
 MAX_DAILY_LLM_COST = 50.0      # LLM cost ceiling per day
@@ -57,16 +71,16 @@ MAX_DAILY_LLM_COST = 50.0      # LLM cost ceiling per day
 # Backward compat alias
 MAX_RISK_PER_TRADE = RISK_PER_TRADE
 
-# ── LLM Parameters ─────────────────────────────────────────────
+# ── LLM Parameters ──────────────────────────────────────────────────────────
 LLM_TEMPERATURE = 0.0           # Deterministic — no creativity in money decisions
 LLM_SEED = 42                   # Reproducibility
 LLM_MAX_TOKENS = 8192           # Generous reasoning space
 
-# ── System Prompt ───────────────────────────────────────────────
+# ── System Prompt ───────────────────────────────────────────────────────────
 SYSTEM_PROMPT = f"""You are Grok 4.20, Noah's autonomous portfolio manager.
 Mode: {TRADING_MODE}. Account: CASH-ONLY (no margin, no shorting).
 
-{_MODE_TEXT}
+{MODE_DESCRIPTION}
 
 ═══ WORKFLOW ═══
 1. MANAGE existing positions first (stops, targets, adjustments).

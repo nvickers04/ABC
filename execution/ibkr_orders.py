@@ -110,7 +110,7 @@ class IBKROrdersMixin:
 
             # Brief pause to let IBKR validate the order server-side
             await asyncio.sleep(0.5)
-            self.ib.sleep(0)  # sync call — flushes IBKR event queue
+            await asyncio.sleep(0)  # yield to event loop — flushes IBKR callbacks
 
             # Check if IBKR immediately rejected/cancelled the order
             status = trade.orderStatus.status
@@ -349,7 +349,7 @@ class IBKROrdersMixin:
                 try:
                     ticker = self.ib.reqMktData(contract, '', snapshot=True, regulatorySnapshot=False)
                     await asyncio.sleep(0.5)
-                    self.ib.sleep(0)
+                    await asyncio.sleep(0)
                     current_bid = ticker.bid if ticker.bid and ticker.bid > 0 else None
                     current_ask = ticker.ask if ticker.ask and ticker.ask > 0 else None
                     self.ib.cancelMktData(contract)

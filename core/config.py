@@ -18,15 +18,14 @@ PAPER_AGGRESSIVE: bool = TRADING_MODE == "aggressive_paper"
 
 # ── Mode-specific defaults ──────────────────────────────────────
 _MODE_DEFAULTS: dict[str, dict[str, float]] = {
-    "aggressive_paper": {"risk": 5.0, "rr": 1.5, "conf": 50},
-    "paper":            {"risk": 1.0, "rr": 2.0, "conf": 65},
-    "live":             {"risk": 1.0, "rr": 2.5, "conf": 70},
+    "aggressive_paper": {"risk": 5.0, "rr": 1.5},
+    "paper":            {"risk": 1.0, "rr": 2.0},
+    "live":             {"risk": 1.0, "rr": 2.5},
 }
 _defaults: dict[str, float] = _MODE_DEFAULTS[TRADING_MODE]
 
 RISK_PER_TRADE: float = float(os.getenv("RISK_PER_TRADE", str(_defaults["risk"]))) / 100.0
 MIN_RR_RATIO: float = float(os.getenv("MIN_RR", str(_defaults["rr"])))
-MIN_CONFIDENCE_PCT: int = int(os.getenv("MIN_CONFIDENCE", str(int(_defaults["conf"]))))
 
 # ── Mode prompt text ────────────────────────────────────────────
 _MODE_TEXTS = {
@@ -73,7 +72,7 @@ Mode: {TRADING_MODE}. Account: CASH-ONLY (no margin, no shorting).
 1. MANAGE existing positions first (stops, targets, adjustments).
 2. RESEARCH to find setups: research("top moving liquid stocks today and why") or research("AAPL earnings sentiment").
 3. ANALYZE with quotes, candles, ATR on candidates from research.
-4. DECIDE: TRADE if R:R >= {MIN_RR_RATIO}:1 and confidence >= {MIN_CONFIDENCE_PCT}%. Otherwise WAIT.
+4. DECIDE: TRADE if R:R >= {MIN_RR_RATIO}:1. Otherwise say done.
 
 ═══ RULES ═══
 - Risk: max {RISK_PER_TRADE*100:.1f}% of CASH per trade. Always check account first.
@@ -135,11 +134,13 @@ Use option_chain bid/ask to determine a fair limit_price.
 ═══ RESPONSE FORMAT ═══
 One JSON object per response. One tool call per response.
 
-Tool call: {{"action": "<tool>", ...params, "confidence": {{"band": "high|medium|low", "why": "brief", "evidence": ["..."], "unknowns": ["..."]}}}}
+Tool call: {{"action": "<tool_name>", ...params}}
+End cycle: {{"action": "done", "summary": "what I did this cycle"}}
 
-End every cycle with FINAL_DECISION:
-  {{"action": "FINAL_DECISION", "decision": "WAIT"|"TRADE", "reason": "short", ...trade_params, "confidence": {{...}}}}
+Examples:
+  {{"action": "research", "query": "top moving liquid stocks today and why"}}
+  {{"action": "quote", "symbol": "AAPL"}}
+  {{"action": "bracket_order", "symbol": "SHOP", "side": "BUY", "quantity": 200, "entry_price": 120.50, "stop_loss": 117.74, "take_profit": 148.52}}
+  {{"action": "done", "summary": "Placed SHOP bracket, adjusted DAWN stop, researched NVDA"}}
 
-Trade example: {{"action": "FINAL_DECISION", "decision": "TRADE", "tactic": "bracket_order BUY 200 SHOP", "ticker": "SHOP", "size": 200, "stop": 117.74, "target": 148.52, "rr": 2.0, "confidence_pct": 65, "hold_days": 1, "confidence": {{"band": "high", "why": "momentum", "evidence": ["ATR sizing"], "unknowns": []}}}}
-
-Keep it compact. Evidence max 3 items. Unknowns max 2."""
+Keep responses compact. Call tools directly — no ceremony needed."""

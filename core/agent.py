@@ -31,7 +31,6 @@ from core.config import (
     TRADING_MODE,
     PAPER_AGGRESSIVE,
     MIN_RR_RATIO,
-    MIN_CONFIDENCE_PCT,
 )
 from xai_sdk.chat import system as sdk_system, user as sdk_user
 
@@ -40,7 +39,7 @@ from data.cost_tracker import get_cost_tracker
 from data.data_provider import get_data_provider
 from data.broker_gateway import create_gateway, BrokerConfigError
 from data.market_hours import get_market_hours_provider
-from tools.tools_executor import ToolExecutor, get_valid_actions
+from tools.tools_executor import ToolExecutor
 
 logger = logging.getLogger(__name__)
 
@@ -147,64 +146,17 @@ def _now_et() -> datetime:
         return datetime.now(timezone(timedelta(hours=-5)))
 
 
-# ── Confidence Validation ───────────────────────────────────────
+# ── Order types the agent can use (for tracking in aggressive mode) ──
 
-CONFIDENCE_BANDS = {"low", "medium", "high"}
-
-
-def _validate_confidence(action_data: dict) -> tuple[bool, str]:
-    """Validate confidence metadata on every action."""
-    conf = action_data.get("confidence")
-    if not isinstance(conf, dict):
-        return False, "Missing required object: confidence"
-    band = str(conf.get("band", "")).strip().lower()
-    if band not in CONFIDENCE_BANDS:
-        return False, "confidence.band must be one of: low, medium, high"
-    if not str(conf.get("why", "")).strip():
-        return False, "confidence.why is required"
-    evidence = conf.get("evidence", [])
-    if isinstance(evidence, str):
-        evidence = [evidence]
-    if not evidence:
-        return False, "confidence.evidence must contain at least one item"
-    if "unknowns" not in conf:
-        return False, "confidence.unknowns is required (can be empty list)"
-    return True, ""
-
-
-def _extract_confidence(action_data: dict) -> dict:
-    """Extract normalized confidence metadata."""
-    conf = action_data.get("confidence")
-    if not isinstance(conf, dict):
-        return {}
-    band = str(conf.get("band", "")).strip().lower()
-    why = str(conf.get("why", "")).strip()
-    evidence = conf.get("evidence", [])
-    if isinstance(evidence, str):
-        evidence = [evidence]
-    unknowns = conf.get("unknowns", [])
-    if isinstance(unknowns, str):
-        unknowns = [unknowns]
-    return {"band": band, "why": why, "evidence": evidence, "unknowns": unknowns}
-
-
-def _extract_trade_info(raw: str) -> dict:
-    """Best-effort extraction of trade plan from free-text FINAL_DECISION.
-
-    Tries to parse embedded JSON first; falls back to empty dict
-    so the execution prompt still works with defaults.
-    """
-    objects = _parse_json_objects(raw)
-    for obj in objects:
-        if obj.get("decision", "").upper() == "TRADE" or obj.get("action", "").upper() in ("FINAL_DECISION", "TRADE"):
-            return {
-                "ticker": obj.get("ticker", "?"),
-                "size": obj.get("size", 0),
-                "stop": obj.get("stop", "N/A"),
-                "target": obj.get("target", "N/A"),
-                "tactic": obj.get("tactic", ""),
-            }
-    return {"ticker": "?", "size": 0, "stop": "N/A", "target": "N/A", "tactic": ""}
+ALL_ORDER_TYPES = {
+    "market_order", "limit_order", "stop_order", "stop_limit",
+    "trailing_stop", "bracket_order", "oca_order",
+    "adaptive_order", "midprice_order", "vwap_order", "twap_order",
+    "relative_order", "snap_mid_order",
+    "vertical_spread", "iron_condor", "straddle", "strangle",
+    "calendar_spread", "diagonal_spread", "butterfly", "collar",
+    "buy_option",
+}
 
 
 # ── The Agent ───────────────────────────────────────────────────
@@ -236,6 +188,7 @@ class TradingAgent:
         self._start_of_day_cash: Optional[float] = None
         self._market_snapshots: list[str] = []  # Rolling 5-cycle summaries
         self._research_results: dict[str, tuple[str, str]] = {}  # query -> (result_summary, timestamp)
+        self._used_order_types: set[str] = set()  # Track which order types used this session
 
         logger.info("TradingAgent initialized (minimal ReAct mode)")
 
@@ -300,88 +253,12 @@ class TradingAgent:
         summary = self.cost_tracker.get_budget_summary()
         return summary.today_llm_cost >= MAX_DAILY_LLM_COST
 
-    def _end_cycle_wait(self, reason: str) -> int:
-        """Log a WAIT decision and return the cycle cooldown."""
-        logger.info(f"Decision: WAIT | {reason}")
-        self._last_cycle_summary = f"Cycle {self._cycle_id}: WAIT \u2014 {reason[:80]}"
-        self._append_snapshot(f"C{self._cycle_id}: WAIT")
+    def _end_cycle(self, reason: str) -> int:
+        """Log cycle end and return the cooldown."""
+        logger.info(f"Decision: done | {reason}")
+        self._last_cycle_summary = f"Cycle {self._cycle_id}: {reason[:80]}"
+        self._append_snapshot(f"C{self._cycle_id}: done")
         return CYCLE_SLEEP_SECONDS
-
-    async def _build_execution_prompt(self, trade_info: dict) -> str:
-        """Build a rich prompt that guides the LLM to emit a concrete tool call.
-
-        Provides the trade plan, fresh broker state, and session-appropriate
-        tool examples so the model picks the right order type.
-        """
-        ticker = trade_info.get('ticker', '?')
-        size = trade_info.get('size', 0)
-        stop = trade_info.get('stop', 'N/A')
-        target = trade_info.get('target', 'N/A')
-        tactic = trade_info.get('tactic', '')
-
-        state = await self._build_state_context()
-
-        # Get current session for order type filtering
-        session = "REGULAR"
-        try:
-            mh = get_market_hours_provider()
-            info = mh.get_session_info()
-            session = info["session"].upper()
-        except Exception:
-            pass
-
-        # Detect options vs stock
-        _opt_keywords = ("option", "call", "put", "spread", "condor", "straddle",
-                         "strangle", "calendar", "diagonal", "close_option", "roll")
-        is_option = (
-            any(kw in (tactic or "").lower() for kw in _opt_keywords)
-            or any(kw in (ticker or "").lower() for kw in ("c0", "p0", "260", "270"))
-            or len(ticker) > 6
-        )
-
-        if session in ("PREMARKET", "POSTMARKET"):
-            # Extended hours — limit orders only
-            if is_option:
-                examples = (
-                    f'SESSION: {session} — options spreads will NOT fill. '
-                    f'Consider queuing a limit_order for the underlying, or WAIT for regular hours.\n'
-                    f'  {{"action": "limit_order", "symbol": "{ticker}", "side": "BUY", "quantity": {size}, "limit_price": ..., "confidence": ...}}\n'
-                )
-            else:
-                examples = (
-                    f'SESSION: {session} — ONLY limit_order works. Set price at/near ASK for buys.\n'
-                    f'  {{"action": "limit_order", "symbol": "{ticker}", "side": "BUY", "quantity": {size}, "limit_price": ..., "confidence": ...}}\n'
-                )
-        elif session == "CLOSED":
-            examples = (
-                'SESSION: CLOSED — no orders will fill. WAIT for next session.\n'
-                '  {"action": "FINAL_DECISION", "decision": "WAIT", "reason": "market closed", "confidence": ...}\n'
-            )
-        else:
-            # Regular hours — full menu
-            if is_option:
-                examples = (
-                    f'OPTION EXAMPLES (choose one, fill in missing fields):\n'
-                    f'  {{"action": "vertical_spread", "symbol": "{ticker}", "right": "C", "long_strike": ..., "short_strike": ..., "expiration": "YYYYMMDD", "quantity": {size}, "confidence": ...}}\n'
-                    f'  {{"action": "iron_condor", "symbol": "{ticker}", "put_long": ..., "put_short": ..., "call_short": ..., "call_long": ..., "expiration": "YYYYMMDD", "quantity": {size}, "confidence": ...}}\n'
-                    f'  {{"action": "buy_option", "symbol": "{ticker}", "right": "C"|"P", "strike": ..., "expiration": "YYYYMMDD", "quantity": {size}, "confidence": ...}}\n'
-                )
-            else:
-                examples = (
-                    f'STOCK EXAMPLES (choose one):\n'
-                    f'  {{"action": "bracket_order", "symbol": "{ticker}", "quantity": {size}, "direction": "LONG", "entry_price": ..., "stop_price": {stop}, "target_price": {target}, "confidence": ...}}\n'
-                    f'  {{"action": "limit_order", "symbol": "{ticker}", "side": "BUY", "quantity": {size}, "limit_price": ..., "confidence": ...}}\n'
-                    f'  {{"action": "market_order", "symbol": "{ticker}", "side": "BUY", "quantity": {size}, "confidence": ...}}\n'
-                )
-
-        return (
-            f"TRADE APPROVED: {ticker} x{size}, stop={stop}, target={target}\n\n"
-            f"{state}\n\n"
-            f"{examples}\n"
-            f"Respond with EXACTLY ONE JSON tool call. "
-            f"Use the current state above to choose entry price and order type. "
-            f"Do NOT output another FINAL_DECISION."
-        )
 
     async def _build_state_context(self) -> str:
         """Build the complete dynamic state context for the agent.
@@ -560,14 +437,22 @@ class TradingAgent:
             except Exception:
                 pass
 
+            # Build order-type diversity hint
+            untested = sorted(ALL_ORDER_TYPES - self._used_order_types)
+            tested_str = ", ".join(sorted(self._used_order_types)) if self._used_order_types else "none yet"
+            untested_str = ", ".join(untested[:10]) if untested else "all tested!"
+
             if _session == "regular":
                 aggressive_nudge = (
-                    "\nAGGRESSIVE TEST: Trade aggressively. Complex options, varied order types. Break things safely."
+                    f"\nAGGRESSIVE TEST: Trade aggressively. Try order types you haven't used yet."
+                    f"\n  Used so far: {tested_str}"
+                    f"\n  Untested: {untested_str}"
+                    f"\n  Pick an untested type when the setup fits."
                 )
             elif _session in ("premarket", "postmarket"):
                 aggressive_nudge = (
                     "\nAGGRESSIVE TEST: Research movers, queue limit_order entries for open. "
-                    "Don't churn on queued orders — they fill at 9:30. "
+                    "Don't churn on queued orders \u2014 they fill at 9:30. "
                     "Options and bracket_order won't fill until regular hours."
                 )
             else:  # closed
@@ -635,14 +520,6 @@ Account state above. Use research() to find opportunities, then analyze and trad
                 # ── Parse JSON actions ──────────────────────────
                 json_objects = _parse_json_objects(raw or "")
 
-                # Free-text FINAL_DECISION fallback (no valid JSON found)
-                if not json_objects and "FINAL_DECISION:" in (raw or ""):
-                    if "FINAL_DECISION: WAIT" in raw:
-                        reason = raw.split("WAIT")[-1].strip(" |\n\r")[:200]
-                        json_objects = [{"action": "FINAL_DECISION", "decision": "WAIT", "reason": reason}]
-                    elif "FINAL_DECISION: TRADE" in raw:
-                        json_objects = [{"action": "FINAL_DECISION", "decision": "TRADE", **_extract_trade_info(raw)}]
-
                 if not json_objects:
                     logger.warning(f"No valid JSON: {raw[:100]}")
                     chat.append(response)
@@ -655,54 +532,10 @@ Account state above. Use research() to find opportunities, then analyze and trad
                 for action_data in json_objects:
                     action = action_data.get("action", "")
 
-                    # Handle FINAL_DECISION (from JSON or synthesized from free-text)
-                    if action.upper() == "FINAL_DECISION":
-                        decision = action_data.get("decision", "WAIT").upper()
-                        if decision == "TRADE":
-                            trade_info = {
-                                'ticker': action_data.get('ticker', '?'),
-                                'size': action_data.get('size', 0),
-                                'stop': action_data.get('stop', 'N/A'),
-                                'target': action_data.get('target', 'N/A'),
-                                'tactic': action_data.get('tactic', ''),
-                            }
-                            logger.info(f"Decision: TRADE {trade_info['ticker']} x{trade_info['size']}")
-                            chat.append(response)
-                            exec_prompt = await self._build_execution_prompt(trade_info)
-                            chat.append(sdk_user(exec_prompt))
-                            self._last_cycle_summary = f"Cycle {self._cycle_id}: TRADE {trade_info['ticker']}"
-                            self._append_snapshot(f"C{self._cycle_id}: TRADE {trade_info['ticker']}")
-                            continue
-                        else:
-                            chat.append(response)
-                            return self._end_cycle_wait(action_data.get('reason', '')[:200])
-
-                    # Validate confidence
-                    conf_ok, conf_err = _validate_confidence(action_data)
-                    if not conf_ok:
-                        logger.warning(f"Confidence invalid: {conf_err}")
-                        chat.append(response)
-                        chat.append(sdk_user(json.dumps({
-                            "system_notice": "RESPONSE REJECTED: confidence metadata missing/invalid.",
-                            "error": conf_err,
-                            "required_schema": {
-                                "action": "<tool>",
-                                "confidence": {
-                                    "band": "low|medium|high",
-                                    "why": "short rationale",
-                                    "evidence": ["signals"],
-                                    "unknowns": ["uncertainties"],
-                                },
-                            },
-                            "valid_actions": get_valid_actions()[:25],
-                        }, indent=2)))
-                        last_result = None
-                        break
-
                     # ── Meta-actions ────────────────────────────
-                    if action == "wait":
+                    if action in ("wait", "FINAL_DECISION"):
                         chat.append(response)
-                        return self._end_cycle_wait(action_data.get('reasoning', '')[:200])
+                        return self._end_cycle(action_data.get('reason', action_data.get('reasoning', ''))[:200])
 
                     elif action == "think":
                         thought = action_data.get("thought", "")
@@ -713,8 +546,7 @@ Account state above. Use research() to find opportunities, then analyze and trad
                             logger.info(f"Think-loop nudge after {consecutive_thinks} thinks")
                             chat.append(sdk_user(
                                 "You have been thinking for multiple turns without new data. "
-                                "Issue your FINAL_DECISION now as JSON: "
-                                '{"action": "FINAL_DECISION", "decision": "WAIT"|"TRADE", ...}'
+                                "Call a tool or say {\"action\": \"done\"} to end this cycle."
                             ))
                         continue
 
@@ -790,17 +622,16 @@ Account state above. Use research() to find opportunities, then analyze and trad
                         logger.warning(f"Circuit breaker: {self._cycle_failures} failures this cycle")
                         return 60
 
+                    # Track order types used (for aggressive mode diversity)
+                    if action in ALL_ORDER_TYPES:
+                        self._used_order_types.add(action)
+
                     # Refresh state from broker
                     state_text = await self._build_state_context()
 
-                    conf = _extract_confidence(action_data)
-                    conf_note = ""
-                    if conf:
-                        conf_note = f"\nCONFIDENCE: {conf['band'].upper()} — {conf['why']}"
-
                     chat.append(response)
                     chat.append(sdk_user(
-                        f"TOOL RESULT:\n{last_result}\n{conf_note}\n\n"
+                        f"TOOL RESULT:\n{last_result}\n\n"
                         f"{state_text}\n\nWhat's your next action?"
                     ))
 
@@ -815,7 +646,7 @@ async def run_agent():
     """Main entry point for the autonomous trading agent."""
     logger.info("=" * 60)
     logger.info("GROK 4.20 TRADER — Pure ReAct")
-    logger.info(f"Risk per trade: {RISK_PER_TRADE*100:.1f}%  |  Min R:R: {MIN_RR_RATIO}:1  |  Min conf: {MIN_CONFIDENCE_PCT}%")
+    logger.info(f"Risk per trade: {RISK_PER_TRADE*100:.1f}%  |  Min R:R: {MIN_RR_RATIO}:1")
     logger.info(f"Trading mode: {TRADING_MODE}")
     if PAPER_AGGRESSIVE:
         logger.info(">>> AGGRESSIVE PAPER MODE — stress testing complex orders <<<")

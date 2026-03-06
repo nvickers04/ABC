@@ -457,7 +457,7 @@ class TradingAgent:
 {cost_line}
 Time: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
 {continuity}{aggressive_nudge}
-Account state above. Use research() to find opportunities, then analyze and trade. What is your next action?"""
+Account state above. What is your next action?"""
 
         # ── Build xAI SDK chat instance ─────────────────────────
         chat = self.grok.client.chat.create(

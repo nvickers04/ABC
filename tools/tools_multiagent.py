@@ -10,9 +10,14 @@ No custom tools — multi-agent only supports built-in server-side tools.
 
 import logging
 import os
+import time
 from typing import Any
 
 logger = logging.getLogger(__name__)
+
+# ── Research cache: exact-query TTL to avoid repeated expensive calls ──
+_research_cache: dict[str, tuple[dict, float]] = {}   # query -> (result_dict, timestamp)
+_RESEARCH_TTL = 600  # 10 minutes
 
 
 async def handle_research(executor, params: dict) -> Any:
@@ -28,6 +33,20 @@ async def handle_research(executor, params: dict) -> Any:
         return {"error": "query is required — describe what you want to research"}
 
     deep = params.get("deep", False)
+
+    # ── Check TTL cache (exact match, 10-min window) ──
+    _cache_key = query.lower().strip()
+    if _cache_key in _research_cache:
+        cached_result, cached_ts = _research_cache[_cache_key]
+        age = time.time() - cached_ts
+        if age < _RESEARCH_TTL:
+            logger.info(f"Research cache hit ({age:.0f}s old): {query[:60]}")
+            cached_result = dict(cached_result)  # copy
+            cached_result["cached"] = True
+            cached_result["cache_age_s"] = round(age)
+            return cached_result
+        else:
+            del _research_cache[_cache_key]  # expired
 
     try:
         from xai_sdk import AsyncClient
@@ -71,13 +90,22 @@ async def handle_research(executor, params: dict) -> Any:
 
         await client.close()
 
-        return {
+        result = {
             "query": query,
             "result": content[:8000],  # Cap to avoid blowing up context
             "agents_used": agents_used,
             "tokens": usage.prompt_tokens + usage.completion_tokens,
             "truncated": len(content) > 8000,
         }
+
+        # ── Store in cache ──
+        _research_cache[_cache_key] = (result, time.time())
+        # Evict oldest if > 20 cached queries
+        if len(_research_cache) > 20:
+            oldest = min(_research_cache, key=lambda k: _research_cache[k][1])
+            del _research_cache[oldest]
+
+        return result
 
     except Exception as e:
         logger.error(f"Multi-agent research failed: {e}", exc_info=True)

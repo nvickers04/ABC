@@ -1693,6 +1693,8 @@ class ToolExecutor:
                 else:
                     logger.info(f"Option redirect: {action}({_sym}) → buy_option({_occ['underlying']}, {_occ['expiration']}, {_occ['strike']}, {_occ['right']})")
                     action = "buy_option"
+                # Preserve limit_price from original params (e.g. limit_order → close_option)
+                _limit = params.get("limit_price") or params.get("price")
                 params = {
                     "symbol": _occ["underlying"],
                     "expiration": _occ["expiration"],
@@ -1700,6 +1702,8 @@ class ToolExecutor:
                     "right": _occ["right"],
                     "quantity": int(qty),
                 }
+                if _limit is not None:
+                    params["limit_price"] = _limit
 
         # STRICT cash-only guardrail at dispatch level — catches direct order
         # calls (market_order, limit_order, etc.) that bypass plan_order.

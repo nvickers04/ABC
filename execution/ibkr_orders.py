@@ -47,6 +47,30 @@ class IBKROrdersMixin:
         await self.ib.qualifyContractsAsync(contract)
         return contract
 
+    async def _check_order_rejection(self, trade, order_name: str, symbol: str) -> Optional[Dict[str, Any]]:
+        """
+        Check if a placed order was immediately rejected by IBKR.
+
+        Waits 1s for broker validation, then checks status and trade log
+        for errors (margin rejection, etc.).
+
+        Returns error dict if rejected, None if order looks OK.
+        """
+        await asyncio.sleep(1.0)
+        await asyncio.sleep(0)  # yield to event loop — flushes IBKR callbacks
+
+        status = trade.orderStatus.status
+        has_error = any(e.errorCode for e in trade.log)
+        if status in ('Cancelled', 'ApiCancelled', 'Inactive') or has_error:
+            err_msg = 'Order rejected by broker'
+            for entry in reversed(trade.log):
+                if entry.errorCode:
+                    err_msg = entry.message or f'IBKR error {entry.errorCode}'
+                    break
+            logger.error(f"{order_name} REJECTED for {symbol}: {err_msg}")
+            return {'error': err_msg, 'symbol': symbol, 'order_id': trade.order.orderId}
+        return None
+
     async def _place_order(
         self,
         symbol: str,
@@ -108,24 +132,12 @@ class IBKROrdersMixin:
 
             trade = self.ib.placeOrder(contract, order)
 
-            # Brief pause to let IBKR validate the order server-side
-            await asyncio.sleep(0.5)
-            await asyncio.sleep(0)  # yield to event loop — flushes IBKR callbacks
-
-            # Check if IBKR immediately rejected/cancelled the order
-            status = trade.orderStatus.status
-            if status in ('Cancelled', 'ApiCancelled'):
-                # Extract error from trade log if available
-                err_msg = 'Order rejected by broker'
-                for entry in trade.log:
-                    if entry.errorCode:
-                        err_msg = entry.message or f'IBKR error {entry.errorCode}'
-                        break
-                name = order_name or order_type
-                logger.error(f"{name} order REJECTED for {symbol}: {err_msg}")
-                return {'error': err_msg, 'symbol': symbol, 'order_id': trade.order.orderId}
-
+            # Check for immediate broker rejection (margin, risk, etc.)
             name = order_name or order_type
+            rejection = await self._check_order_rejection(trade, name, symbol)
+            if rejection:
+                return rejection
+
             price_info = f" @ ${limit_price:.2f}" if limit_price else ""
             price_info = price_info or (f" @ ${aux_price:.2f}" if aux_price else "")
             logger.info(f"{name} order placed: {action} {quantity} {symbol}{price_info}")
@@ -669,6 +681,11 @@ class IBKROrdersMixin:
             order.transmit = True
 
             trade = self.ib.placeOrder(contract, order)
+
+            # Check for immediate broker rejection
+            rejection = await self._check_order_rejection(trade, 'Stop-limit', symbol)
+            if rejection:
+                return rejection
 
             # Track order state
             with self._order_state_lock:

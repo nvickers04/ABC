@@ -136,6 +136,11 @@ class IBKROptionsMixin:
 
             trade = self.ib.placeOrder(combo, order)
 
+            # Check for immediate broker rejection
+            rejection = await self._check_order_rejection(trade, strategy_name, symbol)
+            if rejection:
+                return rejection
+
             strikes_str = '/'.join(str(s) for s, _, _, _ in strikes_rights_actions)
             logger.info(f"{strategy_name}: {symbol} {strikes_str} x{quantity}")
 
@@ -185,6 +190,12 @@ class IBKROptionsMixin:
             order.transmit = True
 
             trade = self.ib.placeOrder(opt, order)
+
+            # Check for immediate broker rejection
+            rejection = await self._check_order_rejection(trade, strategy_name, symbol)
+            if rejection:
+                return rejection
+
             logger.info(f"{strategy_name}: {action} {quantity} {symbol} {strike}{right} {expiration}")
 
             return {
@@ -433,6 +444,12 @@ class IBKROptionsMixin:
 
             trade = self.ib.placeOrder(combo, order)
             strategy = f"{'Call' if right == 'C' else 'Put'} Calendar"
+
+            # Check for immediate broker rejection
+            rejection = await self._check_order_rejection(trade, strategy, symbol)
+            if rejection:
+                return rejection
+
             logger.info(f"{strategy}: {symbol} {strike} {near_expiration}/{far_expiration} x{quantity}")
 
             return {
@@ -495,6 +512,12 @@ class IBKROptionsMixin:
             trade = self.ib.placeOrder(combo, order)
             direction = "Bullish" if (right == 'C' and far_strike > near_strike) or (right == 'P' and far_strike < near_strike) else "Bearish"
             strategy = f"{direction} {'Call' if right == 'C' else 'Put'} Diagonal"
+
+            # Check for immediate broker rejection
+            rejection = await self._check_order_rejection(trade, strategy, symbol)
+            if rejection:
+                return rejection
+
             logger.info(f"{strategy}: {symbol} {near_strike}/{far_strike} {near_expiration}/{far_expiration} x{quantity}")
 
             return {
@@ -733,19 +756,12 @@ class IBKROptionsMixin:
                        f"{contract.strike}{contract.right} {contract.lastTradeDateOrContractMonth} "
                        f"{'LMT@' + str(limit_price) if limit_price else 'MKT'} [{reason}]")
 
-            # Brief pause to let IBKR validate the order server-side
-            await asyncio.sleep(0.5)
-
-            # Check if IBKR immediately rejected/cancelled the order
-            status = trade.orderStatus.status
-            if status in ('Cancelled', 'ApiCancelled'):
-                err_msg = 'Option close order rejected by broker'
-                for entry in trade.log:
-                    if entry.errorCode:
-                        err_msg = entry.message or f'IBKR error {entry.errorCode}'
-                        break
-                logger.error(f"Close option REJECTED for {symbol} {contract.strike}{contract.right}: {err_msg}")
-                return {'error': err_msg, 'symbol': symbol, 'order_id': trade.order.orderId}
+            # Check for immediate broker rejection
+            rejection = await self._check_order_rejection(
+                trade, f'Close {symbol} {contract.strike}{contract.right}', symbol
+            )
+            if rejection:
+                return rejection
 
             return {
                 'success': True,
@@ -864,6 +880,11 @@ class IBKROptionsMixin:
             order.transmit = True
 
             trade = self.ib.placeOrder(combo, order)
+
+            # Check for immediate broker rejection
+            rejection = await self._check_order_rejection(trade, f'Roll {roll_type}', symbol)
+            if rejection:
+                return rejection
 
             logger.info(f"Roll option: {symbol} "
                        f"{current_contract.strike}{current_contract.right} {current_contract.lastTradeDateOrContractMonth} -> "

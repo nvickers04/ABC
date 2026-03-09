@@ -237,6 +237,7 @@ src/data/memory/backups/
 # Memory files
 data/memory/agents/
 data/memory/shared/
+memory/*.db
 data/vector_db/
 .testmondata
 

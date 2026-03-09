@@ -104,6 +104,8 @@ def main():
     parser = argparse.ArgumentParser(description="Grok 4.20 Trader")
     parser.add_argument("--test", action="store_true", help="Test Grok connection")
     parser.add_argument("--verbose", action="store_true", help="Enable DEBUG logging")
+    parser.add_argument("--research", action="store_true",
+                        help="Run research agent alongside trader")
     parser.add_argument(
         "--account",
         choices=["paper", "live"],
@@ -130,7 +132,20 @@ def main():
     print("Press Ctrl+C to stop\n")
 
     from core.agent import run_agent
-    asyncio.run(run_agent())
+
+    if args.research:
+        from research.agent import run_research
+        print("Research agent running alongside trader\n")
+
+        async def _run_both():
+            await asyncio.gather(
+                run_agent(),
+                run_research(verbose=args.verbose),
+            )
+
+        asyncio.run(_run_both())
+    else:
+        asyncio.run(run_agent())
 
 
 if __name__ == "__main__":

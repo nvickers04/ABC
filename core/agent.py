@@ -253,6 +253,68 @@ class TradingAgent:
         summary = self.cost_tracker.get_budget_summary()
         return summary.today_llm_cost >= MAX_DAILY_LLM_COST
 
+    def _get_research_briefing(self) -> str | None:
+        """Read latest kept strategy + live signals from research DB."""
+        try:
+            from memory import get_db
+            db = get_db()
+
+            # Best strategy
+            row = db.execute(
+                """SELECT id, expectancy, hit_rate, avg_rr, total_signals, llm_analysis
+                   FROM strategies WHERE kept = 1
+                   ORDER BY expectancy DESC LIMIT 1"""
+            ).fetchone()
+            if not row:
+                return None
+
+            lines = ["═══ RESEARCH BRIEFING ═══"]
+            lines.append(
+                f"  Best strategy #{row['id']}: exp={row['expectancy']:.4f} "
+                f"hit={row['hit_rate']:.0f}% R:R={row['avg_rr']:.1f} "
+                f"({row['total_signals']} signals)"
+            )
+            if row["llm_analysis"]:
+                snippet = row["llm_analysis"][:300].replace("\n", " ")
+                lines.append(f"  Insight: {snippet}")
+
+            # Live signals for today
+            live = db.execute(
+                """SELECT symbol, direction, order_type, setup_type,
+                          entry_price, target_price, stop_price
+                   FROM live_signals ORDER BY symbol"""
+            ).fetchall()
+            if live:
+                lines.append(f"  Live signals today: {len(live)}")
+                for sig in live[:10]:  # cap at 10 to avoid overwhelming context
+                    lines.append(
+                        f"    {sig['symbol']} {sig['direction']} {sig['order_type']} "
+                        f"@ {sig['entry_price']:.2f} "
+                        f"tgt={sig['target_price']:.2f} stp={sig['stop_price']:.2f} "
+                        f"({sig['setup_type']})"
+                    )
+                if len(live) > 10:
+                    lines.append(f"    ... and {len(live) - 10} more")
+
+            return "\n".join(lines)
+        except Exception:
+            return None
+
+    def record_trade(self, symbol: str, side: str, pnl: float, held_minutes: int = 0):
+        """Record a closed trade into the research memory DB."""
+        try:
+            from memory import get_db
+            from datetime import datetime, timezone
+            db = get_db()
+            db.execute(
+                """INSERT INTO trades (ts, symbol, side, pnl, held_minutes)
+                   VALUES (?, ?, ?, ?, ?)""",
+                (datetime.now(timezone.utc).isoformat(), symbol, side, pnl, held_minutes),
+            )
+            db.commit()
+        except Exception as e:
+            logger.debug(f"Failed to record trade: {e}")
+
     async def _build_state_context(self) -> str:
         """Build the complete dynamic state context for the agent.
 
@@ -373,6 +435,15 @@ class TradingAgent:
                     lines.append(f"  #{oid} {action} {qty} {sym} {otype} {price_str}{tag}")
         except Exception as e:
             lines.append(f"Order error: {e}")
+
+        # ── Research briefing ───────────────────────────────────
+        try:
+            briefing = self._get_research_briefing()
+            if briefing:
+                lines.append("")
+                lines.append(briefing)
+        except Exception as e:
+            logger.debug(f"Research briefing unavailable: {e}")
 
         return "\n".join(lines)
 

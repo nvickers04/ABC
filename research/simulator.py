@@ -11,7 +11,7 @@ from typing import Any
 
 import pandas as pd
 
-from research.config import FORCE_EXIT_MINUTE
+from research.config import FORCE_EXIT_MINUTE, SLIPPAGE_BPS
 
 logger = logging.getLogger(__name__)
 
@@ -62,6 +62,13 @@ def _simulate_one(sig: dict, candles: pd.DataFrame) -> dict | None:
     if fill_bar is None:
         return None
 
+    # Recalculate stop/target relative to actual fill price (preserves % distance)
+    if entry_price and entry_price > 0:
+        target_dist = (target_price - entry_price) / entry_price
+        stop_dist = (stop_price - entry_price) / entry_price
+        target_price = fill_price * (1 + target_dist)
+        stop_price = fill_price * (1 + stop_dist)
+
     # Walk forward from fill bar
     is_long = direction == "long"
     trail_stop = stop_price
@@ -107,27 +114,37 @@ def _simulate_one(sig: dict, candles: pd.DataFrame) -> dict | None:
         active_stop = trail_stop if trail_pct > 0 else stop_price
 
         if is_long:
-            # Check stop first (conservative — assume adverse move happens first)
-            if bar_low <= active_stop:
-                exit_bar = i
-                exit_price = active_stop
-                hit_stop = 1
+            stop_hit = bar_low <= active_stop
+            tgt_hit = bar_high >= target_price
+            if stop_hit and tgt_hit:
+                # Both hit on same bar — use open to infer which came first
+                bar_open = bar["open"]
+                if bar_open >= fill_price:  # opened in favorable direction
+                    exit_bar, exit_price, hit_target = i, target_price, 1
+                else:
+                    exit_bar, exit_price, hit_stop = i, active_stop, 1
                 break
-            if bar_high >= target_price:
-                exit_bar = i
-                exit_price = target_price
-                hit_target = 1
+            elif stop_hit:
+                exit_bar, exit_price, hit_stop = i, active_stop, 1
+                break
+            elif tgt_hit:
+                exit_bar, exit_price, hit_target = i, target_price, 1
                 break
         else:
-            if bar_high >= active_stop:
-                exit_bar = i
-                exit_price = active_stop
-                hit_stop = 1
+            stop_hit = bar_high >= active_stop
+            tgt_hit = bar_low <= target_price
+            if stop_hit and tgt_hit:
+                bar_open = bar["open"]
+                if bar_open <= fill_price:
+                    exit_bar, exit_price, hit_target = i, target_price, 1
+                else:
+                    exit_bar, exit_price, hit_stop = i, active_stop, 1
                 break
-            if bar_low <= target_price:
-                exit_bar = i
-                exit_price = target_price
-                hit_target = 1
+            elif stop_hit:
+                exit_bar, exit_price, hit_stop = i, active_stop, 1
+                break
+            elif tgt_hit:
+                exit_bar, exit_price, hit_target = i, target_price, 1
                 break
 
     # If we never exited (ran out of bars), close at last bar
@@ -136,11 +153,12 @@ def _simulate_one(sig: dict, candles: pd.DataFrame) -> dict | None:
         exit_price = candles.iloc[-1]["close"]
         timed_out = 1
 
-    # Compute return
+    # Compute return (subtract slippage + commission)
     if is_long:
         return_pct = (exit_price - fill_price) / fill_price * 100
     else:
         return_pct = (fill_price - exit_price) / fill_price * 100
+    return_pct -= SLIPPAGE_BPS / 100  # subtract slippage per trade
 
     # Handle options legs if present
     legs = sig.get("legs_json")
@@ -327,21 +345,18 @@ def _simulate_options_return(legs: dict, underlying_entry: float, underlying_exi
 
 
 def _minute_of_day(ts: Any) -> int | None:
-    """Extract minute-of-day from a timestamp. Returns None if unparseable."""
+    """Extract minute-of-day (ET) from a timestamp. Returns None if unparseable."""
     try:
+        from zoneinfo import ZoneInfo
+        _et = ZoneInfo("America/New_York")
         if isinstance(ts, (int, float)):
             from datetime import datetime, timezone
-            dt = datetime.fromtimestamp(ts, tz=timezone.utc)
-            # Convert to ET (approximate: UTC-5 for EST, UTC-4 EDT)
-            # March-November is EDT (UTC-4)
-            et_hour = (dt.hour - 4) % 24
-            return et_hour * 60 + dt.minute
+            dt = datetime.fromtimestamp(ts, tz=timezone.utc).astimezone(_et)
+            return dt.hour * 60 + dt.minute
         elif isinstance(ts, str):
-            # Try parsing ISO format
             from datetime import datetime
-            dt = datetime.fromisoformat(ts.replace("Z", "+00:00"))
-            et_hour = (dt.hour - 4) % 24
-            return et_hour * 60 + dt.minute
+            dt = datetime.fromisoformat(ts.replace("Z", "+00:00")).astimezone(_et)
+            return dt.hour * 60 + dt.minute
         elif hasattr(ts, "hour"):
             return ts.hour * 60 + ts.minute
     except Exception:

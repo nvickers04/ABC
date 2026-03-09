@@ -20,6 +20,7 @@ RESEARCH_UNIVERSE = [
 CANDLE_RESOLUTION = "1"         # 1-min bars
 EVAL_DAYS_BACK = 10             # evaluate against each of the last 10 trading days
 FORCE_EXIT_MINUTE = 955         # 15:55 ET — force exit 5 min before close (minute of day)
+SLIPPAGE_BPS = 2                # 2 basis points per trade (slippage + commission)
 
 # ── Sandbox ─────────────────────────────────────────────────────
 SANDBOX_ALLOWED_IMPORTS = {"pandas", "numpy", "math", "statistics"}
@@ -82,7 +83,9 @@ STRATEGY EVOLUTION GUIDELINES:
 - Adjust target:stop ratios for better R:R
 - Try different setup types: breakout, mean-reversion, opening range, VWAP bounce
 - The LLM analysis section shows qualitative insights about what worked and why
-- The mechanical expectancy score decides keep/discard — focus on improving that number
+- The mechanical fitness score decides keep/discard — focus on improving that number
+- Options strategies are supported but use delta/theta P&L approximations.
+  Prefer simple structures (verticals, straddles) over complex multi-leg strategies.
 
 RESPONSE FORMAT:
 Output ONLY the Python code for strategy.py. No markdown fences, no explanation outside the code.

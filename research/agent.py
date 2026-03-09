@@ -11,12 +11,16 @@ import ast
 import asyncio
 import json
 import logging
+import random
 import subprocess
 import textwrap
 import time
 from datetime import datetime, date, timedelta, timezone
 from pathlib import Path
 from typing import Optional
+from zoneinfo import ZoneInfo
+
+_ET = ZoneInfo("America/New_York")
 
 import pandas as pd
 
@@ -56,30 +60,38 @@ def _candles_to_df(candles) -> pd.DataFrame:
     })
 
 
-def _split_by_trading_day(df: pd.DataFrame) -> dict[str, pd.DataFrame]:
+def _split_by_trading_day(
+    df: pd.DataFrame, *, exclude_today: bool = False,
+) -> dict[str, pd.DataFrame]:
     """Split a multi-day candle DataFrame into per-day DataFrames.
 
     Returns {date_str: df} where date_str is YYYY-MM-DD.
+    If exclude_today is True, today's (potentially incomplete) data is dropped.
     """
     if df.empty:
         return {}
 
-    # Convert unix timestamps to ET datetimes
+    # Convert unix timestamps to proper ET using zoneinfo (handles EST/EDT)
     df = df.copy()
     df["dt"] = pd.to_datetime(df["ts"], unit="s", utc=True)
-    # Approximate ET as UTC-4 (EDT). Good enough for date boundaries.
-    df["dt_et"] = df["dt"] - pd.Timedelta(hours=4)
+    df["dt_et"] = df["dt"].dt.tz_convert(_ET)
     df["trade_date"] = df["dt_et"].dt.date.astype(str)
+
+    today_str = date.today().isoformat()
 
     days = {}
     for d, group in df.groupby("trade_date"):
+        if exclude_today and d == today_str:
+            continue
         day_df = group.drop(columns=["dt", "dt_et", "trade_date"]).reset_index(drop=True)
         if len(day_df) >= 30:  # need at least 30 bars for a meaningful test
             days[d] = day_df
     return days
 
 
-def _fetch_universe_candles(days_back: int) -> dict[str, dict[str, pd.DataFrame]]:
+def _fetch_universe_candles(
+    days_back: int, *, exclude_today: bool = False,
+) -> dict[str, dict[str, pd.DataFrame]]:
     """Fetch candles for all symbols, split by trading day.
 
     Returns: {symbol: {date_str: df}}
@@ -87,18 +99,53 @@ def _fetch_universe_candles(days_back: int) -> dict[str, dict[str, pd.DataFrame]
     provider = get_data_provider()
     universe: dict[str, dict[str, pd.DataFrame]] = {}
 
+    # Use explicit date range so intraday resolution gets full days, not N bars
+    to_date = date.today().isoformat()
+    from_date = (date.today() - timedelta(days=days_back + 4)).isoformat()  # +4 for weekends
+
     for sym in RESEARCH_UNIVERSE:
         try:
-            raw = provider.get_candles(sym, resolution=CANDLE_RESOLUTION, days_back=days_back)
+            raw = provider.get_candles(
+                sym, resolution=CANDLE_RESOLUTION,
+                from_date=from_date, to_date=to_date,
+            )
             if raw and len(raw) > 0:
                 df = _candles_to_df(raw)
-                days = _split_by_trading_day(df)
+                days = _split_by_trading_day(df, exclude_today=exclude_today)
                 if days:
                     universe[sym] = days
         except Exception as e:
             logger.warning(f"Failed to fetch candles for {sym}: {e}")
 
     return universe
+
+
+def _train_test_split(
+    universe: dict[str, dict[str, pd.DataFrame]],
+    train_ratio: float = 0.7,
+) -> tuple[dict[str, dict[str, pd.DataFrame]], dict[str, dict[str, pd.DataFrame]]]:
+    """Split universe into train/test by date.  Chronological — no leakage."""
+    # Collect all unique dates
+    all_dates = sorted({d for days in universe.values() for d in days})
+    if len(all_dates) < 3:
+        # Not enough days to split — use everything for both
+        return universe, universe
+
+    split_idx = max(1, int(len(all_dates) * train_ratio))
+    train_dates = set(all_dates[:split_idx])
+    test_dates = set(all_dates[split_idx:])
+
+    train: dict[str, dict[str, pd.DataFrame]] = {}
+    test: dict[str, dict[str, pd.DataFrame]] = {}
+    for sym, days in universe.items():
+        tr = {d: df for d, df in days.items() if d in train_dates}
+        te = {d: df for d, df in days.items() if d in test_dates}
+        if tr:
+            train[sym] = tr
+        if te:
+            test[sym] = te
+
+    return train, test
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -181,6 +228,26 @@ def _execute_strategy(source: str, candles: pd.DataFrame, symbol: str) -> list[d
 # EVALUATION
 # ═══════════════════════════════════════════════════════════════
 
+def _deduplicate_signals(signals: list[dict]) -> list[dict]:
+    """Remove overlapping signals for the same symbol.
+
+    After a signal fires at bar N, skip any signals within the next
+    max_hold_bars bars (cooldown period) to avoid correlated trades.
+    """
+    if not signals:
+        return []
+    # Sort by entry_bar
+    sorted_sigs = sorted(signals, key=lambda s: s.get("entry_bar", 0))
+    result = []
+    next_allowed_bar = -1
+    for sig in sorted_sigs:
+        bar = sig.get("entry_bar", 0)
+        if bar >= next_allowed_bar:
+            result.append(sig)
+            next_allowed_bar = bar + sig.get("max_hold_bars", 60)
+    return result
+
+
 def _evaluate_strategy(
     source: str,
     universe: dict[str, dict[str, pd.DataFrame]],
@@ -198,6 +265,8 @@ def _evaluate_strategy(
             signals = _execute_strategy(source, day_df, sym)
             if not signals:
                 continue
+            # Deduplicate overlapping signals per symbol/day
+            signals = _deduplicate_signals(signals)
             sim_results = simulate(signals, day_df)
             if not sim_results:
                 continue
@@ -228,9 +297,13 @@ async def _llm_analyze(
     all_results: list[dict],
 ) -> str:
     """Ask the LLM to analyze backtest results. Returns analysis text."""
-    winners = [r for r in all_results if r.get("return_pct", 0) > 0][:10]
-    losers = [r for r in all_results if r.get("return_pct", 0) < 0][:10]
-    timed = [r for r in all_results if r.get("timed_out")][:5]
+    winners = [r for r in all_results if r.get("return_pct", 0) > 0]
+    losers = [r for r in all_results if r.get("return_pct", 0) < 0]
+    timed = [r for r in all_results if r.get("timed_out")]
+    # Random sample for diverse symbol/date coverage
+    winners = random.sample(winners, min(10, len(winners))) if winners else []
+    losers = random.sample(losers, min(10, len(losers))) if losers else []
+    timed = random.sample(timed, min(5, len(timed))) if timed else []
 
     # Format per-day results as a readable table
     day_lines = []
@@ -292,6 +365,8 @@ async def _llm_propose_strategy(
     current_source: str,
     analysis: str,
     history_summary: str,
+    *,
+    temperature: float = 0.5,
 ) -> str:
     """Ask the LLM to propose a new strategy.py. Returns raw source code."""
     prompt = f"""CURRENT STRATEGY:
@@ -305,8 +380,17 @@ ANALYSIS OF CURRENT STRATEGY:
 HISTORY OF PAST ATTEMPTS (recent first):
 {history_summary}
 
+DATA CONTEXT (important!):
+- Each trading day has ~390 bars (1-min candles, 9:30-16:00 ET)
+- Universe: {len(RESEARCH_UNIVERSE)} medium-cap stocks
+- candles DataFrame columns: ts, open, high, low, close, volume
+- The scan() function receives ONE day of candles at a time (not multi-day)
+- Bars are indexed 0-389 for a full day
+- If your strategy produces 0 signals, it will be immediately discarded
+- Prefer generous filters that produce 50+ signals over strict filters that produce 0
+
 Based on the analysis, write an improved strategy.py.
-Output ONLY the complete Python code — no markdown fences, no explanation outside the code."""
+Output ONLY the complete Python code -- no markdown fences, no explanation outside the code."""
 
     from xai_sdk.chat import system as sdk_system, user as sdk_user
     llm = get_grok_llm()
@@ -316,7 +400,7 @@ Output ONLY the complete Python code — no markdown fences, no explanation outs
             sdk_system(RESEARCH_SYSTEM_PROMPT),
             sdk_user(prompt),
         ],
-        temperature=0.4,
+        temperature=temperature,
         max_tokens=4096,
     )
     response = await chat.sample()
@@ -439,10 +523,10 @@ def _store_strategy(
 
 
 def _get_history_summary(limit: int = 10) -> str:
-    """Get recent strategy history for LLM context."""
+    """Get recent strategy history for LLM context, including failed code."""
     db = get_db()
     rows = db.execute(
-        """SELECT id, ts, total_signals, hit_rate, expectancy, kept, llm_analysis
+        """SELECT id, ts, total_signals, hit_rate, expectancy, kept, llm_analysis, methodology
            FROM strategies ORDER BY id DESC LIMIT ?""",
         (limit,),
     ).fetchall()
@@ -451,17 +535,41 @@ def _get_history_summary(limit: int = 10) -> str:
         return "(No prior attempts.)"
 
     lines = []
+    failed_code_shown = 0
     for r in rows:
         kept_str = "KEPT" if r["kept"] else "DISCARDED"
+        signals = r["total_signals"] or 0
+        hit = r["hit_rate"] or 0
+        exp = r["expectancy"] or 0
         lines.append(
-            f"  #{r['id']} [{kept_str}] signals={r['total_signals']} "
-            f"hit={r['hit_rate']:.0f}% exp={r['expectancy']:.4f}"
+            f"  #{r['id']} [{kept_str}] signals={signals} "
+            f"hit={hit:.0f}% exp={exp:.4f}"
         )
+        if signals == 0:
+            lines.append("    WARNING: 0 signals = filters too strict. Loosen thresholds!")
         if r["llm_analysis"]:
-            # First 200 chars of analysis
             snippet = r["llm_analysis"][:200].replace("\n", " ")
             lines.append(f"    Analysis: {snippet}...")
+        # Include parameter block of last 3 failed strategies so LLM avoids repeating
+        if not r["kept"] and failed_code_shown < 3 and r["methodology"]:
+            code_lines = r["methodology"].split("\n")[:30]
+            lines.append("    Code (first 30 lines):")
+            for cl in code_lines:
+                lines.append(f"      {cl}")
+            failed_code_shown += 1
     return "\n".join(lines)
+
+
+def _compute_fitness(agg: dict) -> float:
+    """Composite fitness score — expectancy weighted by signal count and consistency."""
+    exp = agg.get("expectancy", 0)
+    signals = agg.get("total_signals", 0)
+    sharpe = agg.get("sharpe_approx", 0)
+    # Discount strategies with fewer than 100 independent signals
+    signal_factor = min(1.0, signals / 100)
+    # Reward consistency (Sharpe ~1.0 is neutral, >1.5 capped)
+    sharpe_factor = max(0.5, min(1.5, sharpe / 1.0)) if sharpe != 0 else 0.75
+    return exp * signal_factor * sharpe_factor
 
 
 def _get_best_strategy() -> tuple[Optional[int], Optional[str], float]:
@@ -569,16 +677,17 @@ async def run_research(*, verbose: bool = False, dry_run: bool = False):
     init_db()
 
     logger.info("=" * 60)
-    logger.info("RESEARCH AGENT — Strategy Evolution")
+    logger.info("RESEARCH AGENT - Strategy Evolution")
     logger.info(f"Universe: {len(RESEARCH_UNIVERSE)} symbols")
     logger.info(f"Eval window: last {EVAL_DAYS_BACK} trading days, {CANDLE_RESOLUTION}-min bars")
     logger.info("=" * 60)
 
     iteration = 0
+    consecutive_failures = 0
 
     while True:
         iteration += 1
-        logger.info(f"{'─'*40} Iteration {iteration} {'─'*40}")
+        logger.info(f"{'-'*40} Iteration {iteration} {'-'*40}")
 
         # ── 1. Load current strategy ────────────────────────────
         try:
@@ -587,9 +696,9 @@ async def run_research(*, verbose: bool = False, dry_run: bool = False):
             logger.error(f"strategy.py not found at {_STRATEGY_PATH}")
             return
 
-        # ── 2. Fetch candles ────────────────────────────────────
+        # ── 2. Fetch candles (exclude today for stable eval) ────
         logger.info("Fetching candle data...")
-        universe = _fetch_universe_candles(EVAL_DAYS_BACK)
+        universe = _fetch_universe_candles(EVAL_DAYS_BACK, exclude_today=True)
         total_days = sum(len(days) for days in universe.values())
         logger.info(f"Got data for {len(universe)} symbols across {total_days} trading days")
 
@@ -598,72 +707,134 @@ async def run_research(*, verbose: bool = False, dry_run: bool = False):
             await asyncio.sleep(300)
             continue
 
-        # ── 3. Evaluate current strategy ────────────────────────
-        logger.info("Evaluating current strategy...")
-        agg, per_day, all_results = _evaluate_strategy(current_source, universe)
+        # ── 3. Train/test split ─────────────────────────────────
+        train_universe, test_universe = _train_test_split(universe)
+        train_days = sum(len(d) for d in train_universe.values())
+        test_days = sum(len(d) for d in test_universe.values())
+        logger.info(f"Split: train={train_days} days, test={test_days} days")
+
+        # ── 4. Evaluate current strategy on TRAIN set ───────────
+        logger.info("Evaluating current strategy (train)...")
+        train_agg, train_per_day, train_results = _evaluate_strategy(current_source, train_universe)
         logger.info(
-            f"Current: signals={agg['total_signals']} hit={agg['hit_rate']:.0f}% "
-            f"exp={agg['expectancy']:.4f} pf={agg['profit_factor']:.2f}"
+            f"Current train: signals={train_agg['total_signals']} hit={train_agg['hit_rate']:.0f}% "
+            f"exp={train_agg['expectancy']:.4f} pf={train_agg['profit_factor']:.2f}"
         )
 
-        if agg["total_signals"] == 0:
-            logger.warning("Current strategy produced zero signals")
+        # Also evaluate on TEST set for baseline comparison
+        test_agg, test_per_day, test_results = _evaluate_strategy(current_source, test_universe)
+        best_test_fitness = _compute_fitness(test_agg)
+        logger.info(
+            f"Current test:  signals={test_agg['total_signals']} hit={test_agg['hit_rate']:.0f}% "
+            f"exp={test_agg['expectancy']:.4f} fitness={best_test_fitness:.4f}"
+        )
 
-        # ── 4. LLM analysis ─────────────────────────────────────
+        if train_agg["total_signals"] == 0:
+            logger.warning("Current strategy produced zero signals on train set")
+
+        # ── 5. LLM analysis (on TRAIN results only — no test leakage) ─
         logger.info("Running LLM analysis...")
-        analysis = await _llm_analyze(current_source, agg, per_day, all_results)
+        analysis = await _llm_analyze(current_source, train_agg, train_per_day, train_results)
         logger.info(f"Analysis: {analysis[:150]}...")
 
-        # Store current strategy evaluation
-        best_id, _, best_exp = _get_best_strategy()
+        # Store current strategy evaluation (only on first iteration)
+        best_id, best_source, best_exp = _get_best_strategy()
         is_first = best_id is None
 
-        current_id = _store_strategy(
-            current_source, agg, per_day, all_results, analysis,
-            kept=is_first,  # keep first strategy by default
-            parent_id=best_id,
+        if is_first:
+            current_id = _store_strategy(
+                current_source, train_agg, train_per_day, train_results, analysis,
+                kept=True,
+                parent_id=None,
+            )
+            best_id = current_id
+            best_exp = train_agg.get("expectancy", 0)
+            logger.info(f"First strategy stored as baseline (id={current_id})")
+        else:
+            current_id = best_id
+
+        # ── 6. Propose new strategy (escalating temp on failures) ─
+        proposal_temp = min(1.0, 0.5 + consecutive_failures * 0.05)
+        history = _get_history_summary()
+        logger.info(f"Proposing new strategy (temp={proposal_temp:.2f}, failures={consecutive_failures})...")
+        new_source = await _llm_propose_strategy(
+            current_source, analysis, history, temperature=proposal_temp,
         )
 
-        if is_first:
-            best_id = current_id
-            best_exp = agg.get("expectancy", 0)
-            logger.info(f"First strategy stored as baseline (id={current_id})")
-
-        # ── 5. Propose new strategy ─────────────────────────────
-        history = _get_history_summary()
-        logger.info("Proposing new strategy...")
-        new_source = await _llm_propose_strategy(current_source, analysis, history)
-
-        # ── 6. Validate new strategy ────────────────────────────
+        # ── 7. Validate new strategy ────────────────────────────
         validation_err = _validate_strategy_source(new_source)
         if validation_err:
             logger.warning(f"Proposed strategy failed validation: {validation_err}")
-            # Store as discarded
             _store_strategy(new_source, {"total_signals": 0}, [], [], validation_err, kept=False, parent_id=current_id)
+            consecutive_failures += 1
             continue
 
-        # ── 7. Evaluate new strategy ────────────────────────────
-        logger.info("Evaluating proposed strategy...")
-        new_agg, new_per_day, new_all_results = _evaluate_strategy(new_source, universe)
+        # ── 8. Evaluate new strategy on TRAIN set ───────────────
+        logger.info("Evaluating proposed strategy (train)...")
+        new_train_agg, new_train_pd, new_train_res = _evaluate_strategy(new_source, train_universe)
         logger.info(
-            f"Proposed: signals={new_agg['total_signals']} hit={new_agg['hit_rate']:.0f}% "
-            f"exp={new_agg['expectancy']:.4f} pf={new_agg['profit_factor']:.2f}"
+            f"Proposed train: signals={new_train_agg['total_signals']} hit={new_train_agg['hit_rate']:.0f}% "
+            f"exp={new_train_agg['expectancy']:.4f} pf={new_train_agg['profit_factor']:.2f}"
         )
 
-        # ── 8. LLM analysis of new strategy ─────────────────────
-        new_analysis = await _llm_analyze(new_source, new_agg, new_per_day, new_all_results)
+        # ── 9. Evaluate new strategy on TEST set ────────────────
+        new_test_agg, new_test_pd, new_test_res = _evaluate_strategy(new_source, test_universe)
+        new_test_fitness = _compute_fitness(new_test_agg)
+        logger.info(
+            f"Proposed test:  signals={new_test_agg['total_signals']} hit={new_test_agg['hit_rate']:.0f}% "
+            f"exp={new_test_agg['expectancy']:.4f} fitness={new_test_fitness:.4f}"
+        )
 
-        # ── 9. Keep or discard ──────────────────────────────────
-        new_exp = new_agg.get("expectancy", 0)
-        improved = new_exp > best_exp and new_agg.get("total_signals", 0) >= 5
-
-        if improved:
-            logger.info(
-                f"KEEPING new strategy: exp {best_exp:.4f} → {new_exp:.4f} "
-                f"(+{new_exp - best_exp:.4f})"
+        # ── 10. LLM analysis of new strategy (skip if 0 signals) ─
+        if new_train_agg.get("total_signals", 0) > 0:
+            new_analysis = await _llm_analyze(new_source, new_train_agg, new_train_pd, new_train_res)
+        else:
+            new_analysis = (
+                "ZERO SIGNALS produced. The filters are too strict for the data. "
+                "Each trading day has ~390 bars (1-min, 9:30-16:00 ET). "
+                "Loosen conditions, lower thresholds, or simplify the logic."
             )
+            logger.warning("Proposed strategy produced 0 signals -- filters too strict")
+
+        # ── 11. Keep or discard (fitness-based + annealing) ─────
+        min_test_signals = 15
+        has_enough_signals = new_test_agg.get("total_signals", 0) >= min_test_signals
+        train_positive = new_train_agg.get("expectancy", 0) > 0
+
+        # Strict improvement
+        strict_improved = (
+            new_test_fitness > best_test_fitness
+            and has_enough_signals
+            and train_positive
+        )
+
+        # Simulated annealing: accept within 10% if stuck
+        annealing_accept = False
+        if (
+            not strict_improved
+            and has_enough_signals
+            and train_positive
+            and consecutive_failures >= 5
+            and best_test_fitness > 0
+            and new_test_fitness >= best_test_fitness * 0.9
+        ):
+            annealing_accept = True
+
+        kept = strict_improved or annealing_accept
+
+        if kept:
+            if annealing_accept:
+                logger.info(
+                    f"ACCEPTING (annealing): fitness {new_test_fitness:.4f} vs best {best_test_fitness:.4f} "
+                    f"after {consecutive_failures} consecutive failures"
+                )
+            else:
+                logger.info(
+                    f"KEEPING new strategy: fitness {best_test_fitness:.4f} -> {new_test_fitness:.4f} "
+                    f"(+{new_test_fitness - best_test_fitness:.4f})"
+                )
             new_id = _store_strategy(
-                new_source, new_agg, new_per_day, new_all_results, new_analysis,
+                new_source, new_train_agg, new_train_pd, new_train_res, new_analysis,
                 kept=True, parent_id=current_id,
             )
 
@@ -672,27 +843,34 @@ async def run_research(*, verbose: bool = False, dry_run: bool = False):
                 logger.info(f"strategy.py updated (id={new_id})")
 
             best_id = new_id
-            best_exp = new_exp
+            best_test_fitness = new_test_fitness
+            consecutive_failures = 0
         else:
-            reason = "lower expectancy" if new_exp <= best_exp else "too few signals"
-            logger.info(
-                f"DISCARDING: exp {new_exp:.4f} vs best {best_exp:.4f} ({reason})"
-            )
+            reasons = []
+            if new_test_fitness <= best_test_fitness:
+                reasons.append(f"lower fitness ({new_test_fitness:.4f} vs {best_test_fitness:.4f})")
+            if not has_enough_signals:
+                reasons.append(f"too few test signals ({new_test_agg.get('total_signals', 0)}<{min_test_signals})")
+            if not train_positive:
+                reasons.append("negative train expectancy")
+            logger.info(f"DISCARDING: {', '.join(reasons)}")
             _store_strategy(
-                new_source, new_agg, new_per_day, new_all_results, new_analysis,
+                new_source, new_train_agg, new_train_pd, new_train_res, new_analysis,
                 kept=False, parent_id=current_id,
             )
+            consecutive_failures += 1
 
-        # ── 10. Live scan ───────────────────────────────────────
+        # ── 12. Live scan ───────────────────────────────────────
         if best_id is not None:
             best_source = _STRATEGY_PATH.read_text(encoding="utf-8") if not dry_run else current_source
             _run_live_scan(best_id, best_source)
 
-        # ── 11. Git commit ──────────────────────────────────────
+        # ── 13. Git commit ──────────────────────────────────────
         if not dry_run:
-            _git_commit(iteration, improved, best_exp, best_id)
+            _git_commit(iteration, kept, new_test_fitness if kept else best_test_fitness, best_id)
 
         logger.info(
-            f"Iteration {iteration} complete — "
-            f"best exp={best_exp:.4f} (strategy #{best_id})"
+            f"Iteration {iteration} complete - "
+            f"best fitness={best_test_fitness:.4f} (strategy #{best_id}) "
+            f"temp={proposal_temp:.2f} failures={consecutive_failures}"
         )

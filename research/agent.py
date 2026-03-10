@@ -660,6 +660,15 @@ def _git_commit(iteration: int, kept: bool, expectancy: float, strategy_id: int 
         )
         if result.returncode == 0:
             logger.info(f"Git commit: {msg}")
+            # Push to remote so GitHub stays in sync
+            push = subprocess.run(
+                ["git", "push"],
+                cwd=_REPO_ROOT, capture_output=True, timeout=30,
+            )
+            if push.returncode == 0:
+                logger.debug("Git push: success")
+            else:
+                logger.debug(f"Git push failed: {push.stderr.decode(errors='replace').strip()}")
         else:
             # Nothing to commit (strategy unchanged) — that's fine
             logger.debug("Git: nothing to commit (strategy unchanged)")

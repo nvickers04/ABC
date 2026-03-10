@@ -254,47 +254,55 @@ class TradingAgent:
         return summary.today_llm_cost >= MAX_DAILY_LLM_COST
 
     def _get_research_briefing(self) -> str | None:
-        """Read latest kept strategy + live signals from research DB."""
+        """Read best strategy per track + live signals from research DB."""
         try:
             from memory import get_db
             db = get_db()
 
-            # Best strategy
-            row = db.execute(
-                """SELECT id, expectancy, hit_rate, avg_rr, total_signals, llm_analysis
-                   FROM strategies WHERE kept = 1
-                   ORDER BY expectancy DESC LIMIT 1"""
-            ).fetchone()
-            if not row:
+            # Best strategy per track
+            rows = db.execute(
+                """SELECT s.id, s.track, s.expectancy, s.hit_rate, s.avg_rr,
+                          s.total_signals, s.llm_analysis
+                   FROM strategies s
+                   INNER JOIN (
+                       SELECT track, MAX(expectancy) as max_exp
+                       FROM strategies WHERE kept = 1
+                       GROUP BY track
+                   ) best ON s.track = best.track AND s.expectancy = best.max_exp
+                   WHERE s.kept = 1
+                   ORDER BY s.expectancy DESC"""
+            ).fetchall()
+            if not rows:
                 return None
 
-            lines = ["═══ RESEARCH BRIEFING ═══"]
-            lines.append(
-                f"  Best strategy #{row['id']}: exp={row['expectancy']:.4f} "
-                f"hit={row['hit_rate']:.0f}% R:R={row['avg_rr']:.1f} "
-                f"({row['total_signals']} signals)"
-            )
-            if row["llm_analysis"]:
-                snippet = row["llm_analysis"][:300].replace("\n", " ")
-                lines.append(f"  Insight: {snippet}")
+            lines = ["=== RESEARCH BRIEFING ==="]
+            for row in rows:
+                lines.append(
+                    f"  [{row['track'].upper()}] #{row['id']}: "
+                    f"exp={row['expectancy']:.4f} hit={row['hit_rate']:.0f}% "
+                    f"R:R={row['avg_rr']:.1f} ({row['total_signals']} signals)"
+                )
+                if row["llm_analysis"]:
+                    snippet = row["llm_analysis"][:200].replace("\n", " ")
+                    lines.append(f"    Insight: {snippet}")
 
-            # Live signals for today
+            # Live signals for today (all tracks)
             live = db.execute(
-                """SELECT symbol, direction, order_type, setup_type,
+                """SELECT track, symbol, direction, order_type, setup_type,
                           entry_price, target_price, stop_price
-                   FROM live_signals ORDER BY symbol"""
+                   FROM live_signals ORDER BY track, symbol"""
             ).fetchall()
             if live:
                 lines.append(f"  Live signals today: {len(live)}")
-                for sig in live[:10]:  # cap at 10 to avoid overwhelming context
+                for sig in live[:15]:
                     lines.append(
-                        f"    {sig['symbol']} {sig['direction']} {sig['order_type']} "
-                        f"@ {sig['entry_price']:.2f} "
+                        f"    [{sig['track']}] {sig['symbol']} {sig['direction']} "
+                        f"{sig['order_type']} @ {sig['entry_price']:.2f} "
                         f"tgt={sig['target_price']:.2f} stp={sig['stop_price']:.2f} "
                         f"({sig['setup_type']})"
                     )
-                if len(live) > 10:
-                    lines.append(f"    ... and {len(live) - 10} more")
+                if len(live) > 15:
+                    lines.append(f"    ... and {len(live) - 15} more")
 
             return "\n".join(lines)
         except Exception:

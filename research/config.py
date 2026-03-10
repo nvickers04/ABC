@@ -1,8 +1,9 @@
 """
-Research Configuration — Universe, timing, system prompt, sandbox rules.
+Research Configuration — Universe, timing, tracks, system prompt, sandbox rules.
 
-The research agent evolves day trading strategies by rewriting strategy.py,
-backtesting against 1-min candle data, and keeping/discarding based on expectancy.
+The research agent evolves day trading strategies across independent tracks,
+one per order type. Each track has its own strategy file, fitness history,
+and evolution state.
 """
 
 # ── Medium-cap optionable universe ──────────────────────────────
@@ -38,6 +39,61 @@ OPTIONS_STRATEGIES = [
     "calendar_spread", "diagonal_spread", "butterfly",
 ]
 
+# ── Research tracks — one per order type ─────────────────────────
+# Each track evolves independently with its own strategy file and fitness.
+TRACKS = [
+    {
+        "name": "market",
+        "order_type": "market",
+        "description": "Market order entries — momentum, breakouts, trend following.",
+    },
+    {
+        "name": "limit",
+        "order_type": "limit",
+        "description": "Limit order entries — pullbacks, mean reversion, support bounces.",
+    },
+    {
+        "name": "stop_entry",
+        "order_type": "stop_entry",
+        "description": "Stop order entries — breakout triggers above resistance / below support.",
+    },
+    {
+        "name": "bracket",
+        "order_type": "bracket",
+        "description": "Bracket orders — entry with automatic stop-loss and take-profit.",
+    },
+    {
+        "name": "vwap",
+        "order_type": "vwap",
+        "description": "VWAP algo entries — mean reversion to VWAP, VWAP bounce, VWAP trend.",
+    },
+    {
+        "name": "moo",
+        "order_type": "moo",
+        "description": "Market on open entries — gap plays, opening range strategies.",
+    },
+    {
+        "name": "moc",
+        "order_type": "moc",
+        "description": "Market on close entries — end-of-day momentum, closing imbalance.",
+    },
+    {
+        "name": "vertical_spread",
+        "order_type": "vertical_spread",
+        "description": "Vertical spread entries — defined-risk directional options.",
+    },
+    {
+        "name": "straddle",
+        "order_type": "straddle",
+        "description": "Long straddle/strangle entries — volatility expansion plays.",
+    },
+    {
+        "name": "iron_condor",
+        "order_type": "iron_condor",
+        "description": "Iron condor entries — premium selling on range-bound names.",
+    },
+]
+
 # ── Signal schema documentation (given to Grok) ─────────────────
 SIGNAL_SCHEMA = """
 Each signal returned by scan() must be a dict with these keys:
@@ -55,11 +111,17 @@ Each signal returned by scan() must be a dict with these keys:
        "long_strike": 180.0, "short_strike": 185.0, "right": "C"}
 """
 
-# ── System prompt for strategy evolution ─────────────────────────
+# ── System prompt for strategy evolution (track-aware) ───────────
+# Formatted at runtime with track-specific context.
 RESEARCH_SYSTEM_PROMPT = """You are an autonomous research agent evolving day trading strategies.
 
 YOUR JOB: Modify strategy.py to improve its expectancy (expected profit per trade).
 You receive the current strategy code, its evaluation results, and history of past attempts.
+
+TRACK CONSTRAINT:
+This track uses **{track_order_type}** order type. {track_description}
+Every signal MUST set order_type = "{track_order_type}".
+Do NOT produce signals with any other order_type.
 
 RULES:
 1. Output the COMPLETE new strategy.py file. Not a diff, not a snippet — the full file.
@@ -71,17 +133,12 @@ RULES:
 6. No file I/O, no network calls, no os/sys/subprocess.
 7. For options strategies, set order_type to the strategy name and include legs_json.
 
-AVAILABLE ORDER TYPES FOR SIMULATION:
-Stock: {stock_types}
-Options: {options_types}
-
 STRATEGY EVOLUTION GUIDELINES:
 - Study which signals hit target vs. stop vs. timed out
 - Look at time-of-day patterns (morning momentum vs. afternoon chop)
 - Consider volume confirmation, volatility filters, momentum indicators
 - Tighten stops if too many hit stop before target, widen if exits are premature
 - Adjust target:stop ratios for better R:R
-- Try different setup types: breakout, mean-reversion, opening range, VWAP bounce
 - The LLM analysis section shows qualitative insights about what worked and why
 - The mechanical fitness score decides keep/discard — focus on improving that number
 - Options strategies are supported but use delta/theta P&L approximations.
@@ -90,11 +147,7 @@ STRATEGY EVOLUTION GUIDELINES:
 RESPONSE FORMAT:
 Output ONLY the Python code for strategy.py. No markdown fences, no explanation outside the code.
 Use docstrings and comments inside the code to explain your reasoning.
-""".format(
-    signal_schema=SIGNAL_SCHEMA,
-    stock_types=", ".join(STOCK_ORDER_TYPES),
-    options_types=", ".join(OPTIONS_STRATEGIES),
-)
+"""
 
 # ── LLM analysis prompt (runs after mechanical evaluation) ──────
 ANALYSIS_PROMPT_TEMPLATE = """You are analyzing the results of a day trading strategy backtest.

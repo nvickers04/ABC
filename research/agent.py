@@ -5,7 +5,9 @@ Architecture:
   - NUM_SLOTS independent strategy slots, each evolved concurrently
   - All slots run in parallel via asyncio.gather (LLM calls are async)
   - Strategy evals run in thread pool (CPU-bound pandas/numpy)
-  - Selector agent periodically replaces worst slot with fresh or mutated strategy
+  - Meta-learning selector assesses market environment, correlates slot
+    performance with environment, and allocates slots intelligently
+  - Real trade feedback loop compares simulated vs actual P&L
   - Git commits serialized via asyncio.Lock
 """
 
@@ -14,6 +16,7 @@ import asyncio
 import json
 import logging
 import random
+import re
 import subprocess
 import time
 from datetime import datetime, date, timedelta, timezone
@@ -33,6 +36,7 @@ from research.config import (
     ANALYSIS_PROMPT_TEMPLATE,
     CANDLE_RESOLUTION,
     EVAL_DAYS_BACK,
+    MAX_SELECTOR_REPLACEMENTS,
     NUM_SLOTS,
     RESEARCH_SYSTEM_PROMPT,
     RESEARCH_UNIVERSE,
@@ -42,6 +46,7 @@ from research.config import (
     SELECTOR_PROMPT,
     SIGNAL_SCHEMA,
 )
+from research.environment import compute_environment, format_environment_for_prompt
 from research.simulator import compute_expectancy, simulate
 
 logger = logging.getLogger(__name__)
@@ -307,6 +312,8 @@ async def _llm_analyze(
     aggregate: dict,
     per_day: list[dict],
     all_results: list[dict],
+    *,
+    environment_text: str = "",
 ) -> str:
     """Ask the LLM to analyze backtest results. Returns analysis text."""
     winners = [r for r in all_results if r.get("return_pct", 0) > 0]
@@ -338,6 +345,7 @@ async def _llm_analyze(
         return "\n".join(parts) if parts else "  (none)"
 
     prompt = ANALYSIS_PROMPT_TEMPLATE.format(
+        environment_context=environment_text,
         strategy_code=source,
         eval_results="\n".join(day_lines),
         winners=_sig_summary(winners),
@@ -380,6 +388,7 @@ async def _llm_propose_strategy(
     *,
     temperature: float = 0.5,
     slot: int = 1,
+    environment_text: str = "",
 ) -> str:
     """Ask the LLM to propose a new strategy.py. Returns raw source code."""
     prompt = f"""CURRENT STRATEGY:
@@ -409,6 +418,7 @@ Output ONLY the complete Python code -- no markdown fences, no explanation outsi
         slot_id=f"{slot:02d}",
         num_slots=NUM_SLOTS,
         signal_schema=SIGNAL_SCHEMA,
+        environment_context=environment_text,
     )
 
     from xai_sdk.chat import system as sdk_system, user as sdk_user
@@ -448,6 +458,217 @@ Output ONLY the complete Python code -- no markdown fences, no explanation outsi
 # ═══════════════════════════════════════════════════════════════
 # PERSISTENCE
 # ═══════════════════════════════════════════════════════════════
+
+def _store_environment_snapshot(
+    snapshot: dict,
+    round_num: int,
+) -> int:
+    """Store environment snapshot in DB. Returns snapshot id."""
+    db = get_db()
+    now = datetime.now(timezone.utc).isoformat()
+    fit = snapshot.get("strategy_fit", {})
+
+    cur = db.execute(
+        """INSERT INTO environment_snapshots
+           (ts, round_num, volatility_regime, trend_regime, breadth_regime,
+            momentum_regime, volume_regime, avg_atr_pct, dispersion,
+            strategy_fit_json, raw_snapshot_json)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+        (
+            now,
+            round_num,
+            snapshot.get("volatility_regime"),
+            snapshot.get("trend_regime"),
+            snapshot.get("breadth_regime"),
+            snapshot.get("momentum_regime"),
+            snapshot.get("volume_regime"),
+            snapshot.get("avg_atr_pct"),
+            snapshot.get("dispersion"),
+            json.dumps(fit),
+            json.dumps({k: v for k, v in snapshot.items() if k != "per_symbol"}),
+        ),
+    )
+    db.commit()
+    return cur.lastrowid
+
+
+def _store_slot_environment_score(
+    slot: int,
+    env_snapshot_id: int,
+    fitness: float,
+    expectancy: float,
+    total_signals: int,
+    strategy_type: str,
+):
+    """Record how a slot performed in a given environment."""
+    db = get_db()
+    db.execute(
+        """INSERT INTO slot_environment_scores
+           (ts, slot, env_snapshot_id, fitness, expectancy, total_signals, strategy_type)
+           VALUES (?, ?, ?, ?, ?, ?, ?)""",
+        (
+            datetime.now(timezone.utc).isoformat(),
+            slot,
+            env_snapshot_id,
+            fitness,
+            expectancy,
+            total_signals,
+            strategy_type,
+        ),
+    )
+    db.commit()
+
+
+def _get_env_slot_history() -> str:
+    """Get historical performance of strategy types across different environments.
+
+    Returns formatted text showing which strategy types worked in which regimes.
+    """
+    db = get_db()
+    rows = db.execute(
+        """SELECT
+               e.volatility_regime, e.trend_regime, e.breadth_regime,
+               s.strategy_type, s.slot,
+               AVG(s.fitness) as avg_fitness,
+               AVG(s.expectancy) as avg_exp,
+               COUNT(*) as observations
+           FROM slot_environment_scores s
+           JOIN environment_snapshots e ON s.env_snapshot_id = e.id
+           GROUP BY e.volatility_regime, e.trend_regime, s.strategy_type
+           HAVING observations >= 2
+           ORDER BY avg_fitness DESC
+           LIMIT 20"""
+    ).fetchall()
+
+    if not rows:
+        return "(No environment-slot history yet — this data builds over time)"
+
+    lines = []
+    for r in rows:
+        lines.append(
+            f"  {r['strategy_type']:<20s} in vol={r['volatility_regime']:<7s} "
+            f"trend={r['trend_regime']:<10s} breadth={r['breadth_regime']:<8s} "
+            f"→ avg_fitness={r['avg_fitness']:.4f} avg_exp={r['avg_exp']:.4f} "
+            f"(n={r['observations']})"
+        )
+    return "\n".join(lines)
+
+
+def _get_trade_feedback() -> str:
+    """Get real trade feedback — compare signals to actual trade outcomes.
+
+    Returns formatted text showing execution gaps and real P&L vs simulated.
+    """
+    db = get_db()
+
+    # Get recent trades with their linked signals
+    trades = db.execute(
+        """SELECT t.symbol, t.side, t.pnl, t.held_minutes, t.ts,
+                  tf.simulated_return, tf.execution_gap, tf.slot
+           FROM trades t
+           LEFT JOIN trade_feedback tf ON tf.trade_id = t.id
+           ORDER BY t.ts DESC LIMIT 30"""
+    ).fetchall()
+
+    if not trades:
+        return "(No real trades recorded yet — feedback builds as the trader executes)"
+
+    total_trades = len(trades)
+    with_feedback = [t for t in trades if t["simulated_return"] is not None]
+
+    lines = [f"  Recent trades: {total_trades}"]
+
+    if with_feedback:
+        avg_gap = sum(t["execution_gap"] or 0 for t in with_feedback) / len(with_feedback)
+        avg_sim = sum(t["simulated_return"] or 0 for t in with_feedback) / len(with_feedback)
+        avg_actual = sum(t["pnl"] or 0 for t in with_feedback) / len(with_feedback)
+        lines.append(f"  Trades with feedback: {len(with_feedback)}")
+        lines.append(f"  Avg simulated return: {avg_sim:+.2f}%")
+        lines.append(f"  Avg actual PnL: ${avg_actual:+.2f}")
+        lines.append(f"  Avg execution gap: {avg_gap:+.2f}")
+
+        # Per-slot breakdown if available
+        slot_gaps = {}
+        for t in with_feedback:
+            s = t["slot"]
+            if s is not None:
+                slot_gaps.setdefault(s, []).append(t["execution_gap"] or 0)
+        for s, gaps in sorted(slot_gaps.items()):
+            avg = sum(gaps) / len(gaps)
+            lines.append(f"    Slot {s:02d}: avg gap={avg:+.3f} ({len(gaps)} trades)")
+    else:
+        # Just summarize raw trades
+        total_pnl = sum(t["pnl"] or 0 for t in trades)
+        winners = sum(1 for t in trades if (t["pnl"] or 0) > 0)
+        lines.append(f"  Total P&L: ${total_pnl:+.2f}")
+        lines.append(f"  Win rate: {winners}/{total_trades}")
+
+    return "\n".join(lines)
+
+
+def _match_trades_to_signals():
+    """Attempt to match real trades to research signals and compute execution gaps.
+
+    Matches by symbol + time proximity (within 30 minutes). Writes to trade_feedback table.
+    """
+    db = get_db()
+
+    # Get unmatched trades
+    unmatched = db.execute(
+        """SELECT t.id, t.symbol, t.side, t.pnl, t.ts, t.held_minutes
+           FROM trades t
+           LEFT JOIN trade_feedback tf ON tf.trade_id = t.id
+           WHERE tf.id IS NULL
+           ORDER BY t.ts DESC LIMIT 50"""
+    ).fetchall()
+
+    if not unmatched:
+        return
+
+    matched = 0
+    for trade in unmatched:
+        # Find closest live signal for this symbol
+        signal = db.execute(
+            """SELECT ls.id, ls.slot, ls.direction,
+                      s.return_pct as sim_return, s.strategy_id
+               FROM live_signals ls
+               LEFT JOIN signals s ON s.strategy_id = ls.strategy_id
+                   AND s.symbol = ls.symbol
+               WHERE ls.symbol = ?
+               ORDER BY ABS(julianday(ls.ts) - julianday(?)) ASC
+               LIMIT 1""",
+            (trade["symbol"], trade["ts"]),
+        ).fetchone()
+
+        if signal:
+            sim_return = signal["sim_return"] or 0
+            actual_pnl = trade["pnl"] or 0
+            # Normalize: execution gap in percentage terms
+            # (positive gap = real trade did better than simulated)
+            execution_gap = actual_pnl - sim_return  # rough comparison
+
+            db.execute(
+                """INSERT INTO trade_feedback
+                   (ts, trade_id, signal_id, slot, simulated_return,
+                    actual_pnl, execution_gap, symbol)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+                (
+                    datetime.now(timezone.utc).isoformat(),
+                    trade["id"],
+                    signal["id"],
+                    signal["slot"],
+                    sim_return,
+                    actual_pnl,
+                    execution_gap,
+                    trade["symbol"],
+                ),
+            )
+            matched += 1
+
+    if matched:
+        db.commit()
+        logger.info(f"Trade feedback: matched {matched} trades to signals")
+
 
 def _store_strategy(
     source: str,
@@ -710,6 +931,7 @@ async def _run_slot(
     state: dict,
     *,
     dry_run: bool = False,
+    environment_text: str = "",
 ) -> dict:
     """Run one evolution iteration for a single slot. Returns updated state."""
     logger.info(f"[Slot {slot:02d}] Iteration {iteration} starting")
@@ -748,7 +970,10 @@ async def _run_slot(
     # ── 4. LLM analysis (on TRAIN results only) ────────────────
     logger.info(f"[Slot {slot:02d}] Running LLM analysis...")
     async with _LLM_SEMAPHORE:
-        analysis = await _llm_analyze(current_source, train_agg, train_per_day, train_results)
+        analysis = await _llm_analyze(
+            current_source, train_agg, train_per_day, train_results,
+            environment_text=environment_text,
+        )
     logger.info(f"[Slot {slot:02d}] Analysis: {analysis[:120]}...")
 
     # ── 5. Store baseline if first iteration ────────────────────
@@ -777,6 +1002,7 @@ async def _run_slot(
         new_source = await _llm_propose_strategy(
             current_source, analysis, history,
             temperature=proposal_temp, slot=slot,
+            environment_text=environment_text,
         )
 
     # ── 7. Validate ─────────────────────────────────────────────
@@ -817,6 +1043,7 @@ async def _run_slot(
         async with _LLM_SEMAPHORE:
             new_analysis = await _llm_analyze(
                 new_source, new_train_agg, new_train_pd, new_train_res,
+                environment_text=environment_text,
             )
     else:
         new_analysis = (
@@ -872,6 +1099,8 @@ async def _run_slot(
         best_id = new_id
         state["best_test_fitness"] = new_test_fitness
         state["consecutive_failures"] = 0
+        state["last_expectancy"] = new_train_agg.get("expectancy", 0)
+        state["last_total_signals"] = new_train_agg.get("total_signals", 0)
     else:
         reasons = []
         if new_test_fitness <= best_fitness:
@@ -911,78 +1140,145 @@ async def _run_slot(
 
 
 # ═══════════════════════════════════════════════════════════════
-# SELECTOR AGENT
+# META-LEARNING SELECTOR AGENT
 # ═══════════════════════════════════════════════════════════════
 
-async def _run_selector(slot_states: dict[int, dict]):
-    """Evaluate all slots and replace the weakest if appropriate."""
+def _extract_strategy_type(source: str) -> str:
+    """Extract the primary strategy type from strategy source code."""
+    for line in source.split("\n"):
+        if "setup_type" in line and "=" in line:
+            parts = line.split('"')
+            if len(parts) >= 2:
+                return parts[-2]
+    # Fallback: detect from order_type
+    if "iron_condor" in source:
+        return "iron_condor"
+    if "straddle" in source:
+        return "straddle"
+    if "vertical_spread" in source:
+        return "vertical_spread"
+    if "strangle" in source:
+        return "strangle"
+    if "mean_rev" in source.lower() or "rsi" in source.lower():
+        return "mean_reversion"
+    if "breakout" in source.lower() or "momentum" in source.lower():
+        return "momentum_breakout"
+    if "vwap" in source.lower():
+        return "vwap"
+    return "unknown"
+
+
+async def _run_selector(
+    slot_states: dict[int, dict],
+    env_snapshot: dict,
+    env_snapshot_id: int,
+):
+    """Meta-learning selector: assess environment, correlate with slot performance,
+    and make intelligent slot allocation decisions.
+
+    Unlike the old selector (replace worst by fitness), this one:
+    1. Reads the current market environment
+    2. Looks up historical environment-slot performance correlations
+    3. Considers real trade feedback (execution gap)
+    4. Ensures portfolio diversity
+    5. Can act on multiple slots per run
+    """
     logger.info("=" * 60)
-    logger.info("SELECTOR AGENT — Evaluating slot population")
+    logger.info("META-LEARNING SELECTOR — Environment-Aware Portfolio Optimization")
     logger.info("=" * 60)
 
-    # Rank slots by fitness
+    # Match any unmatched real trades to signals before analysis
+    _match_trades_to_signals()
+
+    # ── Build slot rankings with environment scores ─────────────
     rankings = []
     for slot_num in range(1, NUM_SLOTS + 1):
         state = slot_states[slot_num]
         strat_path = _strategy_path(slot_num)
-        setup_type = "unknown"
         try:
             source = strat_path.read_text(encoding="utf-8")
-            # Extract setup_type from code
-            for line in source.split("\n"):
-                if "setup_type" in line and "=" in line:
-                    parts = line.split('"')
-                    if len(parts) >= 2:
-                        setup_type = parts[-2]
-                        break
+            strategy_type = _extract_strategy_type(source)
         except FileNotFoundError:
             source = ""
+            strategy_type = "unknown"
+
+        # Record this slot's performance in this environment
+        _store_slot_environment_score(
+            slot=slot_num,
+            env_snapshot_id=env_snapshot_id,
+            fitness=state["best_test_fitness"],
+            expectancy=state.get("last_expectancy", 0),
+            total_signals=state.get("last_total_signals", 0),
+            strategy_type=strategy_type,
+        )
+
+        # Get environment fit for this strategy type
+        fit_scores = env_snapshot.get("strategy_fit", {})
+        # Map strategy types to fit score keys
+        type_to_fit = {
+            "momentum_breakout": "momentum_breakout",
+            "breakout_volume": "momentum_breakout",
+            "opening_range_breakout": "momentum_breakout",
+            "mean_reversion": "mean_reversion",
+            "mean_reversion_rsi": "mean_reversion",
+            "vwap": "vwap",
+            "vwap_bounce": "vwap",
+            "iron_condor": "short_premium",
+            "cash_secured_put": "short_premium",
+            "straddle": "straddle",
+            "strangle": "straddle",
+            "vertical_spread": "vertical_spread",
+            "bull_call_spread": "vertical_spread",
+            "bear_put_spread": "vertical_spread",
+            "long_call": "long_options",
+            "long_put": "long_options",
+            "bracket": "bracket",
+        }
+        fit_key = type_to_fit.get(strategy_type, "momentum_breakout")
+        env_fit = fit_scores.get(fit_key, 0.5)
+
         rankings.append({
             "slot": slot_num,
             "fitness": state["best_test_fitness"],
             "iterations": state["iteration"],
             "failures": state["consecutive_failures"],
-            "setup_type": setup_type,
+            "strategy_type": strategy_type,
+            "env_fit": env_fit,
+            # Composite: raw fitness weighted by environment fit
+            "env_adjusted_fitness": state["best_test_fitness"] * (0.5 + 0.5 * env_fit),
         })
 
-    rankings.sort(key=lambda x: x["fitness"], reverse=True)
+    rankings.sort(key=lambda x: x["env_adjusted_fitness"], reverse=True)
 
     # Log rankings
     for i, r in enumerate(rankings):
-        marker = " ★" if i == 0 else " ✗" if i == len(rankings) - 1 else ""
+        marker = " ★" if i == 0 else " ✗" if i >= len(rankings) - 2 else ""
         logger.info(
             f"  #{i+1} Slot {r['slot']:02d}: fitness={r['fitness']:.4f} "
-            f"iters={r['iterations']} type={r['setup_type']}{marker}"
+            f"env_fit={r['env_fit']:.2f} adj={r['env_adjusted_fitness']:.4f} "
+            f"iters={r['iterations']} type={r['strategy_type']}{marker}"
         )
 
-    worst = rankings[-1]
-    best = rankings[0]
+    # ── Get historical and feedback context ─────────────────────
+    env_slot_history = _get_env_slot_history()
+    trade_feedback = _get_trade_feedback()
+    environment_text = format_environment_for_prompt(env_snapshot)
 
-    # Don't replace if worst has < 3 iterations (give it a chance)
-    if worst["iterations"] < 3:
-        logger.info(f"Selector: Slot {worst['slot']:02d} only has {worst['iterations']} iterations — keeping")
-        return
-
-    # Don't replace if worst is actually decent (positive fitness)
-    if worst["fitness"] > 0.005:
-        logger.info(f"Selector: Slot {worst['slot']:02d} fitness={worst['fitness']:.4f} is decent — keeping")
-        return
-
-    # Ask LLM for replacement decision
+    # ── Build prompt for meta-learning selector ─────────────────
     slot_ranking_text = "\n".join(
-        f"  Slot {r['slot']:02d}: fitness={r['fitness']:.4f} iters={r['iterations']} "
-        f"consecutive_failures={r['failures']} type={r['setup_type']}"
+        f"  Slot {r['slot']:02d}: fitness={r['fitness']:.4f} "
+        f"env_fit={r['env_fit']:.2f} adj_fitness={r['env_adjusted_fitness']:.4f} "
+        f"iters={r['iterations']} failures={r['failures']} type={r['strategy_type']}"
         for r in rankings
     )
-    current_types = ", ".join(r["setup_type"] for r in rankings)
 
     prompt = SELECTOR_PROMPT.format(
         num_slots=NUM_SLOTS,
         slot_rankings=slot_ranking_text,
-        worst_slot=f"{worst['slot']:02d}",
-        worst_fitness=worst["fitness"],
-        worst_iterations=worst["iterations"],
-        current_types=current_types,
+        environment_context=environment_text,
+        env_slot_history=env_slot_history,
+        trade_feedback=trade_feedback,
+        max_replacements=MAX_SELECTOR_REPLACEMENTS,
     )
 
     from xai_sdk.chat import system as sdk_system, user as sdk_user
@@ -992,7 +1288,7 @@ async def _run_selector(slot_states: dict[int, dict]):
             model=llm.model,
             messages=[sdk_user(prompt)],
             temperature=0.7,
-            max_tokens=4096,
+            max_tokens=8192,
         )
         response = await chat.sample()
 
@@ -1001,13 +1297,11 @@ async def _run_selector(slot_states: dict[int, dict]):
         model=llm.model,
         tokens_in=usage.prompt_tokens,
         tokens_out=usage.completion_tokens,
-        purpose="selector_agent",
+        purpose="meta_selector",
     )
 
-    # Parse response
+    # ── Parse response ──────────────────────────────────────────
     text = response.content.strip()
-    # Try to extract JSON
-    import re
     json_match = re.search(r'\{.*\}', text, re.DOTALL)
     if not json_match:
         logger.warning("Selector: Could not parse JSON response — skipping")
@@ -1019,40 +1313,73 @@ async def _run_selector(slot_states: dict[int, dict]):
         logger.warning("Selector: Invalid JSON — skipping")
         return
 
-    action = decision.get("action", "keep")
-    reasoning = decision.get("reasoning", "")
-    seed_code = decision.get("seed_code")
+    analysis = decision.get("analysis", "")
+    actions = decision.get("actions", [])
+    env_learning = decision.get("environment_learning", "")
+    recommended_focus = decision.get("recommended_focus", [])
 
-    logger.info(f"Selector decision: {action} — {reasoning}")
+    logger.info(f"Selector analysis: {analysis[:200]}...")
+    logger.info(f"Environment learning: {env_learning}")
+    logger.info(f"Recommended focus: {recommended_focus}")
 
-    if action == "keep":
-        return
+    # ── Execute actions ─────────────────────────────────────────
+    replacements_done = 0
+    for action_item in actions:
+        if replacements_done >= MAX_SELECTOR_REPLACEMENTS:
+            logger.info(f"Selector: hit max replacements ({MAX_SELECTOR_REPLACEMENTS})")
+            break
 
-    if not seed_code:
-        logger.warning("Selector: No seed_code provided — skipping")
-        return
+        slot_num = action_item.get("slot")
+        action = action_item.get("action", "keep")
+        reason = action_item.get("reason", "")
+        seed_code = action_item.get("seed_code")
 
-    # Validate the seed code
-    validation_err = _validate_strategy_source(seed_code)
-    if validation_err:
-        logger.warning(f"Selector: Seed code failed validation: {validation_err}")
-        return
+        if not slot_num or slot_num < 1 or slot_num > NUM_SLOTS:
+            continue
 
-    # Replace worst slot
-    worst_slot = worst["slot"]
-    strat_path = _strategy_path(worst_slot)
-    strat_path.write_text(seed_code, encoding="utf-8")
-    logger.info(f"Selector: Replaced Slot {worst_slot:02d} ({action})")
+        logger.info(f"Selector: Slot {slot_num:02d} → {action} — {reason}")
 
-    # Reset slot state
-    slot_states[worst_slot] = {
-        "consecutive_failures": 0,
-        "best_test_fitness": 0.0,
-        "iteration": 0,
-    }
+        if action == "keep":
+            continue
 
-    # Git commit the replacement
-    await _git_commit(0, True, 0.0, None, slot=worst_slot)
+        if action in ("replace", "mutate"):
+            if not seed_code:
+                # If mutate without code, try copying from seed_from_slot
+                seed_from = action_item.get("seed_from_slot")
+                if seed_from and 1 <= seed_from <= NUM_SLOTS:
+                    try:
+                        seed_code = _strategy_path(seed_from).read_text(encoding="utf-8")
+                    except FileNotFoundError:
+                        logger.warning(f"Selector: seed slot {seed_from} not found — skipping")
+                        continue
+                else:
+                    logger.warning("Selector: No seed_code or seed_from_slot — skipping")
+                    continue
+
+            # Validate
+            validation_err = _validate_strategy_source(seed_code)
+            if validation_err:
+                logger.warning(f"Selector: Seed code for slot {slot_num:02d} failed validation: {validation_err}")
+                continue
+
+            # Replace
+            strat_path = _strategy_path(slot_num)
+            strat_path.write_text(seed_code, encoding="utf-8")
+            logger.info(f"Selector: Replaced Slot {slot_num:02d} ({action})")
+
+            # Reset slot state
+            slot_states[slot_num] = {
+                "consecutive_failures": 0,
+                "best_test_fitness": 0.0,
+                "iteration": 0,
+                "last_expectancy": 0,
+                "last_total_signals": 0,
+            }
+
+            await _git_commit(0, True, 0.0, None, slot=slot_num)
+            replacements_done += 1
+
+    logger.info(f"Selector complete: {replacements_done} replacements made")
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -1060,7 +1387,7 @@ async def _run_selector(slot_states: dict[int, dict]):
 # ═══════════════════════════════════════════════════════════════
 
 async def run_research(*, verbose: bool = False, dry_run: bool = False):
-    """Main research loop — all slots evolve concurrently, selector prunes weakest."""
+    """Main research loop — all slots evolve concurrently, meta-learner optimizes."""
     global _LLM_SEMAPHORE
     _LLM_SEMAPHORE = asyncio.Semaphore(4)  # max 4 concurrent LLM calls
 
@@ -1073,7 +1400,7 @@ async def run_research(*, verbose: bool = False, dry_run: bool = False):
     logger.info(f"Slots: {NUM_SLOTS} concurrent")
     logger.info(f"Universe: {len(RESEARCH_UNIVERSE)} symbols")
     logger.info(f"Eval window: last {EVAL_DAYS_BACK} trading days, {CANDLE_RESOLUTION}-min bars")
-    logger.info(f"Selector runs every {SELECTOR_EVERY_N_ROUNDS} rounds")
+    logger.info(f"Selector runs every {SELECTOR_EVERY_N_ROUNDS} rounds (meta-learning)")
     logger.info("=" * 60)
 
     # Per-slot state
@@ -1083,6 +1410,8 @@ async def run_research(*, verbose: bool = False, dry_run: bool = False):
             "consecutive_failures": 0,
             "best_test_fitness": 0.0,
             "iteration": 0,
+            "last_expectancy": 0,
+            "last_total_signals": 0,
         }
 
     round_num = 0
@@ -1102,12 +1431,19 @@ async def run_research(*, verbose: bool = False, dry_run: bool = False):
             await asyncio.sleep(300)
             continue
 
+        # ── Compute market environment ──────────────────────────
+        logger.info("Computing market environment...")
+        env_snapshot = compute_environment(universe)
+        env_text = format_environment_for_prompt(env_snapshot)
+        env_snapshot_id = _store_environment_snapshot(env_snapshot, round_num)
+        logger.info(f"Environment snapshot stored (id={env_snapshot_id})")
+
         train_universe, test_universe = _train_test_split(universe)
         train_days = sum(len(d) for d in train_universe.values())
         test_days = sum(len(d) for d in test_universe.values())
         logger.info(f"Split: train={train_days} days, test={test_days} days")
 
-        # Run all slots concurrently
+        # Run all slots concurrently (with environment context)
         for s in slot_ids:
             slot_states[s]["iteration"] += 1
 
@@ -1119,6 +1455,7 @@ async def run_research(*, verbose: bool = False, dry_run: bool = False):
                 test_universe=test_universe,
                 state=slot_states[s],
                 dry_run=dry_run,
+                environment_text=env_text,
             )
             for s in slot_ids
         ]
@@ -1132,10 +1469,10 @@ async def run_research(*, verbose: bool = False, dry_run: bool = False):
             elif isinstance(result, dict):
                 slot_states[s] = result
 
-        # Selector agent
+        # Meta-learning selector agent
         if round_num % SELECTOR_EVERY_N_ROUNDS == 0:
             try:
-                await _run_selector(slot_states)
+                await _run_selector(slot_states, env_snapshot, env_snapshot_id)
             except Exception as e:
                 logger.error(f"Selector failed: {e}")
 

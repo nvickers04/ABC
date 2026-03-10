@@ -114,12 +114,57 @@ def init_db() -> sqlite3.Connection:
             FOREIGN KEY (strategy_id) REFERENCES strategies(id)
         );
 
+        CREATE TABLE IF NOT EXISTS environment_snapshots (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            ts TEXT NOT NULL,
+            round_num INTEGER,
+            volatility_regime TEXT,
+            trend_regime TEXT,
+            breadth_regime TEXT,
+            momentum_regime TEXT,
+            volume_regime TEXT,
+            avg_atr_pct REAL,
+            dispersion REAL,
+            strategy_fit_json TEXT,
+            raw_snapshot_json TEXT
+        );
+
+        CREATE TABLE IF NOT EXISTS slot_environment_scores (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            ts TEXT NOT NULL,
+            slot INTEGER NOT NULL,
+            env_snapshot_id INTEGER NOT NULL,
+            fitness REAL,
+            expectancy REAL,
+            total_signals INTEGER,
+            strategy_type TEXT,
+            FOREIGN KEY (env_snapshot_id) REFERENCES environment_snapshots(id)
+        );
+
+        CREATE TABLE IF NOT EXISTS trade_feedback (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            ts TEXT NOT NULL,
+            trade_id INTEGER,
+            signal_id INTEGER,
+            slot INTEGER,
+            simulated_return REAL,
+            actual_pnl REAL,
+            execution_gap REAL,
+            symbol TEXT,
+            FOREIGN KEY (trade_id) REFERENCES trades(id),
+            FOREIGN KEY (signal_id) REFERENCES signals(id)
+        );
+
         CREATE INDEX IF NOT EXISTS idx_strategies_kept ON strategies(kept);
         CREATE INDEX IF NOT EXISTS idx_strategies_slot ON strategies(slot);
         CREATE INDEX IF NOT EXISTS idx_evaluations_strategy ON evaluations(strategy_id);
         CREATE INDEX IF NOT EXISTS idx_signals_evaluation ON signals(evaluation_id);
         CREATE INDEX IF NOT EXISTS idx_live_signals_ts ON live_signals(ts);
         CREATE INDEX IF NOT EXISTS idx_live_signals_slot ON live_signals(slot);
+        CREATE INDEX IF NOT EXISTS idx_env_snapshots_ts ON environment_snapshots(ts);
+        CREATE INDEX IF NOT EXISTS idx_slot_env_scores_slot ON slot_environment_scores(slot);
+        CREATE INDEX IF NOT EXISTS idx_slot_env_scores_env ON slot_environment_scores(env_snapshot_id);
+        CREATE INDEX IF NOT EXISTS idx_trade_feedback_slot ON trade_feedback(slot);
     """)
 
     # ── Migrations for existing DBs ─────────────────────────────

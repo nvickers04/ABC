@@ -254,12 +254,53 @@ class TradingAgent:
         return summary.today_llm_cost >= MAX_DAILY_LLM_COST
 
     def _get_research_briefing(self) -> str | None:
-        """Read best strategy per slot + live signals from research DB."""
+        """Read environment snapshot + best strategies + live signals from research DB.
+
+        Produces an actionable briefing that includes:
+        - Current market environment regime
+        - Strategy-environment fit scores
+        - Best strategy per slot with conviction scores
+        - Live signals with environment-adjusted confidence
+        - Real trade feedback summary
+        """
         try:
             from memory import get_db
             db = get_db()
 
-            # Best strategy per slot
+            lines = ["=== RESEARCH BRIEFING ==="]
+
+            # ── Environment context ─────────────────────────────
+            env = db.execute(
+                """SELECT volatility_regime, trend_regime, breadth_regime,
+                          momentum_regime, volume_regime, avg_atr_pct,
+                          dispersion, strategy_fit_json
+                   FROM environment_snapshots
+                   ORDER BY id DESC LIMIT 1"""
+            ).fetchone()
+
+            if env:
+                lines.append("")
+                lines.append("MARKET ENVIRONMENT:")
+                lines.append(
+                    f"  Volatility: {env['volatility_regime']} (ATR {env['avg_atr_pct']:.2f}%)"
+                )
+                lines.append(f"  Trend: {env['trend_regime']}")
+                lines.append(f"  Breadth: {env['breadth_regime']}")
+                lines.append(f"  Momentum: {env['momentum_regime']}")
+                lines.append(f"  Volume: {env['volume_regime']}")
+                lines.append(f"  Dispersion: {env['dispersion']:.2f}")
+
+                # Strategy fit scores
+                try:
+                    fit = json.loads(env['strategy_fit_json']) if env['strategy_fit_json'] else {}
+                    if fit:
+                        lines.append("  Strategy-environment fit:")
+                        for stype, score in sorted(fit.items(), key=lambda x: -x[1])[:5]:
+                            lines.append(f"    {stype}: {score:.2f}")
+                except (json.JSONDecodeError, TypeError):
+                    pass
+
+            # ── Best strategy per slot ──────────────────────────
             rows = db.execute(
                 """SELECT s.id, s.slot, s.expectancy, s.hit_rate, s.avg_rr,
                           s.total_signals, s.llm_analysis
@@ -272,39 +313,75 @@ class TradingAgent:
                    WHERE s.kept = 1
                    ORDER BY s.expectancy DESC"""
             ).fetchall()
-            if not rows:
-                return None
 
-            lines = ["=== RESEARCH BRIEFING ==="]
-            for row in rows:
-                lines.append(
-                    f"  [Slot {row['slot']:02d}] #{row['id']}: "
-                    f"exp={row['expectancy']:.4f} hit={row['hit_rate']:.0f}% "
-                    f"R:R={row['avg_rr']:.1f} ({row['total_signals']} signals)"
-                )
-                if row["llm_analysis"]:
-                    snippet = row["llm_analysis"][:200].replace("\n", " ")
-                    lines.append(f"    Insight: {snippet}")
-
-            # Live signals for today (all slots)
-            live = db.execute(
-                """SELECT slot, symbol, direction, order_type, setup_type,
-                          entry_price, target_price, stop_price
-                   FROM live_signals ORDER BY slot, symbol"""
-            ).fetchall()
-            if live:
-                lines.append(f"  Live signals today: {len(live)}")
-                for sig in live[:15]:
+            if rows:
+                lines.append("")
+                lines.append("STRATEGY SLOTS (ranked by expectancy):")
+                for row in rows:
                     lines.append(
-                        f"    [Slot {sig['slot']:02d}] {sig['symbol']} {sig['direction']} "
-                        f"{sig['order_type']} @ {sig['entry_price']:.2f} "
-                        f"tgt={sig['target_price']:.2f} stp={sig['stop_price']:.2f} "
-                        f"({sig['setup_type']})"
+                        f"  [Slot {row['slot']:02d}] #{row['id']}: "
+                        f"exp={row['expectancy']:.4f} hit={row['hit_rate']:.0f}% "
+                        f"R:R={row['avg_rr']:.1f} ({row['total_signals']} signals)"
                     )
-                if len(live) > 15:
-                    lines.append(f"    ... and {len(live) - 15} more")
+                    if row["llm_analysis"]:
+                        snippet = row["llm_analysis"][:200].replace("\n", " ")
+                        lines.append(f"    Insight: {snippet}")
 
-            return "\n".join(lines)
+            # ── Live signals with confidence ────────────────────
+            live = db.execute(
+                """SELECT ls.slot, ls.symbol, ls.direction, ls.order_type,
+                          ls.setup_type, ls.entry_price, ls.target_price,
+                          ls.stop_price, ls.legs_json,
+                          s.expectancy as slot_exp, s.hit_rate as slot_hit
+                   FROM live_signals ls
+                   LEFT JOIN strategies s ON s.id = ls.strategy_id
+                   ORDER BY s.expectancy DESC, ls.slot, ls.symbol"""
+            ).fetchall()
+
+            if live:
+                lines.append("")
+                lines.append(f"LIVE SIGNALS ({len(live)} total):")
+                for sig in live[:20]:
+                    conf = "HIGH" if (sig["slot_exp"] or 0) > 0.003 else "MED" if (sig["slot_exp"] or 0) > 0 else "LOW"
+                    rr = ""
+                    if sig["entry_price"] and sig["target_price"] and sig["stop_price"]:
+                        risk = abs(sig["entry_price"] - sig["stop_price"])
+                        reward = abs(sig["target_price"] - sig["entry_price"])
+                        if risk > 0:
+                            rr = f" R:R={reward/risk:.1f}"
+                    legs = ""
+                    if sig["legs_json"]:
+                        try:
+                            legs_data = json.loads(sig["legs_json"]) if isinstance(sig["legs_json"], str) else sig["legs_json"]
+                            legs = f" [{legs_data.get('strategy', '')}]"
+                        except (json.JSONDecodeError, TypeError, AttributeError):
+                            pass
+                    lines.append(
+                        f"  [{conf}] [Slot {sig['slot']:02d}] {sig['symbol']} "
+                        f"{sig['direction']} {sig['order_type']} @ {sig['entry_price']:.2f} "
+                        f"tgt={sig['target_price']:.2f} stp={sig['stop_price']:.2f}"
+                        f"{rr}{legs} ({sig['setup_type']})"
+                    )
+                if len(live) > 20:
+                    lines.append(f"  ... and {len(live) - 20} more")
+
+            # ── Trade feedback summary ──────────────────────────
+            feedback = db.execute(
+                """SELECT COUNT(*) as cnt,
+                          AVG(execution_gap) as avg_gap,
+                          AVG(actual_pnl) as avg_pnl
+                   FROM trade_feedback
+                   WHERE ts > datetime('now', '-7 days')"""
+            ).fetchone()
+
+            if feedback and feedback["cnt"] > 0:
+                lines.append("")
+                lines.append("TRADE FEEDBACK (last 7 days):")
+                lines.append(f"  Matched trades: {feedback['cnt']}")
+                lines.append(f"  Avg actual P&L: ${feedback['avg_pnl']:.2f}")
+                lines.append(f"  Avg execution gap: {feedback['avg_gap']:+.3f}")
+
+            return "\n".join(lines) if len(lines) > 1 else None
         except Exception:
             return None
 

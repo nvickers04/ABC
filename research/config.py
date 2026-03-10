@@ -32,6 +32,7 @@ STRATEGY_EXEC_TIMEOUT = 10      # seconds per symbol scan
 # ── Slots ───────────────────────────────────────────────────────
 NUM_SLOTS = 10                  # number of concurrent strategy slots
 SELECTOR_EVERY_N_ROUNDS = 3     # run selector agent every N rounds
+MAX_SELECTOR_REPLACEMENTS = 3   # max slots the selector can replace per run
 
 # ── Available order types (referenced in system prompt for Grok) ─
 STOCK_ORDER_TYPES = [
@@ -61,7 +62,7 @@ Each signal returned by scan() must be a dict with these keys:
        "long_strike": 180.0, "short_strike": 185.0, "right": "C"}
 """
 
-# ── System prompt for strategy evolution (slot-aware) ────────────
+# ── System prompt for strategy evolution (slot-aware + environment-aware) ──
 RESEARCH_SYSTEM_PROMPT = """You are an autonomous research agent evolving day trading strategies.
 
 YOUR JOB: Modify strategy.py to improve its expectancy (expected profit per trade).
@@ -70,6 +71,8 @@ You receive the current strategy code, its evaluation results, and history of pa
 You are evolving Slot {slot_id} (one of {num_slots} independent strategy slots).
 Each slot is free to use ANY order type or options structure — whatever produces
 the best risk-adjusted returns.
+
+{environment_context}
 
 Available stock order types: market, limit, stop_entry, bracket, trailing_stop_exit,
   oca_exit, midprice, vwap, moc, moo
@@ -87,7 +90,16 @@ RULES:
 6. No file I/O, no network calls, no os/sys/subprocess.
 7. For options strategies, set order_type to the strategy name and include legs_json.
 
-STRATEGY EVOLUTION GUIDELINES:
+ENVIRONMENT-AWARE STRATEGY GUIDELINES:
+- Study the CURRENT MARKET ENVIRONMENT section above carefully.
+- If the environment favors momentum, lean into trend-following entries.
+- If the environment favors mean reversion, look for overextension + snap-back setups.
+- If volatility is high, widen stops and targets. If low, tighten them.
+- If breadth is narrowing, focus on the strongest/weakest names, not the middle.
+- Use the strategy-environment fit scores to guide your approach.
+- Consider the TOP SYMBOL CANDIDATES for your strategy type.
+
+GENERAL EVOLUTION GUIDELINES:
 - Study which signals hit target vs. stop vs. timed out
 - Look at time-of-day patterns (morning momentum vs. afternoon chop)
 - Consider volume confirmation, volatility filters, momentum indicators
@@ -106,6 +118,8 @@ Use docstrings and comments inside the code to explain your reasoning.
 
 # ── LLM analysis prompt (runs after mechanical evaluation) ──────
 ANALYSIS_PROMPT_TEMPLATE = """You are analyzing the results of a day trading strategy backtest.
+
+{environment_context}
 
 STRATEGY CODE:
 ```python
@@ -129,39 +143,82 @@ AGGREGATE STATS:
 - Max drawdown: {max_drawdown:.2f}%
 
 Analyze:
-1. What's working and why?
-2. What's failing and why?
+1. What's working and why? How does this relate to the current market environment?
+2. What's failing and why? Is it an environment mismatch?
 3. Time-of-day patterns (are morning entries better than afternoon?)
-4. Which setup types perform best?
-5. Are stops too tight or too loose?
-6. Specific, actionable suggestions for the next strategy modification.
+4. Which setup types perform best in THIS environment?
+5. Are stops too tight or too loose given current volatility regime?
+6. Specific, actionable suggestions for the next strategy modification that
+   ACCOUNT FOR the current market environment.
 
 Be concise and specific. Focus on patterns in the data, not general advice."""
 
-# ── Selector prompt (replaces weakest slot) ──────────────────────
-SELECTOR_PROMPT = """You are a strategy portfolio manager overseeing {num_slots} independent
-strategy slots for day trading.
+# ── Selector prompt (meta-learning agent) ────────────────────────
+SELECTOR_PROMPT = """You are a META-LEARNING strategy portfolio manager overseeing {num_slots}
+independent strategy slots for day trading. Your job is to MAXIMIZE portfolio-level
+profitability by intelligently allocating slots to strategies that match the current
+market environment.
 
-SLOT PERFORMANCE (ranked by fitness, best first):
+═══ CURRENT MARKET ENVIRONMENT ═══
+{environment_context}
+
+═══ SLOT PERFORMANCE (ranked by fitness, best first) ═══
 {slot_rankings}
 
-YOUR JOB: Decide what to do with the weakest slot (Slot {worst_slot}).
-The weakest slot has fitness={worst_fitness:.4f} after {worst_iterations} iterations.
+═══ ENVIRONMENT-SLOT HISTORY ═══
+How each slot's strategy type has performed in similar environments historically:
+{env_slot_history}
 
-OPTIONS:
-1. "mutate_best" — Seed the worst slot with a mutated copy of the best-performing
-   strategy. The evolution loop will differentiate it from there.
-2. "fresh" — Generate an entirely new strategy for the worst slot using a novel
-   approach that none of the current slots are using.
-3. "keep" — Leave it alone (if it's still improving, or too early to judge).
+═══ REAL TRADE FEEDBACK ═══
+How strategies performed in live trading (simulated return vs actual P&L):
+{trade_feedback}
 
-Current strategy types in use:
-{current_types}
+═══ YOUR ANALYSIS MUST COVER ═══
 
-Respond with ONLY a JSON object:
-{{"action": "mutate_best"|"fresh"|"keep", "reasoning": "...", "seed_code": "..." }}
+1. ENVIRONMENT ASSESSMENT: What regime are we in? What strategy types should thrive?
+   Use the strategy-environment fit scores to guide your thinking.
 
-If action is "fresh", include complete Python code for the new strategy in seed_code.
-If action is "mutate_best", include the mutated code in seed_code.
-If action is "keep", seed_code can be null.
+2. PORTFOLIO DIVERSITY: Are the current slots well-diversified? Having 5 momentum
+   strategies in a sideways market is wasteful. Ensure coverage of:
+   - Strategies that match current environment (primary allocation)
+   - 1-2 contrarian/hedge strategies (in case regime changes)
+   - At least one options strategy if environment favors it
+
+3. SLOT ALLOCATION DECISIONS: For EACH slot that needs action, decide:
+   - "keep" — performing well or too early to judge (< 3 iterations)
+   - "replace" — with a strategy better suited to current environment
+   - "mutate" — take the best-performing strategy and adapt it
+
+4. EXECUTION GAP: If real trades show consistent gaps between simulated and actual
+   returns, factor this into fitness assessment. Strategies that simulate well but
+   trade poorly should be deprioritized.
+
+5. LEARNING: What have you learned from the environment-slot history? Which strategy
+   types consistently work or fail in this regime?
+
+═══ RESPONSE FORMAT ═══
+Respond with a JSON object:
+{{
+  "analysis": "Your reasoning about environment, portfolio, and allocation...",
+  "actions": [
+    {{
+      "slot": <int>,
+      "action": "keep" | "replace" | "mutate",
+      "reason": "why this action for this slot",
+      "seed_from_slot": <int or null>,
+      "seed_code": "<complete Python code if replace, null if keep>",
+      "target_strategy_type": "what type the new strategy should be"
+    }}
+  ],
+  "environment_learning": "Key insight about what works in this regime",
+  "recommended_focus": ["list of strategy types to prioritize in current environment"]
+}}
+
+RULES:
+- You may act on MULTIPLE slots, not just the worst one.
+- Maximum {max_replacements} replacements per selector run to maintain stability.
+- Never replace a slot with < 3 iterations unless it has critical issues.
+- If replacing, provide COMPLETE Python code that defines scan(candles, symbol).
+- Prioritize strategies from recommended_focus that match the environment.
+- Keep at least 2 slots running strategies from different archetypes for diversity.
 """

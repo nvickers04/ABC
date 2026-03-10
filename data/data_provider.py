@@ -372,6 +372,9 @@ class DataProviderProtocol(Protocol):
 # IMPLEMENTATION
 # ============================================================
 
+_CACHE_MISS = object()  # Sentinel for "not in cache"
+
+
 class DataProvider:
     """
     Unified data provider wrapping MarketDataClient (official SDK).
@@ -454,8 +457,12 @@ class DataProvider:
             logger.debug(f"_run_async failed: {type(e).__name__}: {e}")
             raise
 
-    def _get_cached(self, key: str) -> Optional[Any]:
-        """Get cached value if not expired (uses per-type TTL)."""
+    def _get_cached(self, key: str) -> Any:
+        """Get cached value if not expired (uses per-type TTL).
+        
+        Returns _CACHE_MISS sentinel when key is not in cache.
+        Returns the cached value (including None) when found.
+        """
         if key in self._cache:
             value, timestamp = self._cache[key]
             data_type = key.split(':')[0] if ':' in key else key
@@ -463,7 +470,7 @@ class DataProvider:
             if (datetime.now() - timestamp).seconds < ttl:
                 return value
             del self._cache[key]
-        return None
+        return _CACHE_MISS
 
     def _set_cached(self, key: str, value: Any):
         """Set cached value with timestamp."""
@@ -483,7 +490,7 @@ class DataProvider:
         """
         cache_key = f"quote:{symbol}"
         cached = self._get_cached(cache_key)
-        if cached:
+        if cached is not _CACHE_MISS:
             return cached
 
         try:
@@ -570,7 +577,7 @@ class DataProvider:
         """
         cache_key = f"candles:{symbol}:{resolution}:{from_date or days_back}:{to_date}"
         cached = self._get_cached(cache_key)
-        if cached:
+        if cached is not _CACHE_MISS:
             return cached
 
         try:
@@ -596,9 +603,12 @@ class DataProvider:
                 return candles
             else:
                 logger.warning(f"No candle data available for {symbol}")
+                # Negative-cache to avoid re-requesting the same failure
+                self._set_cached(cache_key, None)
 
         except Exception as e:
             logger.warning(f"Failed to get candles for {symbol}: {e}")
+            self._set_cached(cache_key, None)
 
         return None
 
@@ -617,7 +627,7 @@ class DataProvider:
         """
         cache_key = f"atr:{symbol}:{period}"
         cached = self._get_cached(cache_key)
-        if cached:
+        if cached is not _CACHE_MISS:
             return cached
 
         try:
@@ -860,7 +870,7 @@ class DataProvider:
         """
         cache_key = f"fundamentals:{symbol}"
         cached = self._get_cached(cache_key)
-        if cached:
+        if cached is not _CACHE_MISS:
             return cached
 
         try:
@@ -903,7 +913,7 @@ class DataProvider:
         """
         cache_key = f"earnings:{symbol}"
         cached = self._get_cached(cache_key)
-        if cached:
+        if cached is not _CACHE_MISS:
             return cached
 
         try:
@@ -1011,7 +1021,7 @@ class DataProvider:
         """
         cache_key = f"ext_fundamentals:{symbol}"
         cached = self._get_cached(cache_key)
-        if cached:
+        if cached is not _CACHE_MISS:
             return cached
 
         try:
@@ -1056,7 +1066,7 @@ class DataProvider:
         """
         cache_key = f"analyst:{symbol}"
         cached = self._get_cached(cache_key)
-        if cached:
+        if cached is not _CACHE_MISS:
             return cached
 
         try:
@@ -1111,7 +1121,7 @@ class DataProvider:
         """
         cache_key = f"institutional:{symbol}"
         cached = self._get_cached(cache_key)
-        if cached:
+        if cached is not _CACHE_MISS:
             return cached
 
         try:
@@ -1164,7 +1174,7 @@ class DataProvider:
         """
         cache_key = f"insider:{symbol}"
         cached = self._get_cached(cache_key)
-        if cached:
+        if cached is not _CACHE_MISS:
             return cached
 
         try:
@@ -1228,7 +1238,7 @@ class DataProvider:
         """
         cache_key = f"news:{symbol}"
         cached = self._get_cached(cache_key)
-        if cached:
+        if cached is not _CACHE_MISS:
             return cached
 
         try:
@@ -1282,7 +1292,7 @@ class DataProvider:
         """
         cache_key = f"peer:{symbol}"
         cached = self._get_cached(cache_key)
-        if cached:
+        if cached is not _CACHE_MISS:
             return cached
 
         try:

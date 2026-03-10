@@ -30,7 +30,8 @@ SANDBOX_BLOCKED_CALLS = {"os", "subprocess", "sys", "shutil", "pathlib", "socket
 STRATEGY_EXEC_TIMEOUT = 10      # seconds per symbol scan
 
 # ── Slots ───────────────────────────────────────────────────────
-NUM_SLOTS = 10                  # number of concurrent strategy slots
+NUM_SLOTS = 12                  # number of strategy slots
+BATCH_SIZE = 4                  # slots per batch (matches LLM semaphore)
 SELECTOR_EVERY_N_ROUNDS = 3     # run selector agent every N rounds
 MAX_SELECTOR_REPLACEMENTS = 3   # max slots the selector can replace per run
 
@@ -206,7 +207,6 @@ Respond with a JSON object:
       "action": "keep" | "replace" | "mutate",
       "reason": "why this action for this slot",
       "seed_from_slot": <int or null>,
-      "seed_code": "<complete Python code if replace, null if keep>",
       "target_strategy_type": "what type the new strategy should be"
     }}
   ],
@@ -218,7 +218,9 @@ RULES:
 - You may act on MULTIPLE slots, not just the worst one.
 - Maximum {max_replacements} replacements per selector run to maintain stability.
 - Never replace a slot with < 3 iterations unless it has critical issues.
-- If replacing, provide COMPLETE Python code that defines scan(candles, symbol).
+- Do NOT provide seed_code — the evolution pipeline will generate proper code.
+- If seed_from_slot is set, the donor's code will be cloned as a starting point
+  (only if it evaluates better than the current slot).
 - Prioritize strategies from recommended_focus that match the environment.
 - Keep at least 2 slots running strategies from different archetypes for diversity.
 """

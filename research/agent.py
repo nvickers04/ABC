@@ -34,6 +34,7 @@ from data.data_provider import get_data_provider
 from memory import get_db
 from research.config import (
     ANALYSIS_PROMPT_TEMPLATE,
+    BATCH_SIZE,
     CANDLE_RESOLUTION,
     EVAL_DAYS_BACK,
     MAX_SELECTOR_REPLACEMENTS,
@@ -832,24 +833,39 @@ def _get_best_strategy(slot: int = 1) -> tuple[Optional[int], Optional[str], flo
 # LIVE SCAN
 # ═══════════════════════════════════════════════════════════════
 
-def _run_live_scan(strategy_id: int, source: str, slot: int = 1):
-    """Run best strategy against today's candles and write live_signals for this slot."""
+def _fetch_live_candles() -> dict[str, pd.DataFrame]:
+    """Fetch today's 1-min candles for the full universe (called once per round)."""
     provider = get_data_provider()
+    today = date.today().isoformat()
+    result: dict[str, pd.DataFrame] = {}
+    for sym in RESEARCH_UNIVERSE:
+        try:
+            raw = provider.get_candles(
+                sym, resolution=CANDLE_RESOLUTION, from_date=today,
+            )
+            if raw and len(raw) > 0:
+                df = _candles_to_df(raw)
+                if len(df) >= 30:
+                    result[sym] = df
+        except Exception as e:
+            logger.warning(f"Live candle fetch failed for {sym}: {e}")
+    logger.info(f"Live candles: {len(result)}/{len(RESEARCH_UNIVERSE)} symbols with >= 30 bars")
+    return result
+
+
+def _run_live_scan(
+    strategy_id: int, source: str, slot: int,
+    live_candles: dict[str, pd.DataFrame],
+):
+    """Run best strategy against pre-fetched today's candles and write live_signals."""
     db = get_db()
     now = datetime.now(timezone.utc).isoformat()
 
     # Clear old live signals for THIS slot only
     db.execute("DELETE FROM live_signals WHERE slot = ?", (slot,))
 
-    for sym in RESEARCH_UNIVERSE:
+    for sym, df in live_candles.items():
         try:
-            raw = provider.get_candles(sym, resolution=CANDLE_RESOLUTION, days_back=1)
-            if not raw or len(raw) == 0:
-                continue
-            df = _candles_to_df(raw)
-            if len(df) < 30:
-                continue
-
             signals = _execute_strategy(source, df, sym)
             for sig in signals:
                 db.execute(
@@ -878,7 +894,7 @@ def _run_live_scan(strategy_id: int, source: str, slot: int = 1):
 
     db.commit()
     count = db.execute("SELECT COUNT(*) FROM live_signals WHERE slot = ?", (slot,)).fetchone()[0]
-    logger.info(f"Live scan [slot {slot:02d}]: {count} signals written for {len(RESEARCH_UNIVERSE)} symbols")
+    logger.info(f"Live scan [slot {slot:02d}]: {count} signals written for {len(live_candles)} symbols")
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -932,6 +948,7 @@ async def _run_slot(
     *,
     dry_run: bool = False,
     environment_text: str = "",
+    live_candles: dict[str, pd.DataFrame] | None = None,
 ) -> dict:
     """Run one evolution iteration for a single slot. Returns updated state."""
     logger.info(f"[Slot {slot:02d}] Iteration {iteration} starting")
@@ -994,13 +1011,31 @@ async def _run_slot(
     consecutive_failures = state["consecutive_failures"]
     proposal_temp = min(1.0, 0.5 + consecutive_failures * 0.05)
     history = _get_history_summary(slot=slot)
+
+    # Check for selector directive (meta-learning pivot)
+    directive = state.pop("selector_directive", None)
+    directive_text = ""
+    if directive:
+        target = directive.get("target_strategy_type", "")
+        dreason = directive.get("reason", "")
+        directive_text = (
+            f"\n\nSELECTOR DIRECTIVE: The meta-learning selector has requested this slot "
+            f"pivot to a '{target}' strategy. Reason: {dreason}\n"
+            f"You MUST produce a strategy of type '{target}'. Use the current code as "
+            f"a starting point but fundamentally change the approach to match this type."
+        )
+        proposal_temp = min(1.0, proposal_temp + 0.15)  # higher temp for pivots
+        logger.info(
+            f"[Slot {slot:02d}] Selector directive: pivot to {target} (temp={proposal_temp:.2f})"
+        )
+
     logger.info(
         f"[Slot {slot:02d}] Proposing new strategy "
         f"(temp={proposal_temp:.2f}, failures={consecutive_failures})..."
     )
     async with _LLM_SEMAPHORE:
         new_source = await _llm_propose_strategy(
-            current_source, analysis, history,
+            current_source, analysis + directive_text, history,
             temperature=proposal_temp, slot=slot,
             environment_text=environment_text,
         )
@@ -1119,9 +1154,9 @@ async def _run_slot(
         state["consecutive_failures"] += 1
 
     # ── 12. Live scan ───────────────────────────────────────────
-    if best_id is not None:
+    if best_id is not None and live_candles:
         best_source = strat_path.read_text(encoding="utf-8") if not dry_run else current_source
-        await asyncio.to_thread(_run_live_scan, best_id, best_source, slot)
+        await asyncio.to_thread(_run_live_scan, best_id, best_source, slot, live_candles)
 
     # ── 13. Git commit ──────────────────────────────────────────
     if not dry_run:
@@ -1172,6 +1207,8 @@ async def _run_selector(
     slot_states: dict[int, dict],
     env_snapshot: dict,
     env_snapshot_id: int,
+    train_universe: dict,
+    test_universe: dict,
 ):
     """Meta-learning selector: assess environment, correlate with slot performance,
     and make intelligent slot allocation decisions.
@@ -1322,17 +1359,17 @@ async def _run_selector(
     logger.info(f"Environment learning: {env_learning}")
     logger.info(f"Recommended focus: {recommended_focus}")
 
-    # ── Execute actions ─────────────────────────────────────────
-    replacements_done = 0
+    # ── Execute actions (set directives — no direct code replacement) ──
+    directives_set = 0
     for action_item in actions:
-        if replacements_done >= MAX_SELECTOR_REPLACEMENTS:
-            logger.info(f"Selector: hit max replacements ({MAX_SELECTOR_REPLACEMENTS})")
+        if directives_set >= MAX_SELECTOR_REPLACEMENTS:
+            logger.info(f"Selector: hit max directives ({MAX_SELECTOR_REPLACEMENTS})")
             break
 
         slot_num = action_item.get("slot")
         action = action_item.get("action", "keep")
         reason = action_item.get("reason", "")
-        seed_code = action_item.get("seed_code")
+        target_type = action_item.get("target_strategy_type", "")
 
         if not slot_num or slot_num < 1 or slot_num > NUM_SLOTS:
             continue
@@ -1343,43 +1380,60 @@ async def _run_selector(
             continue
 
         if action in ("replace", "mutate"):
-            if not seed_code:
-                # If mutate without code, try copying from seed_from_slot
-                seed_from = action_item.get("seed_from_slot")
-                if seed_from and 1 <= seed_from <= NUM_SLOTS:
-                    try:
-                        seed_code = _strategy_path(seed_from).read_text(encoding="utf-8")
-                    except FileNotFoundError:
-                        logger.warning(f"Selector: seed slot {seed_from} not found — skipping")
-                        continue
-                else:
-                    logger.warning("Selector: No seed_code or seed_from_slot — skipping")
-                    continue
-
-            # Validate
-            validation_err = _validate_strategy_source(seed_code)
-            if validation_err:
-                logger.warning(f"Selector: Seed code for slot {slot_num:02d} failed validation: {validation_err}")
-                continue
-
-            # Replace
-            strat_path = _strategy_path(slot_num)
-            strat_path.write_text(seed_code, encoding="utf-8")
-            logger.info(f"Selector: Replaced Slot {slot_num:02d} ({action})")
-
-            # Reset slot state
-            slot_states[slot_num] = {
-                "consecutive_failures": 0,
-                "best_test_fitness": 0.0,
-                "iteration": 0,
-                "last_expectancy": 0,
-                "last_total_signals": 0,
+            # Set a directive — the next _run_slot iteration will use it
+            # to guide the LLM proposal through normal eval pipeline
+            seed_from = action_item.get("seed_from_slot")
+            directive = {
+                "action": action,
+                "target_strategy_type": target_type,
+                "reason": reason,
             }
 
-            await _git_commit(0, True, 0.0, None, slot=slot_num)
-            replacements_done += 1
+            # If cloning from another slot, copy its code as the new baseline
+            if seed_from and 1 <= seed_from <= NUM_SLOTS and seed_from != slot_num:
+                try:
+                    donor_source = _strategy_path(seed_from).read_text(encoding="utf-8")
+                    validation_err = _validate_strategy_source(donor_source)
+                    if not validation_err:
+                        # Evaluate donor code against current data before replacing
+                        donor_agg, _, _ = await asyncio.to_thread(
+                            _evaluate_strategy, donor_source, test_universe,
+                        )
+                        donor_fitness = _compute_fitness(donor_agg)
+                        current_fitness = slot_states[slot_num]["best_test_fitness"]
 
-    logger.info(f"Selector complete: {replacements_done} replacements made")
+                        if donor_fitness > current_fitness:
+                            strat_path = _strategy_path(slot_num)
+                            strat_path.write_text(donor_source, encoding="utf-8")
+                            slot_states[slot_num]["best_test_fitness"] = donor_fitness
+                            slot_states[slot_num]["consecutive_failures"] = 0
+                            logger.info(
+                                f"Selector: Slot {slot_num:02d} cloned from Slot {seed_from:02d} "
+                                f"(fitness {current_fitness:.4f} → {donor_fitness:.4f})"
+                            )
+                            await _git_commit(
+                                slot_states[slot_num]["iteration"], True,
+                                donor_fitness, None, slot=slot_num,
+                            )
+                        else:
+                            logger.info(
+                                f"Selector: Slot {slot_num:02d} skip clone — donor fitness "
+                                f"{donor_fitness:.4f} <= current {current_fitness:.4f}"
+                            )
+                    else:
+                        logger.warning(f"Selector: donor slot {seed_from} failed validation")
+                except FileNotFoundError:
+                    logger.warning(f"Selector: seed slot {seed_from} not found")
+
+            # Always set the directive so the next iteration knows which
+            # strategy type to evolve toward
+            slot_states[slot_num]["selector_directive"] = directive
+            directives_set += 1
+            logger.info(
+                f"Selector: Slot {slot_num:02d} directive set → pivot to {target_type}"
+            )
+
+    logger.info(f"Selector complete: {directives_set} directives set")
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -1443,36 +1497,53 @@ async def run_research(*, verbose: bool = False, dry_run: bool = False):
         test_days = sum(len(d) for d in test_universe.values())
         logger.info(f"Split: train={train_days} days, test={test_days} days")
 
-        # Run all slots concurrently (with environment context)
+        # Fetch today's candles once for all live scans
+        logger.info("Fetching live candles (today)...")
+        live_candles = _fetch_live_candles()
+
+        # Run slots in batches
         for s in slot_ids:
             slot_states[s]["iteration"] += 1
 
-        tasks = [
-            _run_slot(
-                slot=s,
-                iteration=slot_states[s]["iteration"],
-                train_universe=train_universe,
-                test_universe=test_universe,
-                state=slot_states[s],
-                dry_run=dry_run,
-                environment_text=env_text,
-            )
-            for s in slot_ids
+        batches = [
+            slot_ids[i:i + BATCH_SIZE]
+            for i in range(0, len(slot_ids), BATCH_SIZE)
         ]
 
-        results = await asyncio.gather(*tasks, return_exceptions=True)
+        for batch_num, batch in enumerate(batches, 1):
+            logger.info(
+                f"Batch {batch_num}/{len(batches)}: "
+                f"slots {[f'{s:02d}' for s in batch]}"
+            )
+            tasks = [
+                _run_slot(
+                    slot=s,
+                    iteration=slot_states[s]["iteration"],
+                    train_universe=train_universe,
+                    test_universe=test_universe,
+                    state=slot_states[s],
+                    dry_run=dry_run,
+                    environment_text=env_text,
+                    live_candles=live_candles,
+                )
+                for s in batch
+            ]
 
-        # Update states from results
-        for s, result in zip(slot_ids, results):
-            if isinstance(result, Exception):
-                logger.error(f"[Slot {s:02d}] Failed: {result}")
-            elif isinstance(result, dict):
-                slot_states[s] = result
+            results = await asyncio.gather(*tasks, return_exceptions=True)
+
+            for s, result in zip(batch, results):
+                if isinstance(result, Exception):
+                    logger.error(f"[Slot {s:02d}] Failed: {result}")
+                elif isinstance(result, dict):
+                    slot_states[s] = result
 
         # Meta-learning selector agent
         if round_num % SELECTOR_EVERY_N_ROUNDS == 0:
             try:
-                await _run_selector(slot_states, env_snapshot, env_snapshot_id)
+                await _run_selector(
+                    slot_states, env_snapshot, env_snapshot_id,
+                    train_universe, test_universe,
+                )
             except Exception as e:
                 logger.error(f"Selector failed: {e}")
 

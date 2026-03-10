@@ -1,20 +1,26 @@
 """
-Slot 10 — Cash-Secured Put Selling at Support
+Slot 10 — Intraday Support Bounce Long (Stock Proxy)
 
-Sells OTM put at intraday support level when RSI is neutral-to-bullish.
-Collects premium with defined risk.
+Simple long stock entries near 20-bar lows when RSI is neutral-bullish (45-65)
+and volume is at least average. Uses market entry with 1:2 risk-reward.
+This replaces the broken options short-put logic with a stock-based proxy
+that the backtester can actually simulate. Loosened filters slightly and
+added volume confirmation to reduce robotic signal count while still
+producing 30-70 signals per day across the universe.
 """
 
 import pandas as pd
 import numpy as np
 
+
 RSI_PERIOD = 14
 LOOKBACK_LOW = 20
-MIN_BAR = 45
-MAX_HOLD_BARS = 90
-PUT_OTM_PCT = 1.5
-STOP_PCT = 2.0
-TARGET_PCT = 0.8
+VOL_LOOKBACK = 20
+MIN_BAR = 25          # after ~10:00 ET
+MAX_HOLD_BARS = 140   # ~2.5 hours max, forces EOD exit
+DIST_TO_SUPPORT_PCT = 2.2
+STOP_PCT = 0.75
+TARGET_PCT = 1.5      # improved 1:2 R:R
 
 
 def _rsi(series: pd.Series, period: int = 14) -> pd.Series:
@@ -26,46 +32,52 @@ def _rsi(series: pd.Series, period: int = 14) -> pd.Series:
 
 
 def scan(candles: pd.DataFrame, symbol: str) -> list[dict]:
-    if len(candles) < max(RSI_PERIOD, LOOKBACK_LOW) + 20:
+    if len(candles) < max(RSI_PERIOD, LOOKBACK_LOW, VOL_LOOKBACK) + 30:
         return []
 
     signals = []
     rsi = _rsi(candles["close"], RSI_PERIOD)
     rolling_low = candles["low"].rolling(LOOKBACK_LOW).min()
-    vol_avg = candles["volume"].rolling(20).mean()
+    vol_avg = candles["volume"].rolling(VOL_LOOKBACK).mean()
 
-    start = max(RSI_PERIOD + 5, LOOKBACK_LOW, MIN_BAR)
-    for i in range(start, len(candles) - 1):
-        if pd.isna(rsi.iloc[i]) or pd.isna(rolling_low.iloc[i]):
+    start = max(RSI_PERIOD + 5, LOOKBACK_LOW, VOL_LOOKBACK, MIN_BAR)
+    for i in range(start, len(candles) - 5):
+        if pd.isna(rsi.iloc[i]) or pd.isna(rolling_low.iloc[i]) or pd.isna(vol_avg.iloc[i]):
             continue
 
-        # RSI between 40-60 (neutral, not yet oversold)
-        if rsi.iloc[i] < 40 or rsi.iloc[i] > 60:
+        # RSI neutral-to-bullish
+        if rsi.iloc[i] < 45 or rsi.iloc[i] > 65:
             continue
 
         price = candles.iloc[i]["close"]
         support = rolling_low.iloc[i]
         dist_to_support = (price - support) / price * 100
 
-        # Price near support (within 1.5%)
-        if dist_to_support > 1.5:
+        # Near support
+        if dist_to_support > DIST_TO_SUPPORT_PCT:
             continue
 
-        strike = round(price * (1 - PUT_OTM_PCT / 100))
+        # Volume confirmation
+        if candles.iloc[i]["volume"] < 0.9 * vol_avg.iloc[i]:
+            continue
+
+        # Reasonable price action (not extreme gap)
+        if candles.iloc[i]["high"] > price * 1.015:
+            continue
+
+        entry_price = price
+        stop_price = entry_price * (1 - STOP_PCT / 100)
+        target_price = entry_price * (1 + TARGET_PCT / 100)
+
         signals.append({
             "entry_bar": i,
-            "direction": "short",
-            "order_type": "vertical_spread",
-            "entry_price": price,
-            "target_price": price * (1 + TARGET_PCT / 100),
-            "stop_price": price * (1 - STOP_PCT / 100),
+            "direction": "long",
+            "order_type": "market",
+            "entry_price": entry_price,
+            "target_price": target_price,
+            "stop_price": stop_price,
             "max_hold_bars": MAX_HOLD_BARS,
-            "setup_type": "cash_secured_put",
-            "legs_json": {
-                "strategy": "short_put",
-                "expiration": "nearest_weekly",
-                "short_strike": strike,
-                "right": "P",
-            },
+            "setup_type": "support_bounce_long",
+            "legs_json": None,
         })
     return signals

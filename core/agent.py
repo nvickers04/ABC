@@ -254,21 +254,21 @@ class TradingAgent:
         return summary.today_llm_cost >= MAX_DAILY_LLM_COST
 
     def _get_research_briefing(self) -> str | None:
-        """Read best strategy per track + live signals from research DB."""
+        """Read best strategy per slot + live signals from research DB."""
         try:
             from memory import get_db
             db = get_db()
 
-            # Best strategy per track
+            # Best strategy per slot
             rows = db.execute(
-                """SELECT s.id, s.track, s.expectancy, s.hit_rate, s.avg_rr,
+                """SELECT s.id, s.slot, s.expectancy, s.hit_rate, s.avg_rr,
                           s.total_signals, s.llm_analysis
                    FROM strategies s
                    INNER JOIN (
-                       SELECT track, MAX(expectancy) as max_exp
+                       SELECT slot, MAX(expectancy) as max_exp
                        FROM strategies WHERE kept = 1
-                       GROUP BY track
-                   ) best ON s.track = best.track AND s.expectancy = best.max_exp
+                       GROUP BY slot
+                   ) best ON s.slot = best.slot AND s.expectancy = best.max_exp
                    WHERE s.kept = 1
                    ORDER BY s.expectancy DESC"""
             ).fetchall()
@@ -278,7 +278,7 @@ class TradingAgent:
             lines = ["=== RESEARCH BRIEFING ==="]
             for row in rows:
                 lines.append(
-                    f"  [{row['track'].upper()}] #{row['id']}: "
+                    f"  [Slot {row['slot']:02d}] #{row['id']}: "
                     f"exp={row['expectancy']:.4f} hit={row['hit_rate']:.0f}% "
                     f"R:R={row['avg_rr']:.1f} ({row['total_signals']} signals)"
                 )
@@ -286,17 +286,17 @@ class TradingAgent:
                     snippet = row["llm_analysis"][:200].replace("\n", " ")
                     lines.append(f"    Insight: {snippet}")
 
-            # Live signals for today (all tracks)
+            # Live signals for today (all slots)
             live = db.execute(
-                """SELECT track, symbol, direction, order_type, setup_type,
+                """SELECT slot, symbol, direction, order_type, setup_type,
                           entry_price, target_price, stop_price
-                   FROM live_signals ORDER BY track, symbol"""
+                   FROM live_signals ORDER BY slot, symbol"""
             ).fetchall()
             if live:
                 lines.append(f"  Live signals today: {len(live)}")
                 for sig in live[:15]:
                     lines.append(
-                        f"    [{sig['track']}] {sig['symbol']} {sig['direction']} "
+                        f"    [Slot {sig['slot']:02d}] {sig['symbol']} {sig['direction']} "
                         f"{sig['order_type']} @ {sig['entry_price']:.2f} "
                         f"tgt={sig['target_price']:.2f} stp={sig['stop_price']:.2f} "
                         f"({sig['setup_type']})"

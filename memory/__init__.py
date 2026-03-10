@@ -35,7 +35,7 @@ def init_db() -> sqlite3.Connection:
         CREATE TABLE IF NOT EXISTS strategies (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             ts TEXT NOT NULL,
-            track TEXT NOT NULL DEFAULT 'market',
+            slot INTEGER NOT NULL DEFAULT 1,
             methodology TEXT NOT NULL,
             parent_id INTEGER,
             total_signals INTEGER DEFAULT 0,
@@ -100,7 +100,7 @@ def init_db() -> sqlite3.Connection:
         CREATE TABLE IF NOT EXISTS live_signals (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             strategy_id INTEGER NOT NULL,
-            track TEXT NOT NULL DEFAULT 'market',
+            slot INTEGER NOT NULL DEFAULT 1,
             ts TEXT NOT NULL,
             symbol TEXT NOT NULL,
             direction TEXT,
@@ -115,23 +115,30 @@ def init_db() -> sqlite3.Connection:
         );
 
         CREATE INDEX IF NOT EXISTS idx_strategies_kept ON strategies(kept);
-        CREATE INDEX IF NOT EXISTS idx_strategies_track ON strategies(track);
+        CREATE INDEX IF NOT EXISTS idx_strategies_slot ON strategies(slot);
         CREATE INDEX IF NOT EXISTS idx_evaluations_strategy ON evaluations(strategy_id);
         CREATE INDEX IF NOT EXISTS idx_signals_evaluation ON signals(evaluation_id);
         CREATE INDEX IF NOT EXISTS idx_live_signals_ts ON live_signals(ts);
-        CREATE INDEX IF NOT EXISTS idx_live_signals_track ON live_signals(track);
+        CREATE INDEX IF NOT EXISTS idx_live_signals_slot ON live_signals(slot);
     """)
 
     # ── Migrations for existing DBs ─────────────────────────────
-    # Add track column if upgrading from pre-multi-track schema
+    # Add slot column if upgrading from pre-slot schema (or track-based schema)
     try:
-        conn.execute("SELECT track FROM strategies LIMIT 1")
+        conn.execute("SELECT slot FROM strategies LIMIT 1")
     except sqlite3.OperationalError:
-        conn.execute("ALTER TABLE strategies ADD COLUMN track TEXT NOT NULL DEFAULT 'market'")
+        # Try adding slot; if track exists, we're migrating from track-based
+        try:
+            conn.execute("ALTER TABLE strategies ADD COLUMN slot INTEGER NOT NULL DEFAULT 1")
+        except sqlite3.OperationalError:
+            pass
     try:
-        conn.execute("SELECT track FROM live_signals LIMIT 1")
+        conn.execute("SELECT slot FROM live_signals LIMIT 1")
     except sqlite3.OperationalError:
-        conn.execute("ALTER TABLE live_signals ADD COLUMN track TEXT NOT NULL DEFAULT 'market'")
+        try:
+            conn.execute("ALTER TABLE live_signals ADD COLUMN slot INTEGER NOT NULL DEFAULT 1")
+        except sqlite3.OperationalError:
+            pass
 
     conn.commit()
     _connection = conn

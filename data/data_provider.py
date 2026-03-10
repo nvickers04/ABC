@@ -551,7 +551,9 @@ class DataProvider:
         self,
         symbol: str,
         resolution: str = 'D',
-        days_back: int = 30
+        days_back: int = 30,
+        from_date: Optional[str] = None,
+        to_date: Optional[str] = None,
     ) -> Optional[Candles]:
         """
         Get historical OHLCV candles.
@@ -559,19 +561,24 @@ class DataProvider:
         Args:
             symbol: Stock ticker
             resolution: 'D' (daily), 'H' (hourly), '1'/'5'/'15' (minutes)
-            days_back: Number of days of history
+            days_back: Number of bars (when from_date not specified)
+            from_date: Start date 'YYYY-MM-DD' (overrides days_back)
+            to_date: End date 'YYYY-MM-DD'
 
         Returns:
             Candles with source tracking, or None if unavailable
         """
-        cache_key = f"candles:{symbol}:{resolution}:{days_back}"
+        cache_key = f"candles:{symbol}:{resolution}:{from_date or days_back}:{to_date}"
         cached = self._get_cached(cache_key)
         if cached:
             return cached
 
         try:
             raw = self._run_async(
-                self._mda_client.get_candles(symbol, resolution, days_back)
+                self._mda_client.get_candles(
+                    symbol, resolution, days_back,
+                    from_date=from_date, to_date=to_date,
+                )
             )
 
             if raw and raw.get('close'):

@@ -1,10 +1,12 @@
 """
 Research Agent — Karpathy autoresearch pattern for day trading.
 
-Core loop: load strategy → evaluate across trading days → LLM analysis →
-propose new strategy.py → safety validate → evaluate → keep if improved → repeat.
-
-Also runs a live scan: best strategy against today's accruing candles.
+Architecture:
+  - NUM_SLOTS independent strategy slots, each evolved concurrently
+  - All slots run in parallel via asyncio.gather (LLM calls are async)
+  - Strategy evals run in thread pool (CPU-bound pandas/numpy)
+  - Selector agent periodically replaces worst slot with fresh or mutated strategy
+  - Git commits serialized via asyncio.Lock
 """
 
 import ast
@@ -13,7 +15,6 @@ import json
 import logging
 import random
 import subprocess
-import textwrap
 import time
 from datetime import datetime, date, timedelta, timezone
 from pathlib import Path
@@ -32,23 +33,27 @@ from research.config import (
     ANALYSIS_PROMPT_TEMPLATE,
     CANDLE_RESOLUTION,
     EVAL_DAYS_BACK,
+    NUM_SLOTS,
     RESEARCH_SYSTEM_PROMPT,
     RESEARCH_UNIVERSE,
     SANDBOX_ALLOWED_IMPORTS,
     SANDBOX_BLOCKED_CALLS,
+    SELECTOR_EVERY_N_ROUNDS,
+    SELECTOR_PROMPT,
     SIGNAL_SCHEMA,
-    TRACKS,
 )
 from research.simulator import compute_expectancy, simulate
 
 logger = logging.getLogger(__name__)
 
-_STRATEGIES_DIR = Path(__file__).parent / "strategies"
+_SLOTS_DIR = Path(__file__).parent / "slots"
+_GIT_LOCK = asyncio.Lock()
+_LLM_SEMAPHORE: asyncio.Semaphore | None = None  # initialized in run_research
 
 
-def _strategy_path(track: str) -> Path:
-    """Return the file path for a given track's strategy."""
-    return _STRATEGIES_DIR / f"{track}.py"
+def _strategy_path(slot: int) -> Path:
+    """Return the file path for a given slot's strategy."""
+    return _SLOTS_DIR / f"strategy_{slot:02d}.py"
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -374,7 +379,7 @@ async def _llm_propose_strategy(
     history_summary: str,
     *,
     temperature: float = 0.5,
-    track_info: dict | None = None,
+    slot: int = 1,
 ) -> str:
     """Ask the LLM to propose a new strategy.py. Returns raw source code."""
     prompt = f"""CURRENT STRATEGY:
@@ -400,11 +405,9 @@ DATA CONTEXT (important!):
 Based on the analysis, write an improved strategy.py.
 Output ONLY the complete Python code -- no markdown fences, no explanation outside the code."""
 
-    # Format system prompt with track-specific context
-    ti = track_info or {"order_type": "market", "description": "Market order entries."}
     system_prompt = RESEARCH_SYSTEM_PROMPT.format(
-        track_order_type=ti["order_type"],
-        track_description=ti["description"],
+        slot_id=f"{slot:02d}",
+        num_slots=NUM_SLOTS,
         signal_schema=SIGNAL_SCHEMA,
     )
 
@@ -454,7 +457,7 @@ def _store_strategy(
     analysis: str,
     kept: bool,
     parent_id: Optional[int] = None,
-    track: str = "market",
+    slot: int = 1,
 ) -> int:
     """Store strategy + evaluation results in SQLite. Returns strategy id."""
     db = get_db()
@@ -462,11 +465,11 @@ def _store_strategy(
 
     cur = db.execute(
         """INSERT INTO strategies
-           (ts, track, methodology, parent_id, total_signals, hit_rate, avg_rr, expectancy, kept, llm_analysis)
+           (ts, slot, methodology, parent_id, total_signals, hit_rate, avg_rr, expectancy, kept, llm_analysis)
            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
         (
             now,
-            track,
+            slot,
             source,
             parent_id,
             aggregate.get("total_signals", 0),
@@ -540,13 +543,13 @@ def _store_strategy(
     return strategy_id
 
 
-def _get_history_summary(limit: int = 10, track: str = "market") -> str:
-    """Get recent strategy history for LLM context, scoped to track."""
+def _get_history_summary(limit: int = 10, slot: int = 1) -> str:
+    """Get recent strategy history for LLM context, scoped to slot."""
     db = get_db()
     rows = db.execute(
         """SELECT id, ts, total_signals, hit_rate, expectancy, kept, llm_analysis, methodology
-           FROM strategies WHERE track = ? ORDER BY id DESC LIMIT ?""",
-        (track, limit),
+           FROM strategies WHERE slot = ? ORDER BY id DESC LIMIT ?""",
+        (slot, limit),
     ).fetchall()
 
     if not rows:
@@ -590,14 +593,14 @@ def _compute_fitness(agg: dict) -> float:
     return exp * signal_factor * sharpe_factor
 
 
-def _get_best_strategy(track: str = "market") -> tuple[Optional[int], Optional[str], float]:
-    """Get the best kept strategy for a track. Returns (id, source, expectancy)."""
+def _get_best_strategy(slot: int = 1) -> tuple[Optional[int], Optional[str], float]:
+    """Get the best kept strategy for a slot. Returns (id, source, expectancy)."""
     db = get_db()
     row = db.execute(
         """SELECT id, methodology, expectancy
-           FROM strategies WHERE kept = 1 AND track = ?
+           FROM strategies WHERE kept = 1 AND slot = ?
            ORDER BY expectancy DESC LIMIT 1""",
-        (track,),
+        (slot,),
     ).fetchone()
     if row:
         return row["id"], row["methodology"], row["expectancy"]
@@ -608,14 +611,14 @@ def _get_best_strategy(track: str = "market") -> tuple[Optional[int], Optional[s
 # LIVE SCAN
 # ═══════════════════════════════════════════════════════════════
 
-def _run_live_scan(strategy_id: int, source: str, track: str = "market"):
-    """Run best strategy against today's candles and write live_signals for this track."""
+def _run_live_scan(strategy_id: int, source: str, slot: int = 1):
+    """Run best strategy against today's candles and write live_signals for this slot."""
     provider = get_data_provider()
     db = get_db()
     now = datetime.now(timezone.utc).isoformat()
 
-    # Clear old live signals for THIS track only
-    db.execute("DELETE FROM live_signals WHERE track = ?", (track,))
+    # Clear old live signals for THIS slot only
+    db.execute("DELETE FROM live_signals WHERE slot = ?", (slot,))
 
     for sym in RESEARCH_UNIVERSE:
         try:
@@ -630,13 +633,13 @@ def _run_live_scan(strategy_id: int, source: str, track: str = "market"):
             for sig in signals:
                 db.execute(
                     """INSERT INTO live_signals
-                       (strategy_id, track, ts, symbol, direction, order_type,
+                       (strategy_id, slot, ts, symbol, direction, order_type,
                         setup_type, entry_price, target_price, stop_price,
                         max_hold_bars, legs_json)
                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                     (
                         strategy_id,
-                        track,
+                        slot,
                         now,
                         sym,
                         sig.get("direction"),
@@ -653,8 +656,8 @@ def _run_live_scan(strategy_id: int, source: str, track: str = "market"):
             logger.warning(f"Live scan failed for {sym}: {e}")
 
     db.commit()
-    count = db.execute("SELECT COUNT(*) FROM live_signals WHERE track = ?", (track,)).fetchone()[0]
-    logger.info(f"Live scan [{track}]: {count} signals written for {len(RESEARCH_UNIVERSE)} symbols")
+    count = db.execute("SELECT COUNT(*) FROM live_signals WHERE slot = ?", (slot,)).fetchone()[0]
+    logger.info(f"Live scan [slot {slot:02d}]: {count} signals written for {len(RESEARCH_UNIVERSE)} symbols")
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -664,36 +667,392 @@ def _run_live_scan(strategy_id: int, source: str, track: str = "market"):
 _REPO_ROOT = Path(__file__).resolve().parent.parent
 
 
-def _git_commit(iteration: int, kept: bool, expectancy: float, strategy_id: int | None, track: str = "market"):
-    """Commit track strategy file after each iteration so git log shows full evolution."""
-    try:
-        strategy_rel = f"research/strategies/{track}.py"
-        subprocess.run(
-            ["git", "add", strategy_rel],
-            cwd=_REPO_ROOT, capture_output=True, timeout=10,
-        )
-        status = "KEPT" if kept else "DISCARDED"
-        msg = f"research [{track}] iter {iteration}: {status} exp={expectancy:.4f} (#{strategy_id})"
-        result = subprocess.run(
-            ["git", "commit", "-m", msg, "--", strategy_rel],
-            cwd=_REPO_ROOT, capture_output=True, timeout=10,
-        )
-        if result.returncode == 0:
-            logger.info(f"Git commit: {msg}")
-            # Push to remote so GitHub stays in sync
-            push = subprocess.run(
-                ["git", "push"],
-                cwd=_REPO_ROOT, capture_output=True, timeout=30,
+async def _git_commit(iteration: int, kept: bool, expectancy: float, strategy_id: int | None, slot: int = 1):
+    """Commit slot strategy file after each iteration so git log shows full evolution."""
+    async with _GIT_LOCK:
+        try:
+            strategy_rel = f"research/slots/strategy_{slot:02d}.py"
+            subprocess.run(
+                ["git", "add", strategy_rel],
+                cwd=_REPO_ROOT, capture_output=True, timeout=10,
             )
-            if push.returncode == 0:
-                logger.debug("Git push: success")
+            status = "KEPT" if kept else "DISCARDED"
+            msg = f"research [slot {slot:02d}] iter {iteration}: {status} exp={expectancy:.4f} (#{strategy_id})"
+            result = subprocess.run(
+                ["git", "commit", "-m", msg, "--", strategy_rel],
+                cwd=_REPO_ROOT, capture_output=True, timeout=10,
+            )
+            if result.returncode == 0:
+                logger.info(f"Git commit: {msg}")
+                push = subprocess.run(
+                    ["git", "push"],
+                    cwd=_REPO_ROOT, capture_output=True, timeout=30,
+                )
+                if push.returncode == 0:
+                    logger.debug("Git push: success")
+                else:
+                    logger.debug(f"Git push failed: {push.stderr.decode(errors='replace').strip()}")
             else:
-                logger.debug(f"Git push failed: {push.stderr.decode(errors='replace').strip()}")
+                logger.debug("Git: nothing to commit (strategy unchanged)")
+        except Exception as e:
+            logger.debug(f"Git commit skipped: {e}")
+
+
+# ═══════════════════════════════════════════════════════════════
+# MAIN LOOP
+# ═══════════════════════════════════════════════════════════════
+
+async def _run_slot(
+    slot: int,
+    iteration: int,
+    train_universe: dict,
+    test_universe: dict,
+    state: dict,
+    *,
+    dry_run: bool = False,
+) -> dict:
+    """Run one evolution iteration for a single slot. Returns updated state."""
+    logger.info(f"[Slot {slot:02d}] Iteration {iteration} starting")
+
+    # ── 1. Load current strategy ────────────────────────────────
+    strat_path = _strategy_path(slot)
+    try:
+        current_source = strat_path.read_text(encoding="utf-8")
+    except FileNotFoundError:
+        logger.warning(f"[Slot {slot:02d}] strategy file not found — skipping")
+        return state
+
+    # ── 2. Evaluate current strategy on TRAIN set ───────────────
+    logger.info(f"[Slot {slot:02d}] Evaluating current (train)...")
+    train_agg, train_per_day, train_results = await asyncio.to_thread(
+        _evaluate_strategy, current_source, train_universe,
+    )
+    logger.info(
+        f"[Slot {slot:02d}] Train: signals={train_agg['total_signals']} "
+        f"hit={train_agg['hit_rate']:.0f}% exp={train_agg['expectancy']:.4f} "
+        f"pf={train_agg['profit_factor']:.2f}"
+    )
+
+    # ── 3. Evaluate current strategy on TEST set ────────────────
+    test_agg, test_per_day, test_results = await asyncio.to_thread(
+        _evaluate_strategy, current_source, test_universe,
+    )
+    best_test_fitness = _compute_fitness(test_agg)
+    state["best_test_fitness"] = max(state["best_test_fitness"], best_test_fitness)
+    logger.info(
+        f"[Slot {slot:02d}] Test:  signals={test_agg['total_signals']} "
+        f"hit={test_agg['hit_rate']:.0f}% exp={test_agg['expectancy']:.4f} "
+        f"fitness={best_test_fitness:.4f}"
+    )
+
+    # ── 4. LLM analysis (on TRAIN results only) ────────────────
+    logger.info(f"[Slot {slot:02d}] Running LLM analysis...")
+    async with _LLM_SEMAPHORE:
+        analysis = await _llm_analyze(current_source, train_agg, train_per_day, train_results)
+    logger.info(f"[Slot {slot:02d}] Analysis: {analysis[:120]}...")
+
+    # ── 5. Store baseline if first iteration ────────────────────
+    best_id, best_source, best_exp = _get_best_strategy(slot)
+    is_first = best_id is None
+
+    if is_first:
+        current_id = _store_strategy(
+            current_source, train_agg, train_per_day, train_results, analysis,
+            kept=True, parent_id=None, slot=slot,
+        )
+        best_id = current_id
+        logger.info(f"[Slot {slot:02d}] First strategy stored as baseline (id={current_id})")
+    else:
+        current_id = best_id
+
+    # ── 6. Propose new strategy ─────────────────────────────────
+    consecutive_failures = state["consecutive_failures"]
+    proposal_temp = min(1.0, 0.5 + consecutive_failures * 0.05)
+    history = _get_history_summary(slot=slot)
+    logger.info(
+        f"[Slot {slot:02d}] Proposing new strategy "
+        f"(temp={proposal_temp:.2f}, failures={consecutive_failures})..."
+    )
+    async with _LLM_SEMAPHORE:
+        new_source = await _llm_propose_strategy(
+            current_source, analysis, history,
+            temperature=proposal_temp, slot=slot,
+        )
+
+    # ── 7. Validate ─────────────────────────────────────────────
+    validation_err = _validate_strategy_source(new_source)
+    if validation_err:
+        logger.warning(f"[Slot {slot:02d}] Validation failed: {validation_err}")
+        _store_strategy(
+            new_source, {"total_signals": 0}, [], [], validation_err,
+            kept=False, parent_id=current_id, slot=slot,
+        )
+        state["consecutive_failures"] += 1
+        return state
+
+    # ── 8. Evaluate proposed on TRAIN ───────────────────────────
+    logger.info(f"[Slot {slot:02d}] Evaluating proposed (train)...")
+    new_train_agg, new_train_pd, new_train_res = await asyncio.to_thread(
+        _evaluate_strategy, new_source, train_universe,
+    )
+    logger.info(
+        f"[Slot {slot:02d}] Proposed train: signals={new_train_agg['total_signals']} "
+        f"hit={new_train_agg['hit_rate']:.0f}% exp={new_train_agg['expectancy']:.4f} "
+        f"pf={new_train_agg['profit_factor']:.2f}"
+    )
+
+    # ── 9. Evaluate proposed on TEST ────────────────────────────
+    new_test_agg, new_test_pd, new_test_res = await asyncio.to_thread(
+        _evaluate_strategy, new_source, test_universe,
+    )
+    new_test_fitness = _compute_fitness(new_test_agg)
+    logger.info(
+        f"[Slot {slot:02d}] Proposed test:  signals={new_test_agg['total_signals']} "
+        f"hit={new_test_agg['hit_rate']:.0f}% exp={new_test_agg['expectancy']:.4f} "
+        f"fitness={new_test_fitness:.4f}"
+    )
+
+    # ── 10. LLM analysis of new strategy ────────────────────────
+    if new_train_agg.get("total_signals", 0) > 0:
+        async with _LLM_SEMAPHORE:
+            new_analysis = await _llm_analyze(
+                new_source, new_train_agg, new_train_pd, new_train_res,
+            )
+    else:
+        new_analysis = (
+            "ZERO SIGNALS produced. The filters are too strict for the data. "
+            "Each trading day has ~390 bars (1-min, 9:30-16:00 ET). "
+            "Loosen conditions, lower thresholds, or simplify the logic."
+        )
+        logger.warning(f"[Slot {slot:02d}] Proposed strategy produced 0 signals")
+
+    # ── 11. Keep or discard (fitness + annealing) ───────────────
+    min_test_signals = 15
+    has_enough_signals = new_test_agg.get("total_signals", 0) >= min_test_signals
+    train_positive = new_train_agg.get("expectancy", 0) > 0
+
+    best_fitness = state["best_test_fitness"]
+    strict_improved = (
+        new_test_fitness > best_fitness
+        and has_enough_signals
+        and train_positive
+    )
+
+    annealing_accept = False
+    if (
+        not strict_improved
+        and has_enough_signals
+        and train_positive
+        and consecutive_failures >= 5
+        and best_fitness > 0
+        and new_test_fitness >= best_fitness * 0.9
+    ):
+        annealing_accept = True
+
+    kept = strict_improved or annealing_accept
+
+    if kept:
+        if annealing_accept:
+            logger.info(
+                f"[Slot {slot:02d}] ACCEPTING (annealing): fitness {new_test_fitness:.4f} "
+                f"vs best {best_fitness:.4f} after {consecutive_failures} failures"
+            )
         else:
-            # Nothing to commit (strategy unchanged) — that's fine
-            logger.debug("Git: nothing to commit (strategy unchanged)")
-    except Exception as e:
-        logger.debug(f"Git commit skipped: {e}")
+            logger.info(
+                f"[Slot {slot:02d}] KEEPING: fitness {best_fitness:.4f} "
+                f"-> {new_test_fitness:.4f} (+{new_test_fitness - best_fitness:.4f})"
+            )
+        new_id = _store_strategy(
+            new_source, new_train_agg, new_train_pd, new_train_res, new_analysis,
+            kept=True, parent_id=current_id, slot=slot,
+        )
+        if not dry_run:
+            strat_path.write_text(new_source, encoding="utf-8")
+            logger.info(f"[Slot {slot:02d}] Strategy updated (id={new_id})")
+        best_id = new_id
+        state["best_test_fitness"] = new_test_fitness
+        state["consecutive_failures"] = 0
+    else:
+        reasons = []
+        if new_test_fitness <= best_fitness:
+            reasons.append(f"lower fitness ({new_test_fitness:.4f} vs {best_fitness:.4f})")
+        if not has_enough_signals:
+            reasons.append(
+                f"too few test signals ({new_test_agg.get('total_signals', 0)}<{min_test_signals})"
+            )
+        if not train_positive:
+            reasons.append("negative train expectancy")
+        logger.info(f"[Slot {slot:02d}] DISCARDING: {', '.join(reasons)}")
+        _store_strategy(
+            new_source, new_train_agg, new_train_pd, new_train_res, new_analysis,
+            kept=False, parent_id=current_id, slot=slot,
+        )
+        state["consecutive_failures"] += 1
+
+    # ── 12. Live scan ───────────────────────────────────────────
+    if best_id is not None:
+        best_source = strat_path.read_text(encoding="utf-8") if not dry_run else current_source
+        await asyncio.to_thread(_run_live_scan, best_id, best_source, slot)
+
+    # ── 13. Git commit ──────────────────────────────────────────
+    if not dry_run:
+        await _git_commit(
+            iteration, kept,
+            new_test_fitness if kept else best_fitness,
+            best_id, slot=slot,
+        )
+
+    logger.info(
+        f"[Slot {slot:02d}] Iteration {iteration} complete — "
+        f"best fitness={state['best_test_fitness']:.4f} (#{best_id}) "
+        f"failures={state['consecutive_failures']}"
+    )
+    return state
+
+
+# ═══════════════════════════════════════════════════════════════
+# SELECTOR AGENT
+# ═══════════════════════════════════════════════════════════════
+
+async def _run_selector(slot_states: dict[int, dict]):
+    """Evaluate all slots and replace the weakest if appropriate."""
+    logger.info("=" * 60)
+    logger.info("SELECTOR AGENT — Evaluating slot population")
+    logger.info("=" * 60)
+
+    # Rank slots by fitness
+    rankings = []
+    for slot_num in range(1, NUM_SLOTS + 1):
+        state = slot_states[slot_num]
+        strat_path = _strategy_path(slot_num)
+        setup_type = "unknown"
+        try:
+            source = strat_path.read_text(encoding="utf-8")
+            # Extract setup_type from code
+            for line in source.split("\n"):
+                if "setup_type" in line and "=" in line:
+                    parts = line.split('"')
+                    if len(parts) >= 2:
+                        setup_type = parts[-2]
+                        break
+        except FileNotFoundError:
+            source = ""
+        rankings.append({
+            "slot": slot_num,
+            "fitness": state["best_test_fitness"],
+            "iterations": state["iteration"],
+            "failures": state["consecutive_failures"],
+            "setup_type": setup_type,
+        })
+
+    rankings.sort(key=lambda x: x["fitness"], reverse=True)
+
+    # Log rankings
+    for i, r in enumerate(rankings):
+        marker = " ★" if i == 0 else " ✗" if i == len(rankings) - 1 else ""
+        logger.info(
+            f"  #{i+1} Slot {r['slot']:02d}: fitness={r['fitness']:.4f} "
+            f"iters={r['iterations']} type={r['setup_type']}{marker}"
+        )
+
+    worst = rankings[-1]
+    best = rankings[0]
+
+    # Don't replace if worst has < 3 iterations (give it a chance)
+    if worst["iterations"] < 3:
+        logger.info(f"Selector: Slot {worst['slot']:02d} only has {worst['iterations']} iterations — keeping")
+        return
+
+    # Don't replace if worst is actually decent (positive fitness)
+    if worst["fitness"] > 0.005:
+        logger.info(f"Selector: Slot {worst['slot']:02d} fitness={worst['fitness']:.4f} is decent — keeping")
+        return
+
+    # Ask LLM for replacement decision
+    slot_ranking_text = "\n".join(
+        f"  Slot {r['slot']:02d}: fitness={r['fitness']:.4f} iters={r['iterations']} "
+        f"consecutive_failures={r['failures']} type={r['setup_type']}"
+        for r in rankings
+    )
+    current_types = ", ".join(r["setup_type"] for r in rankings)
+
+    prompt = SELECTOR_PROMPT.format(
+        num_slots=NUM_SLOTS,
+        slot_rankings=slot_ranking_text,
+        worst_slot=f"{worst['slot']:02d}",
+        worst_fitness=worst["fitness"],
+        worst_iterations=worst["iterations"],
+        current_types=current_types,
+    )
+
+    from xai_sdk.chat import system as sdk_system, user as sdk_user
+    llm = get_grok_llm()
+    async with _LLM_SEMAPHORE:
+        chat = llm.client.chat.create(
+            model=llm.model,
+            messages=[sdk_user(prompt)],
+            temperature=0.7,
+            max_tokens=4096,
+        )
+        response = await chat.sample()
+
+    usage = response.usage
+    get_cost_tracker().log_llm_call(
+        model=llm.model,
+        tokens_in=usage.prompt_tokens,
+        tokens_out=usage.completion_tokens,
+        purpose="selector_agent",
+    )
+
+    # Parse response
+    text = response.content.strip()
+    # Try to extract JSON
+    import re
+    json_match = re.search(r'\{.*\}', text, re.DOTALL)
+    if not json_match:
+        logger.warning("Selector: Could not parse JSON response — skipping")
+        return
+
+    try:
+        decision = json.loads(json_match.group())
+    except json.JSONDecodeError:
+        logger.warning("Selector: Invalid JSON — skipping")
+        return
+
+    action = decision.get("action", "keep")
+    reasoning = decision.get("reasoning", "")
+    seed_code = decision.get("seed_code")
+
+    logger.info(f"Selector decision: {action} — {reasoning}")
+
+    if action == "keep":
+        return
+
+    if not seed_code:
+        logger.warning("Selector: No seed_code provided — skipping")
+        return
+
+    # Validate the seed code
+    validation_err = _validate_strategy_source(seed_code)
+    if validation_err:
+        logger.warning(f"Selector: Seed code failed validation: {validation_err}")
+        return
+
+    # Replace worst slot
+    worst_slot = worst["slot"]
+    strat_path = _strategy_path(worst_slot)
+    strat_path.write_text(seed_code, encoding="utf-8")
+    logger.info(f"Selector: Replaced Slot {worst_slot:02d} ({action})")
+
+    # Reset slot state
+    slot_states[worst_slot] = {
+        "consecutive_failures": 0,
+        "best_test_fitness": 0.0,
+        "iteration": 0,
+    }
+
+    # Git commit the replacement
+    await _git_commit(0, True, 0.0, None, slot=worst_slot)
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -701,38 +1060,45 @@ def _git_commit(iteration: int, kept: bool, expectancy: float, strategy_id: int 
 # ═══════════════════════════════════════════════════════════════
 
 async def run_research(*, verbose: bool = False, dry_run: bool = False):
-    """Main research loop — round-robin across tracks, evolving each independently."""
+    """Main research loop — all slots evolve concurrently, selector prunes weakest."""
+    global _LLM_SEMAPHORE
+    _LLM_SEMAPHORE = asyncio.Semaphore(4)  # max 4 concurrent LLM calls
+
     from memory import init_db
     init_db()
 
-    track_names = [t["name"] for t in TRACKS]
+    slot_ids = list(range(1, NUM_SLOTS + 1))
     logger.info("=" * 60)
-    logger.info("RESEARCH AGENT - Multi-Track Strategy Evolution")
-    logger.info(f"Tracks: {', '.join(track_names)}")
+    logger.info("RESEARCH AGENT — Population-Based Strategy Evolution")
+    logger.info(f"Slots: {NUM_SLOTS} concurrent")
     logger.info(f"Universe: {len(RESEARCH_UNIVERSE)} symbols")
     logger.info(f"Eval window: last {EVAL_DAYS_BACK} trading days, {CANDLE_RESOLUTION}-min bars")
+    logger.info(f"Selector runs every {SELECTOR_EVERY_N_ROUNDS} rounds")
     logger.info("=" * 60)
 
-    # Per-track state
-    track_state: dict[str, dict] = {}
-    for t in TRACKS:
-        track_state[t["name"]] = {
+    # Per-slot state
+    slot_states: dict[int, dict] = {}
+    for s in slot_ids:
+        slot_states[s] = {
             "consecutive_failures": 0,
             "best_test_fitness": 0.0,
             "iteration": 0,
         }
 
-    global_iteration = 0
+    round_num = 0
 
     while True:
-        # Fetch candles once per round (shared across all tracks)
+        round_num += 1
+        logger.info(f"{'='*20} Round {round_num} {'='*20}")
+
+        # Fetch candles once per round (shared across all slots)
         logger.info("Fetching candle data...")
         universe = _fetch_universe_candles(EVAL_DAYS_BACK, exclude_today=True)
         total_days = sum(len(days) for days in universe.values())
         logger.info(f"Got data for {len(universe)} symbols across {total_days} trading days")
 
         if not universe:
-            logger.warning("No candle data available -- waiting 5 min")
+            logger.warning("No candle data available — waiting 5 min")
             await asyncio.sleep(300)
             continue
 
@@ -741,207 +1107,44 @@ async def run_research(*, verbose: bool = False, dry_run: bool = False):
         test_days = sum(len(d) for d in test_universe.values())
         logger.info(f"Split: train={train_days} days, test={test_days} days")
 
-        # Round-robin through all tracks
-        for track_info in TRACKS:
-            track = track_info["name"]
-            state = track_state[track]
-            state["iteration"] += 1
-            global_iteration += 1
-            iteration = state["iteration"]
+        # Run all slots concurrently
+        for s in slot_ids:
+            slot_states[s]["iteration"] += 1
 
-            logger.info(
-                f"{'='*20} [{track.upper()}] Iteration {iteration} "
-                f"(global #{global_iteration}) {'='*20}"
+        tasks = [
+            _run_slot(
+                slot=s,
+                iteration=slot_states[s]["iteration"],
+                train_universe=train_universe,
+                test_universe=test_universe,
+                state=slot_states[s],
+                dry_run=dry_run,
             )
+            for s in slot_ids
+        ]
 
-            # ── 1. Load current strategy for this track ─────────
-            strat_path = _strategy_path(track)
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+
+        # Update states from results
+        for s, result in zip(slot_ids, results):
+            if isinstance(result, Exception):
+                logger.error(f"[Slot {s:02d}] Failed: {result}")
+            elif isinstance(result, dict):
+                slot_states[s] = result
+
+        # Selector agent
+        if round_num % SELECTOR_EVERY_N_ROUNDS == 0:
             try:
-                current_source = strat_path.read_text(encoding="utf-8")
-            except FileNotFoundError:
-                logger.warning(f"[{track}] strategy file not found at {strat_path} -- skipping")
-                continue
+                await _run_selector(slot_states)
+            except Exception as e:
+                logger.error(f"Selector failed: {e}")
 
-            # ── 2. Evaluate current strategy on TRAIN set ───────
-            logger.info(f"[{track}] Evaluating current strategy (train)...")
-            train_agg, train_per_day, train_results = _evaluate_strategy(current_source, train_universe)
+        # Summary
+        logger.info(f"Round {round_num} complete. Slot fitness summary:")
+        for s in slot_ids:
+            st = slot_states[s]
             logger.info(
-                f"[{track}] Current train: signals={train_agg['total_signals']} "
-                f"hit={train_agg['hit_rate']:.0f}% exp={train_agg['expectancy']:.4f} "
-                f"pf={train_agg['profit_factor']:.2f}"
+                f"  Slot {s:02d}: fitness={st['best_test_fitness']:.4f} "
+                f"iter={st['iteration']} failures={st['consecutive_failures']}"
             )
-
-            # ── 3. Evaluate current strategy on TEST set ────────
-            test_agg, test_per_day, test_results = _evaluate_strategy(current_source, test_universe)
-            best_test_fitness = _compute_fitness(test_agg)
-            state["best_test_fitness"] = max(state["best_test_fitness"], best_test_fitness)
-            logger.info(
-                f"[{track}] Current test:  signals={test_agg['total_signals']} "
-                f"hit={test_agg['hit_rate']:.0f}% exp={test_agg['expectancy']:.4f} "
-                f"fitness={best_test_fitness:.4f}"
-            )
-
-            if train_agg["total_signals"] == 0:
-                logger.warning(f"[{track}] Current strategy produced zero signals on train set")
-
-            # ── 4. LLM analysis (on TRAIN results only) ─────────
-            logger.info(f"[{track}] Running LLM analysis...")
-            analysis = await _llm_analyze(current_source, train_agg, train_per_day, train_results)
-            logger.info(f"[{track}] Analysis: {analysis[:120]}...")
-
-            # ── 5. Store baseline if first iteration for track ──
-            best_id, best_source, best_exp = _get_best_strategy(track)
-            is_first = best_id is None
-
-            if is_first:
-                current_id = _store_strategy(
-                    current_source, train_agg, train_per_day, train_results, analysis,
-                    kept=True, parent_id=None, track=track,
-                )
-                best_id = current_id
-                logger.info(f"[{track}] First strategy stored as baseline (id={current_id})")
-            else:
-                current_id = best_id
-
-            # ── 6. Propose new strategy ─────────────────────────
-            consecutive_failures = state["consecutive_failures"]
-            proposal_temp = min(1.0, 0.5 + consecutive_failures * 0.05)
-            history = _get_history_summary(track=track)
-            logger.info(
-                f"[{track}] Proposing new strategy "
-                f"(temp={proposal_temp:.2f}, failures={consecutive_failures})..."
-            )
-            new_source = await _llm_propose_strategy(
-                current_source, analysis, history,
-                temperature=proposal_temp,
-                track_info=track_info,
-            )
-
-            # ── 7. Validate ─────────────────────────────────────
-            validation_err = _validate_strategy_source(new_source)
-            if validation_err:
-                logger.warning(f"[{track}] Proposed strategy failed validation: {validation_err}")
-                _store_strategy(
-                    new_source, {"total_signals": 0}, [], [], validation_err,
-                    kept=False, parent_id=current_id, track=track,
-                )
-                state["consecutive_failures"] += 1
-                continue
-
-            # ── 8. Evaluate proposed on TRAIN ───────────────────
-            logger.info(f"[{track}] Evaluating proposed strategy (train)...")
-            new_train_agg, new_train_pd, new_train_res = _evaluate_strategy(new_source, train_universe)
-            logger.info(
-                f"[{track}] Proposed train: signals={new_train_agg['total_signals']} "
-                f"hit={new_train_agg['hit_rate']:.0f}% exp={new_train_agg['expectancy']:.4f} "
-                f"pf={new_train_agg['profit_factor']:.2f}"
-            )
-
-            # ── 9. Evaluate proposed on TEST ────────────────────
-            new_test_agg, new_test_pd, new_test_res = _evaluate_strategy(new_source, test_universe)
-            new_test_fitness = _compute_fitness(new_test_agg)
-            logger.info(
-                f"[{track}] Proposed test:  signals={new_test_agg['total_signals']} "
-                f"hit={new_test_agg['hit_rate']:.0f}% exp={new_test_agg['expectancy']:.4f} "
-                f"fitness={new_test_fitness:.4f}"
-            )
-
-            # ── 10. LLM analysis of new strategy ───────────────
-            if new_train_agg.get("total_signals", 0) > 0:
-                new_analysis = await _llm_analyze(
-                    new_source, new_train_agg, new_train_pd, new_train_res,
-                )
-            else:
-                new_analysis = (
-                    "ZERO SIGNALS produced. The filters are too strict for the data. "
-                    "Each trading day has ~390 bars (1-min, 9:30-16:00 ET). "
-                    "Loosen conditions, lower thresholds, or simplify the logic."
-                )
-                logger.warning(f"[{track}] Proposed strategy produced 0 signals")
-
-            # ── 11. Keep or discard (fitness + annealing) ───────
-            min_test_signals = 15
-            has_enough_signals = new_test_agg.get("total_signals", 0) >= min_test_signals
-            train_positive = new_train_agg.get("expectancy", 0) > 0
-
-            best_fitness = state["best_test_fitness"]
-            strict_improved = (
-                new_test_fitness > best_fitness
-                and has_enough_signals
-                and train_positive
-            )
-
-            annealing_accept = False
-            if (
-                not strict_improved
-                and has_enough_signals
-                and train_positive
-                and consecutive_failures >= 5
-                and best_fitness > 0
-                and new_test_fitness >= best_fitness * 0.9
-            ):
-                annealing_accept = True
-
-            kept = strict_improved or annealing_accept
-
-            if kept:
-                if annealing_accept:
-                    logger.info(
-                        f"[{track}] ACCEPTING (annealing): fitness {new_test_fitness:.4f} "
-                        f"vs best {best_fitness:.4f} after {consecutive_failures} failures"
-                    )
-                else:
-                    logger.info(
-                        f"[{track}] KEEPING new strategy: fitness {best_fitness:.4f} "
-                        f"-> {new_test_fitness:.4f} (+{new_test_fitness - best_fitness:.4f})"
-                    )
-                new_id = _store_strategy(
-                    new_source, new_train_agg, new_train_pd, new_train_res, new_analysis,
-                    kept=True, parent_id=current_id, track=track,
-                )
-
-                if not dry_run:
-                    strat_path.write_text(new_source, encoding="utf-8")
-                    logger.info(f"[{track}] strategy updated (id={new_id})")
-
-                best_id = new_id
-                state["best_test_fitness"] = new_test_fitness
-                state["consecutive_failures"] = 0
-            else:
-                reasons = []
-                if new_test_fitness <= best_fitness:
-                    reasons.append(f"lower fitness ({new_test_fitness:.4f} vs {best_fitness:.4f})")
-                if not has_enough_signals:
-                    reasons.append(
-                        f"too few test signals ({new_test_agg.get('total_signals', 0)}<{min_test_signals})"
-                    )
-                if not train_positive:
-                    reasons.append("negative train expectancy")
-                logger.info(f"[{track}] DISCARDING: {', '.join(reasons)}")
-                _store_strategy(
-                    new_source, new_train_agg, new_train_pd, new_train_res, new_analysis,
-                    kept=False, parent_id=current_id, track=track,
-                )
-                state["consecutive_failures"] += 1
-
-            # ── 12. Live scan for this track ────────────────────
-            if best_id is not None:
-                best_source = strat_path.read_text(encoding="utf-8") if not dry_run else current_source
-                _run_live_scan(best_id, best_source, track=track)
-
-            # ── 13. Git commit ──────────────────────────────────
-            if not dry_run:
-                _git_commit(
-                    iteration, kept,
-                    new_test_fitness if kept else best_fitness,
-                    best_id, track=track,
-                )
-
-            logger.info(
-                f"[{track}] Iteration {iteration} complete - "
-                f"best fitness={state['best_test_fitness']:.4f} (strategy #{best_id}) "
-                f"temp={proposal_temp:.2f} failures={state['consecutive_failures']}"
-            )
-
-        # Brief pause between rounds
-        logger.info(f"Round complete (global iteration {global_iteration}). Starting next round...")
+        logger.info("Starting next round...")

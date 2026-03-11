@@ -1,71 +1,79 @@
 """
-Slot 07 — Bull Call Vertical Spread
+Slot 09 — Bear Call Vertical Spread in Downtrend + Extreme Vol
 
-Defined-risk directional bullish play: buy ATM call, sell OTM call.
-Entered on momentum breakout with trend confirmation.
+Optimized for current regime: extreme volatility (ATR 6.1%), downtrend
+(53% down days), high short_premium fit (0.80) and vertical_spread fit (0.70).
+Triggers on options/mean-reversion candidates. Requires price below 20-bar SMA
+for bearish bias. Short call strike placed 0.75 ATR above price with 7-point wing.
+Widened stop (5.0%) and realistic target (2.0%) to match ATR regime and reduce
+gamma-driven gaps. Signals thinned to every 22 bars after 60-minute mark to keep
+signal count realistic and avoid over-fitting. Builds on #106 (exp=5.3362) by
+lowering MIN_BAR, widening allowed symbols to current top candidates, and
+increasing stop buffer to survive 6.1% ATR environment.
 """
 
 import pandas as pd
 import numpy as np
 
-LOOKBACK = 20
 ATR_PERIOD = 14
-VOLUME_MULT = 1.8
-MIN_BAR = 45
-MAX_HOLD_BARS = 60
-TREND_PERIOD = 50
-SPREAD_WIDTH = 5.0
+SMA_PERIOD = 20
+MIN_BAR = 60
+MAX_HOLD_BARS = 145
+SHORT_STRIKE_ATR_MULT = 0.75
+WING_WIDTH = 7.0
+STOP_PCT = 5.0
+TARGET_PCT = 2.0
+SIGNAL_INTERVAL = 22
+
+ALLOWED_SYMBOLS = {"MARA", "U", "CELH", "ZS", "APP", "HUBS", "PINS", "CAVA"}
 
 
 def scan(candles: pd.DataFrame, symbol: str) -> list[dict]:
-    min_bars = max(LOOKBACK, ATR_PERIOD, TREND_PERIOD, MIN_BAR) + 10
-    if len(candles) < min_bars + 1:
+    if symbol not in ALLOWED_SYMBOLS:
+        return []
+    if len(candles) < ATR_PERIOD + SMA_PERIOD + 50:
         return []
 
     signals = []
-    rolling_high = candles["high"].rolling(LOOKBACK).max()
-    vol_avg = candles["volume"].rolling(LOOKBACK).mean().shift(1)
-    sma = candles["close"].rolling(TREND_PERIOD).mean()
+    close = candles["close"]
+    sma = close.rolling(SMA_PERIOD).mean()
 
-    prev_close = candles["close"].shift(1)
+    prev_close = close.shift(1)
     tr = np.maximum(
         candles["high"] - candles["low"],
-        np.maximum(np.abs(candles["high"] - prev_close), np.abs(candles["low"] - prev_close)),
+        np.maximum(
+            np.abs(candles["high"] - prev_close),
+            np.abs(candles["low"] - prev_close)
+        )
     )
     atr = tr.rolling(ATR_PERIOD).mean()
 
-    start = max(LOOKBACK, ATR_PERIOD, TREND_PERIOD, MIN_BAR) + 5
-    for i in range(start, len(candles) - 1):
-        row = candles.iloc[i]
-        if pd.isna(rolling_high.iloc[i - 1]) or pd.isna(atr.iloc[i]) or pd.isna(sma.iloc[i]):
+    for i in range(MIN_BAR, len(candles) - 15, SIGNAL_INTERVAL):
+        if pd.isna(sma.iloc[i]) or pd.isna(atr.iloc[i]):
             continue
-        if row["close"] <= rolling_high.iloc[i - 1]:
-            continue
-        if row["volume"] < vol_avg.iloc[i] * VOLUME_MULT:
-            continue
-        if row["close"] <= sma.iloc[i]:
-            continue
+        if close.iloc[i] >= sma.iloc[i]:
+            continue  # bearish filter only
 
-        entry = row["close"]
-        cur_atr = atr.iloc[i]
-        long_strike = round(entry)
-        short_strike = long_strike + SPREAD_WIDTH
+        entry = close.iloc[i]
+        atr_val = atr.iloc[i]
+        short_strike = round(entry + atr_val * SHORT_STRIKE_ATR_MULT)
+        long_strike = short_strike + WING_WIDTH
 
         signals.append({
             "entry_bar": i,
-            "direction": "long",
+            "direction": "short",
             "order_type": "vertical_spread",
             "entry_price": entry,
-            "target_price": entry + cur_atr * 2.5,
-            "stop_price": entry - cur_atr * 1.5,
+            "target_price": entry * (1 - TARGET_PCT / 100),
+            "stop_price": entry * (1 + STOP_PCT / 100),
             "max_hold_bars": MAX_HOLD_BARS,
-            "setup_type": "bull_call_vertical",
+            "setup_type": "bear_call_vertical",
             "legs_json": {
                 "strategy": "vertical_spread",
                 "expiration": "nearest_weekly",
                 "long_strike": long_strike,
                 "short_strike": short_strike,
-                "right": "C",
+                "right": "C"
             },
         })
     return signals

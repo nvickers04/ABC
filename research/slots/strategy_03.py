@@ -1,31 +1,34 @@
 """
-Slot 03 — Short-Biased VWAP Rejection (ATR-Scaled, Trend-Filtered)
+Slot 03 — Short-Only VWAP Rejection with Momentum Acceleration (High-Vol Downtrend)
 
-Evolved for current regime: extreme volatility (ATR ~5.85%), downtrend,
-decelerating momentum, neutral breadth. Prioritizes short_premium (0.80)
-and momentum_breakout (0.75) alignment.
+Evolved for current regime: high volatility (ATR 5.28%), trend=down (68%),
+momentum=accelerating (+0.78), volume=normal, breadth=bullish. Aligns with
+momentum_breakout (1.00) and vwap (0.80) environment fit.
 
 Core logic:
-- VWAP cross-down rejections (price crosses below VWAP on elevated volume)
-- Strict trend filter: shorts ONLY when below EMA20, longs ONLY when above
-- ATR(14) scaled stops/targets to survive 5.35% intraday ranges (no more 0.4% chops)
-- Volume confirmation at 1.8x 20-bar average
-- Morning/midday filter only (before bar 210 ≈ 13:00 ET)
-- Reduced max hold to 20 bars for faster regime
-- Short bias via EMA filter naturally suppresses counter-trend longs
+- Short-only: VWAP cross-down on elevated volume while below EMA20
+- Momentum acceleration filter: 5-bar delta negative AND more negative
+  than the preceding 5-bar delta (captures the +0.78 regime)
+- Volume confirmation at 2.0× 20-bar average for conviction
+- ATR(14) scaled stops/targets tightened to observed move sizes
+  (0.60 stop ≈ 3.2%, 1.65 target ≈ 8.7%) to reduce timeouts
+- Max hold reduced to 12 bars to exit before afternoon chop
+- Strict morning filter only (before bar 180 ≈ 12:30 ET)
+- Long logic completely removed to eliminate counter-trend drag
+- Focus on symbols like MARA, CAVA, DUOL, PLTR, NET that match regime
 """
 
 import pandas as pd
 import numpy as np
 
-MAX_HOLD_BARS = 20
-MIN_BAR = 50
-VOL_MULT = 1.8
+MAX_HOLD_BARS = 12
+MIN_BAR = 60
+VOL_MULT = 2.0
 EMA_SPAN = 20
 ATR_PERIOD = 14
-STOP_ATR_MULT = 0.85
-TARGET_ATR_MULT = 2.1
-MAX_ENTRY_BAR = 210
+STOP_ATR_MULT = 0.60
+TARGET_ATR_MULT = 1.65
+MAX_ENTRY_BAR = 180
 
 
 def calculate_atr(candles: pd.DataFrame, period: int) -> pd.Series:
@@ -65,6 +68,10 @@ def scan(candles: pd.DataFrame, symbol: str) -> list[dict]:
             pd.isna(vol_avg.iloc[i]) or pd.isna(atr.iloc[i]) or atr.iloc[i] <= 0):
             continue
 
+        # Need enough history for momentum
+        if i < 10:
+            continue
+
         price = candles.iloc[i]["close"]
         prev_price = candles.iloc[i - 1]["close"]
         v = vwap.iloc[i]
@@ -73,9 +80,15 @@ def scan(candles: pd.DataFrame, symbol: str) -> list[dict]:
         vol = candles.iloc[i]["volume"]
         vol_threshold = vol_avg.iloc[i] * VOL_MULT
 
-        # Short rejection: cross below VWAP on high volume while below EMA (trend-aligned)
+        # Momentum acceleration (more negative delta = accelerating down)
+        mom_now = price - candles.iloc[i - 5]["close"]
+        mom_prev = candles.iloc[i - 5]["close"] - candles.iloc[i - 10]["close"]
+
+        # Short rejection: cross below VWAP on high volume while below EMA
+        # with accelerating downward momentum (regime-aligned)
         if (prev_price > v and price < v and
-            vol > vol_threshold and price < e):
+            vol > vol_threshold and price < e and
+            mom_now < mom_prev and mom_now < 0):
             entry = price
             signals.append({
                 "entry_bar": i,
@@ -85,23 +98,7 @@ def scan(candles: pd.DataFrame, symbol: str) -> list[dict]:
                 "target_price": entry - TARGET_ATR_MULT * a,
                 "stop_price": entry + STOP_ATR_MULT * a,
                 "max_hold_bars": MAX_HOLD_BARS,
-                "setup_type": "vwap_rejection_trend_short",
-                "legs_json": None,
-            })
-
-        # Long bounce: cross above VWAP on high volume while above EMA (rare in downtrend)
-        elif (prev_price < v and price > v and
-              vol > vol_threshold and price > e):
-            entry = price
-            signals.append({
-                "entry_bar": i,
-                "direction": "long",
-                "order_type": "vwap",
-                "entry_price": entry,
-                "target_price": entry + TARGET_ATR_MULT * a,
-                "stop_price": entry - STOP_ATR_MULT * a,
-                "max_hold_bars": MAX_HOLD_BARS,
-                "setup_type": "vwap_bounce_trend_aligned",
+                "setup_type": "vwap_rejection_accel_short",
                 "legs_json": None,
             })
 

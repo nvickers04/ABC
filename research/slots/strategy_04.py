@@ -1,6 +1,6 @@
 """
-Slot 04 — Dual-Sided ORB with Short Bias, Wide Stops & Momentum Filter
-(High-Vol Downtrend v60)
+Slot 04 — Dual-Sided ORB with Short Bias, Wider Stops & Stronger Long Filter
+(High-Vol Downtrend v61)
 
 Adapted to CURRENT environment: Volatility=high (ATR 5.28%), Trend=down (68% trending down),
 Breadth=bullish (+0.28 A/D), Momentum=accelerating (+0.78), Volume=normal (0.86x).
@@ -10,24 +10,22 @@ with explicit short-first bias to respect the dominant downtrend while capturing
 longs on strong names only. Restricted to current top momentum and options candidates
 (MARA, CAVA, DUOL, PLTR, NET, U, PATH, IOT, HUBS, HOOD, ROKU).
 
-Uses OR range as volatility proxy for high-vol regime. Wider stops (0.9× OR) to survive
-whipsaws in 5.28% ATR environment. Realistic ~2.2:1 R:R with 2.0× OR targets.
-Volume confirmation relaxed for shorts (1.05×) and stricter for longs (1.4×) given
-downtrend bias. Requires close-through confirmation on both sides to reduce false
-wick breaks. Morning-only entries (before bar 90). Reduced hold (40 bars) to capture
-front-loaded momentum before midday chop in downtrend regime. 5-bar momentum check
-for confirmation on both sides.
+Uses OR range as volatility proxy for high-vol regime. Significantly wider stops (1.3× OR)
+to survive whipsaws in extreme 5.28% ATR environment. Realistic ~2.1:1 R:R with 2.75× OR
+targets. Volume confirmation relaxed for shorts (1.05×) and stricter for longs (1.65×)
+given downtrend bias. Requires close-through confirmation on both sides. Morning-only
+entries (before bar 90). 40-bar max hold to stay in front-loaded momentum window.
+5-bar momentum check + extra 1.5% up-move threshold for longs to respect trend=down
+while allowing bullish-breadth outliers.
 
-Key improvements over prior versions:
-- Wider stop (0.9× OR) calibrated to current extreme volatility
-- Short-first logic + close-through + 5-bar momentum filter aligned with trend=down
-- Selective symbol filter using current top momentum/options candidates
-- MIN_OR_RANGE_PCT=0.015 to avoid noisy small ranges
-- MAX_ENTRY_BAR=90 + MAX_HOLD_BARS=40 avoids afternoon noise and premature timeouts
+Key improvements over prior version:
+- Wider stop (1.3× OR) and larger target (2.75× OR) calibrated to extreme volatility
+- Stronger long filter: MIN_VOL_LONG=1.65× plus >1.5% 5-bar momentum to reduce up-day noise
+- Tighter MIN_OR_RANGE_PCT=0.022 to focus on meaningful ranges in 5%+ ATR regime
+- Short-first logic + close-through + momentum filter aligned with 68% downtrend
 - Distinct setup_type per side for regime tracking
 - One signal per day using stop_entry for live execution realism
-- Looser volume on shorts and stricter on longs to reflect 68% downtrend bias
-- Momentum filter uses comparison to price 5 bars earlier (accelerating momentum label)
+- Looser volume on shorts, stricter on longs to reflect dominant downtrend
 """
 
 import pandas as pd
@@ -36,11 +34,12 @@ import numpy as np
 OPENING_BARS = 15
 MAX_ENTRY_BAR = 90
 MAX_HOLD_BARS = 40
-STOP_MULT = 0.9
-TARGET_MULT = 2.0
+STOP_MULT = 1.3
+TARGET_MULT = 2.75
 MIN_VOL_SHORT = 1.05
-MIN_VOL_LONG = 1.4
-MIN_OR_RANGE_PCT = 0.015
+MIN_VOL_LONG = 1.65
+MIN_OR_RANGE_PCT = 0.022
+MIN_LONG_MOM_PCT = 0.015
 
 TOP_SYMBOLS = {
     "MARA", "CAVA", "DUOL", "PLTR", "NET",
@@ -81,8 +80,9 @@ def scan(candles: pd.DataFrame, symbol: str) -> list[dict]:
         if i - mom_bars < 0:
             continue
         prev_price = candles.iloc[i - mom_bars]["close"]
-        is_mom_down = row["close"] < prev_price
-        is_mom_up = row["close"] > prev_price
+        mom_pct = (row["close"] - prev_price) / prev_price
+        is_mom_down = mom_pct < 0.0
+        is_mom_up = mom_pct > 0.0
 
         # Short side first (bias for downtrend regime)
         if (row["low"] < or_low and
@@ -104,11 +104,12 @@ def scan(candles: pd.DataFrame, symbol: str) -> list[dict]:
             })
             break  # one signal per day
 
-        # Long side (selective, stricter filters)
+        # Long side (selective, stricter filters + strong momentum gate)
         elif (row["high"] > or_high and
               row["close"] > or_high and
               vol_ratio > MIN_VOL_LONG and
-              is_mom_up):
+              is_mom_up and
+              mom_pct > MIN_LONG_MOM_PCT):
 
             entry = or_high
             signals.append({

@@ -119,6 +119,11 @@ CLOSED:
 - Stocks: trailing_stop or oca_order. NEVER bracket_order on existing positions.
 - Cut losers early, trail winners. Adjust stops as price moves.
 
+═══ ENVIRONMENT AWARENESS (USE RESEARCH BRIEFING) ═══
+The RESEARCH BRIEFING contains current regime, strategy slots with signed fitness values, live signals, and historical performance per environment. 
+Use signed_edge_score and raw_search_fitness when available — positive values indicate edge in the current regime; negative values indicate strategies to avoid in similar conditions.
+Build decisions on the full picture: what has worked and what has not across days of research. Prefer high-confidence rules for the current environment. Call tools like get_environment_rules if more detail is needed.
+
 ═══ TOOLS ═══
 RESEARCH:  research(query, deep?=false) — multi-agent web + X search. Your primary discovery tool.
            quote(symbol), candles(symbol), atr(symbol), fundamentals(symbol), news(symbol)

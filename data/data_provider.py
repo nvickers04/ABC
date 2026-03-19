@@ -144,6 +144,9 @@ class OptionContract:
     vega: Optional[float]
     iv: Optional[float]
     source: str
+    # Historical metadata (set when fetched for a specific historical date)
+    as_of_date: Optional[str] = None
+    underlying_price: Optional[float] = None
 
     @property
     def spread(self) -> Optional[float]:
@@ -166,6 +169,8 @@ class OptionChain:
     symbol: str
     contracts: List[OptionContract]
     source: str
+    is_historical: bool = False
+    as_of_date: Optional[str] = None
 
     def calls(self) -> List[OptionContract]:
         """Get call contracts only."""
@@ -399,6 +404,10 @@ class DataProvider:
             'atr': 60,         # Derived from candles, changes slowly
             'iv_info': 60,     # IV updates with options flow
             'option_chain': 30, # Chains shift with underlying
+            'option_chain_hist': 3600,
+            'option_quote': 30,
+            'option_quote_hist': 3600,
+            'option_quote_series': 3600,
             'option_greeks': 30,
             'fundamentals': 300,   # Sector/PE/earnings date rarely change
             'earnings': 300,
@@ -602,7 +611,7 @@ class DataProvider:
                 self._set_cached(cache_key, candles)
                 return candles
             else:
-                logger.warning(f"No candle data available for {symbol}")
+                logger.debug(f"No candle data available for {symbol}")
                 # Negative-cache to avoid re-requesting the same failure
                 self._set_cached(cache_key, None)
 
@@ -658,7 +667,10 @@ class DataProvider:
         expiration: Optional[str] = None,
         side: Optional[str] = None,
         strike_range: Optional[tuple] = None,
-        dte_range: Optional[tuple] = None
+        dte_range: Optional[tuple] = None,
+        date: Optional[str] = None,
+        from_date: Optional[str] = None,
+        to_date: Optional[str] = None,
     ) -> Optional[OptionChain]:
         """
         Get options chain with Greeks and IV.
@@ -669,10 +681,22 @@ class DataProvider:
             side: 'call', 'put', or None for both
             strike_range: (min_strike, max_strike) tuple or None for all
             dte_range: (min_dte, max_dte) tuple to filter expirations
+            date: Historical snapshot date (YYYY-MM-DD)
+            from_date: Start of historical range (YYYY-MM-DD)
+            to_date: End of historical range (YYYY-MM-DD)
 
         Returns:
             OptionChain with contracts and source tracking
         """
+        cache_prefix = 'option_chain_hist' if (date or from_date or to_date) else 'option_chain'
+        cache_key = (
+            f"{cache_prefix}:{symbol.upper()}:{expiration or '*'}:{side or '*'}:"
+            f"{strike_range or '*'}:{dte_range or '*'}:{date or '*'}:{from_date or '*'}:{to_date or '*'}"
+        )
+        cached = self._get_cached(cache_key)
+        if cached is not _CACHE_MISS:
+            return cached
+
         try:
             raw = self._run_async(
                 self._mda_client.get_option_chain(
@@ -680,7 +704,10 @@ class DataProvider:
                     expiration=expiration,
                     side=side,
                     strike_range=strike_range,
-                    dte_range=dte_range
+                    dte_range=dte_range,
+                    date=date,
+                    from_date=from_date,
+                    to_date=to_date,
                 )
             )
 
@@ -705,19 +732,98 @@ class DataProvider:
                         theta=c.get('theta'),
                         vega=c.get('vega'),
                         iv=c.get('iv'),
-                        source=raw.get('source', 'unknown')
+                        source=raw.get('source', 'unknown'),
+                        as_of_date=raw.get('as_of_date'),
                     ))
 
-                return OptionChain(
+                chain = OptionChain(
                     symbol=symbol,
                     contracts=contracts,
-                    source=raw.get('source', 'unknown')
+                    source=raw.get('source', 'unknown'),
+                    is_historical=raw.get('is_historical', False),
+                    as_of_date=raw.get('as_of_date'),
                 )
+                self._set_cached(cache_key, chain)
+                return chain
+
+            self._set_cached(cache_key, None)
 
         except Exception as e:
             logger.warning(f"Failed to get option chain for {symbol}: {e}")
+            self._set_cached(cache_key, None)
 
         return None
+
+    def get_option_quote(
+        self,
+        option_symbol: str,
+        date: Optional[str] = None,
+        from_date: Optional[str] = None,
+        to_date: Optional[str] = None,
+    ) -> Optional[Dict]:
+        """
+        Get a single option contract quote, optionally for a historical date.
+
+        Args:
+            option_symbol: OCC-format symbol (e.g. 'AAPL230120C00150000')
+            date: Historical snapshot date (YYYY-MM-DD)
+            from_date: Range start (YYYY-MM-DD)
+            to_date: Range end (YYYY-MM-DD)
+
+        Returns:
+            Quote dict or None
+        """
+        cache_prefix = 'option_quote_hist' if (date or from_date or to_date) else 'option_quote'
+        cache_key = f"{cache_prefix}:{option_symbol}:{date or '*'}:{from_date or '*'}:{to_date or '*'}"
+        cached = self._get_cached(cache_key)
+        if cached is not _CACHE_MISS:
+            return cached
+
+        try:
+            quote = self._run_async(
+                self._mda_client.get_option_quote(
+                    option_symbol, date=date, from_date=from_date, to_date=to_date
+                )
+            )
+            self._set_cached(cache_key, quote)
+            return quote
+        except Exception as e:
+            logger.warning(f"Failed to get option quote for {option_symbol}: {e}")
+            self._set_cached(cache_key, None)
+            return None
+
+    def get_option_quote_series(
+        self,
+        option_symbol: str,
+        from_date: str,
+        to_date: str,
+    ) -> Optional[List[Dict]]:
+        """
+        Get a time series of daily option quotes between two dates.
+
+        Args:
+            option_symbol: OCC-format symbol
+            from_date: Start date inclusive (YYYY-MM-DD)
+            to_date: End date inclusive (YYYY-MM-DD)
+
+        Returns:
+            List of daily quote dicts sorted by date, or None
+        """
+        cache_key = f"option_quote_series:{option_symbol}:{from_date}:{to_date}"
+        cached = self._get_cached(cache_key)
+        if cached is not _CACHE_MISS:
+            return cached
+
+        try:
+            series = self._run_async(
+                self._mda_client.get_option_quote_series(option_symbol, from_date, to_date)
+            )
+            self._set_cached(cache_key, series)
+            return series
+        except Exception as e:
+            logger.warning(f"Failed to get option quote series for {option_symbol}: {e}")
+            self._set_cached(cache_key, None)
+            return None
 
     def get_option_expirations(self, symbol: str) -> Optional[List[str]]:
         """

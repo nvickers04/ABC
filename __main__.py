@@ -39,7 +39,7 @@ def setup_logging(verbose: bool = False):
         log_dir / "agent.log",
         when="midnight",
         interval=1,
-        backupCount=30,
+        backupCount=7,  # reduced; value preserved in DB snapshots/hypotheses
         encoding="utf-8",
     )
     file_handler.setLevel(logging.DEBUG)

@@ -572,6 +572,7 @@ async def handle_option_chain(executor, params: dict) -> Any:
       dte_min, dte_max: DTE range (omit for all expirations)
       strike_min, strike_max: strike price range (omit for all strikes)
       limit: max contracts to return (default 20)
+      date: 'YYYY-MM-DD' — historical chain snapshot (goes back to 2005)
     """
     import re
     
@@ -611,6 +612,13 @@ async def handle_option_chain(executor, params: dict) -> Any:
             float(strike_min) if strike_min is not None else 0,
             float(strike_max) if strike_max is not None else 999999
         )
+
+    # --- Historical date (YYYY-MM-DD); enables as-of-date chain lookup ---
+    hist_date = params.get("date")
+    if hist_date:
+        hist_date = str(hist_date).strip()
+        if not re.match(r'^\d{4}-\d{2}-\d{2}$', hist_date):
+            return {"error": f"Invalid 'date' format '{hist_date}'. Use YYYY-MM-DD."}
     
     limit = params.get("limit", 20)
     
@@ -620,7 +628,8 @@ async def handle_option_chain(executor, params: dict) -> Any:
         expiration=expiration,
         side=side,
         strike_range=strike_range,
-        dte_range=dte_range
+        dte_range=dte_range,
+        date=hist_date,
     )
     
     # --- No data: return what was requested + what to try ---
@@ -634,7 +643,8 @@ async def handle_option_chain(executor, params: dict) -> Any:
                 "dte_min": dte_min,
                 "dte_max": dte_max,
                 "strike_min": strike_min,
-                "strike_max": strike_max
+                "strike_max": strike_max,
+                "date": hist_date,
             },
             "retry_suggestions": [
                 "Omit 'expiration' to search all available dates",
@@ -651,7 +661,8 @@ async def handle_option_chain(executor, params: dict) -> Any:
                 "dte_max": "optional - maximum days to expiration",
                 "strike_min": "optional - minimum strike price",
                 "strike_max": "optional - maximum strike price",
-                "limit": "optional - max contracts to return (default 20)"
+                "limit": "optional - max contracts to return (default 20)",
+                "date": "optional - 'YYYY-MM-DD' for historical snapshot (back to 2005)",
             }
         }
     
@@ -681,7 +692,9 @@ async def handle_option_chain(executor, params: dict) -> Any:
         "count": len(contracts_out),
         "contracts": contracts_out,
         "source": chain.source,
-        "is_realtime": True,
+        "is_realtime": not chain.is_historical,
+        "is_historical": chain.is_historical,
+        "as_of_date": chain.as_of_date,
         "data_warning": None,
         "timestamp": __import__('datetime').datetime.utcnow().strftime('%Y-%m-%dT%H:%M:%SZ'),
     }
@@ -744,6 +757,54 @@ async def handle_position_greeks(executor, params: dict) -> Any:
     symbol = params.get("symbol")
     results = await executor.gateway.get_position_greeks(symbol)
     return {"positions": results, "count": len(results)}
+
+
+async def handle_option_quote(executor, params: dict) -> Any:
+    """
+    Get a single option contract quote, with optional historical date support.
+
+    Accepts:
+      option_symbol: required — OCC-format symbol e.g. 'AAPL230120C00150000'
+      date: optional — 'YYYY-MM-DD' historical snapshot date (goes back to 2005)
+      from_date: optional — start of historical range (YYYY-MM-DD)
+      to_date: optional — end of historical range (YYYY-MM-DD)
+
+    Without date params returns current real-time quote.
+    With 'date' returns the closing mark on that specific day.
+    With 'from_date'/'to_date' returns a daily series.
+    """
+    import re
+
+    option_symbol = params.get("option_symbol")
+    if not option_symbol:
+        return {"error": "option_symbol required (OCC format, e.g. 'AAPL230120C00150000')"}
+
+    date = params.get("date")
+    from_date = params.get("from_date")
+    to_date = params.get("to_date")
+
+    for label, val in [("date", date), ("from_date", from_date), ("to_date", to_date)]:
+        if val and not re.match(r'^\d{4}-\d{2}-\d{2}$', str(val).strip()):
+            return {"error": f"Invalid '{label}' format. Use YYYY-MM-DD."}
+
+    if from_date and to_date:
+        series = executor.data_provider.get_option_quote_series(
+            option_symbol, from_date=from_date, to_date=to_date
+        )
+        if not series:
+            return {"error": f"No quote series found for {option_symbol} ({from_date} to {to_date})"}
+        return {
+            "option_symbol": option_symbol,
+            "from_date": from_date,
+            "to_date": to_date,
+            "count": len(series),
+            "series": series,
+        }
+
+    quote = executor.data_provider.get_option_quote(option_symbol, date=date)
+    if not quote:
+        return {"error": f"No quote found for {option_symbol}" + (f" on {date}" if date else "")}
+    return quote
 
 
 # =========================================================================
@@ -854,6 +915,7 @@ HANDLERS = {
     "roll_option": handle_roll_option,
     "option_chain": handle_option_chain,
     "option_greeks": handle_option_greeks,
+    "option_quote": handle_option_quote,
     "position_greeks": handle_position_greeks,
     # Multi-leg convenience
     "multi_leg": handle_multi_leg,

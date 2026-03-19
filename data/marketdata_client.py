@@ -27,6 +27,9 @@ logger = logging.getLogger(__name__)
 
 # API Base URL
 API_BASE = "https://api.marketdata.app/v1"
+_OPTIONS_RETRY_STATUSES = {429, 500, 502, 503, 504}
+_OPTIONS_MAX_CONCURRENCY = 3
+_OPTIONS_RETRY_ATTEMPTS = 3
 
 
 class MarketDataClient:
@@ -54,6 +57,8 @@ class MarketDataClient:
         self._daily_reset: Optional[datetime] = None  # Resets at midnight UTC
         self._last_request_time: Optional[datetime] = None
         self._loop_id: Optional[int] = None  # Track which event loop the client belongs to
+        self._options_semaphore: Optional[asyncio.Semaphore] = None
+        self._options_semaphore_loop_id: Optional[int] = None
 
         if not self.api_key:
             logger.warning("No Market Data App API key configured")
@@ -88,6 +93,60 @@ class MarketDataClient:
                 self._loop_id = current_loop_id
         
         return self._http_client
+
+    def _get_options_semaphore(self) -> asyncio.Semaphore:
+        """Get a per-event-loop semaphore for high-volume option endpoints."""
+        try:
+            current_loop_id = id(asyncio.get_running_loop())
+        except RuntimeError:
+            current_loop_id = None
+
+        if self._options_semaphore is None or self._options_semaphore_loop_id != current_loop_id:
+            self._options_semaphore = asyncio.Semaphore(_OPTIONS_MAX_CONCURRENCY)
+            self._options_semaphore_loop_id = current_loop_id
+        return self._options_semaphore
+
+    async def _get_with_retries(
+        self,
+        path: str,
+        *,
+        params: Optional[Dict[str, Any]] = None,
+        label: str,
+        throttle_options: bool = False,
+    ) -> Optional[httpx.Response]:
+        """Issue a GET with bounded retry/backoff for transient option-data failures."""
+        client = self._get_http_client()
+        if not client:
+            return None
+
+        async def _do_request() -> Optional[httpx.Response]:
+            for attempt in range(_OPTIONS_RETRY_ATTEMPTS):
+                try:
+                    if self._track_request():
+                        return None
+                    response = await client.get(path, params=params)
+                    if response.status_code not in _OPTIONS_RETRY_STATUSES or attempt == _OPTIONS_RETRY_ATTEMPTS - 1:
+                        return response
+                    logger.debug(
+                        f"Retrying {label} after HTTP {response.status_code} "
+                        f"({attempt + 1}/{_OPTIONS_RETRY_ATTEMPTS})"
+                    )
+                except (httpx.ConnectError, httpx.ReadError, httpx.ConnectTimeout, httpx.ReadTimeout,
+                        httpx.RemoteProtocolError, httpx.PoolTimeout, httpx.NetworkError) as exc:
+                    if attempt == _OPTIONS_RETRY_ATTEMPTS - 1:
+                        raise
+                    logger.debug(
+                        f"Retrying {label} after transport error "
+                        f"({attempt + 1}/{_OPTIONS_RETRY_ATTEMPTS}): {exc}"
+                    )
+                await asyncio.sleep(0.5 * (attempt + 1))
+            return None
+
+        if not throttle_options:
+            return await _do_request()
+
+        async with self._get_options_semaphore():
+            return await _do_request()
 
     @property
     def is_configured(self) -> bool:
@@ -373,7 +432,9 @@ class MarketDataClient:
             response = await client.get(f"/stocks/candles/{resolution}/{symbol}/", params=params)
 
             if response.status_code not in (200, 203):
-                logger.warning(f"Candles request failed for {symbol}: {response.status_code}")
+                # 404 is expected outside market hours or for symbols with no intraday data
+                level = logging.DEBUG if response.status_code == 404 else logging.WARNING
+                logger.log(level, f"Candles request failed for {symbol}: {response.status_code}")
                 return None
 
             data = response.json()
@@ -444,7 +505,10 @@ class MarketDataClient:
         expiration: Optional[str] = None,
         side: Optional[str] = None,
         strike_range: Optional[tuple] = None,
-        dte_range: Optional[tuple] = None
+        dte_range: Optional[tuple] = None,
+        date: Optional[str] = None,
+        from_date: Optional[str] = None,
+        to_date: Optional[str] = None,
     ) -> Optional[Dict[str, Any]]:
         """
         Get options chain with Greeks and IV.
@@ -455,6 +519,9 @@ class MarketDataClient:
             side: 'call', 'put', or None for both
             strike_range: (min_strike, max_strike) or None for all
             dte_range: (min_dte, max_dte) to filter expirations
+            date: Historical snapshot date (YYYY-MM-DD); returns chain as-of that date
+            from_date: Start of historical range (YYYY-MM-DD)
+            to_date: End of historical range (YYYY-MM-DD)
 
         Returns:
             Dict with options data including Greeks
@@ -464,20 +531,28 @@ class MarketDataClient:
             return None
 
         try:
-            client = self._get_http_client()
-            if not client:
-                return None
-
             symbol = symbol.upper().strip()
 
             # Build query params
             params: Dict[str, Any] = {}
             if expiration:
                 params['expiration'] = expiration
+            elif date or from_date or to_date:
+                # Historical fetch without explicit expiration: the API defaults
+                # to the nearest *monthly* only, silently dropping weeklies.
+                # Use 'all' so we get every available expiration including weeklies.
+                params['expiration'] = 'all'
             if side:
                 params['side'] = side
             if strike_range:
                 params['strike'] = f"{strike_range[0]}-{strike_range[1]}"
+            # Historical snapshot or date-range parameters
+            if date:
+                params['date'] = date
+            if from_date:
+                params['from'] = from_date
+            if to_date:
+                params['to'] = to_date
 
             # FIX: The MarketData API defaults to the nearest expiration only.
             # When a dte_range is requested, pass the target DTE so the API
@@ -490,9 +565,14 @@ class MarketDataClient:
                 target_dte = (dte_range[0] + dte_range[1]) // 2
                 params['dte'] = str(target_dte)
 
-            if self._track_request():
+            response = await self._get_with_retries(
+                f"/options/chain/{symbol}/",
+                params=params,
+                label=f"options chain {symbol}",
+                throttle_options=True,
+            )
+            if response is None:
                 return None
-            response = await client.get(f"/options/chain/{symbol}/", params=params)
 
             # 404/400 are common when filters are too narrow (or symbol truly has no listed options).
             # Retry once dropping only the strike filter — keep side, expiration, dte.
@@ -503,21 +583,32 @@ class MarketDataClient:
                     fallback_params['expiration'] = expiration
                 if side:
                     fallback_params['side'] = side
+                if date:
+                    fallback_params['date'] = date
+                if from_date:
+                    fallback_params['from'] = from_date
+                if to_date:
+                    fallback_params['to'] = to_date
                 # Preserve DTE so API returns the right expiration window
                 if 'dte' in params:
                     fallback_params['dte'] = params['dte']
 
-                if self._track_request():
+                response = await self._get_with_retries(
+                    f"/options/chain/{symbol}/",
+                    params=fallback_params,
+                    label=f"options chain fallback {symbol}",
+                    throttle_options=True,
+                )
+                if response is None:
                     return None
-                response = await client.get(f"/options/chain/{symbol}/", params=fallback_params)
                 used_fallback = True
 
             if response.status_code == 404:
-                logger.info(f"No options chain available for {symbol}")
+                logger.debug(f"No options chain available for {symbol}")
                 return None
 
             if response.status_code == 400:
-                logger.info(f"No valid options chain match for {symbol} with current filters")
+                logger.debug(f"No valid options chain match for {symbol} with current filters")
                 return None
 
             if response.status_code not in (200, 203):
@@ -574,11 +665,18 @@ class MarketDataClient:
             if not contracts:
                 return None
 
-            return {
+            result: Dict[str, Any] = {
                 'symbol': symbol,
                 'contracts': contracts,
-                'source': 'marketdata'
+                'source': 'marketdata',
+                'is_historical': bool(date or from_date or to_date),
             }
+            if date:
+                result['as_of_date'] = date
+            elif from_date or to_date:
+                result['from_date'] = from_date
+                result['to_date'] = to_date
+            return result
         except asyncio.TimeoutError:
             logger.warning(f"Options chain request timed out for {symbol}")
             return None
@@ -657,12 +755,21 @@ class MarketDataClient:
             logger.warning(f"Strikes request failed for {symbol}: {e}")
             return None
 
-    async def get_option_quote(self, option_symbol: str) -> Optional[Dict[str, Any]]:
+    async def get_option_quote(
+        self,
+        option_symbol: str,
+        date: Optional[str] = None,
+        from_date: Optional[str] = None,
+        to_date: Optional[str] = None,
+    ) -> Optional[Dict[str, Any]]:
         """
         Get quote for a specific option contract.
 
         Args:
             option_symbol: OCC option symbol (e.g., 'AAPL230120C00150000')
+            date: Historical snapshot date (YYYY-MM-DD)
+            from_date: Start of historical range (YYYY-MM-DD)
+            to_date: End of historical range (YYYY-MM-DD)
 
         Returns:
             Dict with bid, ask, Greeks, IV, etc.
@@ -671,13 +778,22 @@ class MarketDataClient:
             return None
 
         try:
-            client = self._get_http_client()
-            if not client:
+            # Build historical query params if provided
+            q_params: Dict[str, Any] = {}
+            if date:
+                q_params['date'] = date
+            if from_date:
+                q_params['from'] = from_date
+            if to_date:
+                q_params['to'] = to_date
+            response = await self._get_with_retries(
+                f"/options/quotes/{option_symbol}/",
+                params=q_params,
+                label=f"option quote {option_symbol}",
+                throttle_options=True,
+            )
+            if response is None:
                 return None
-
-            if self._track_request():
-                return None
-            response = await client.get(f"/options/quotes/{option_symbol}/")
 
             if response.status_code not in (200, 203):
                 return None
@@ -689,7 +805,7 @@ class MarketDataClient:
             def first(arr):
                 return arr[0] if isinstance(arr, list) and arr else arr
 
-            return {
+            result: Dict[str, Any] = {
                 'option_symbol': option_symbol,
                 'underlying': first(data.get('underlying')),
                 'strike': first(data.get('strike')),
@@ -707,10 +823,96 @@ class MarketDataClient:
                 'vega': first(data.get('vega')),
                 'iv': first(data.get('iv')),
                 'dte': first(data.get('dte')),
-                'source': 'marketdata'
+                'source': 'marketdata',
+                'is_historical': bool(date or from_date or to_date),
             }
+            if date:
+                result['as_of_date'] = date
+            return result
         except Exception as e:
             logger.warning(f"Option quote request failed for {option_symbol}: {e}")
+            return None
+
+    async def get_option_quote_series(
+        self,
+        option_symbol: str,
+        from_date: str,
+        to_date: str,
+    ) -> Optional[List[Dict[str, Any]]]:
+        """
+        Get a time series of option quotes between two dates.
+
+        Returns one record per trading day in ascending date order.
+        Each record has the same fields as get_option_quote() plus 'date'.
+
+        Args:
+            option_symbol: OCC option symbol
+            from_date: Start date inclusive (YYYY-MM-DD)
+            to_date: End date inclusive (YYYY-MM-DD)
+
+        Returns:
+            List of quote dicts ordered by date, or None on failure.
+        """
+        if not self.is_configured:
+            return None
+
+        try:
+            response = await self._get_with_retries(
+                f"/options/quotes/{option_symbol}/",
+                params={'from': from_date, 'to': to_date},
+                label=f"option quote series {option_symbol}",
+                throttle_options=True,
+            )
+            if response is None:
+                return None
+
+            if response.status_code not in (200, 203):
+                return None
+
+            data = response.json()
+            if data.get('s') != 'ok':
+                return None
+
+            updated_list = data.get('updated', [])
+            n = len(data.get('bid', []))
+            records = []
+            for i in range(n):
+                def g(key, idx=i):
+                    arr = data.get(key, [])
+                    return arr[idx] if idx < len(arr) else None
+
+                ts_raw = g('updated')
+                record_date: Optional[str] = None
+                if ts_raw is not None:
+                    try:
+                        from datetime import datetime as _dt, timezone as _tz
+                        record_date = _dt.fromtimestamp(
+                            int(ts_raw), tz=_tz.utc
+                        ).strftime('%Y-%m-%d')
+                    except Exception:
+                        pass
+
+                records.append({
+                    'option_symbol': option_symbol,
+                    'date': record_date,
+                    'bid': g('bid'),
+                    'ask': g('ask'),
+                    'mid': g('mid'),
+                    'last': g('last'),
+                    'volume': g('volume') or 0,
+                    'open_interest': g('openInterest') or 0,
+                    'delta': g('delta'),
+                    'gamma': g('gamma'),
+                    'theta': g('theta'),
+                    'vega': g('vega'),
+                    'iv': g('iv'),
+                    'dte': g('dte'),
+                    'source': 'marketdata',
+                    'is_historical': True,
+                })
+            return records or None
+        except Exception as e:
+            logger.warning(f"Option quote series request failed for {option_symbol}: {e}")
             return None
 
     async def find_option_by_delta(

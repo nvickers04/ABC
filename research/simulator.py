@@ -1,22 +1,210 @@
 """
 Trade Simulator — walks 1-min candles bar-by-bar to evaluate signals.
 
-Supports all stock order types and options strategies via mechanical
-price simulation. No LLM involved — pure math.
+Fast search path: deterministic bar-by-bar simulation for all order types and
+options strategies.  Slippage is parameterised so downstream callers (promotion
+engine) can substitute harsher assumptions without duplicating the walk logic.
+
+No LLM involved — pure math.
 """
 
 import logging
 import math
+import statistics
 from typing import Any
 
 import pandas as pd
 
-from research.config import FORCE_EXIT_MINUTE, SLIPPAGE_BPS
+from research.config import FORCE_EXIT_MINUTE, SLIPPAGE_BPS, validate_legs_json
 
 logger = logging.getLogger(__name__)
 
 
-def simulate(signals: list[dict], candles: pd.DataFrame) -> list[dict]:
+# Two-tailed 95% t-critical values for df 1..29; df >= 30 uses z = 1.96.
+_T_CRIT_95 = [
+    0.0,     # df=0 placeholder
+    12.706, 4.303, 3.182, 2.776, 2.571,   # df 1-5
+    2.447, 2.365, 2.306, 2.262, 2.228,    # df 6-10
+    2.201, 2.179, 2.160, 2.145, 2.131,    # df 11-15
+    2.120, 2.110, 2.101, 2.093, 2.086,    # df 16-20
+    2.080, 2.074, 2.069, 2.064, 2.060,    # df 21-25
+    2.056, 2.052, 2.048, 2.045,           # df 26-29
+]
+
+
+def _t_critical(n: int) -> float:
+    """Return two-tailed 95% critical value for n observations (df = n-1)."""
+    df = n - 1
+    if df < 1:
+        return 1.96
+    if df < len(_T_CRIT_95):
+        return _T_CRIT_95[df]
+    return 1.96
+
+
+def compute_sample_confidence(samples: list[float]) -> dict[str, float | bool | int]:
+    """Estimate how much of an observed edge may still be luck/noise."""
+    n = len(samples)
+    if n == 0:
+        return {
+            "sample_mean": 0.0,
+            "sample_count": 0,
+            "return_std": 0.0,
+            "stderr": 0.0,
+            "ci95_low": 0.0,
+            "ci95_high": 0.0,
+            "t_stat": 0.0,
+            "confidence_score": 0.0,
+            "luck_pressure": 1.0,
+            "ci_excludes_zero": False,
+        }
+
+    mean_r = statistics.mean(samples)
+    if n < 2:
+        return {
+            "sample_mean": mean_r,
+            "sample_count": n,
+            "return_std": 0.0,
+            "stderr": 0.0,
+            "ci95_low": mean_r,
+            "ci95_high": mean_r,
+            "t_stat": 0.0,
+            "confidence_score": 0.0,
+            "luck_pressure": 1.0,
+            "ci_excludes_zero": False,
+        }
+
+    std_r = statistics.stdev(samples)
+    stderr = std_r / math.sqrt(n) if n > 0 else 0.0
+    t_crit = _t_critical(n)
+    ci_half = t_crit * stderr
+    ci_low = mean_r - ci_half
+    ci_high = mean_r + ci_half
+    t_stat = mean_r / stderr if stderr > 0 else 0.0
+
+    sample_score = min(1.0, n / 30.0)
+    t_score = min(1.0, abs(t_stat) / 3.0)
+    confidence_score = sample_score * t_score
+
+    return {
+        "sample_mean": mean_r,
+        "sample_count": n,
+        "return_std": std_r,
+        "stderr": stderr,
+        "ci95_low": ci_low,
+        "ci95_high": ci_high,
+        "t_stat": t_stat,
+        "confidence_score": confidence_score,
+        "luck_pressure": 1.0 - confidence_score,
+        "ci_excludes_zero": ci_low > 0 or ci_high < 0,
+    }
+
+
+def _confidence_metrics(returns: list[float]) -> dict[str, float | bool | int]:
+    """Backward-compatible alias for confidence summaries on return samples."""
+    return compute_sample_confidence(returns)
+
+
+def _condition_metrics(results: list[dict]) -> dict[str, Any]:
+    """Score how believable the edge is inside each environment bucket."""
+    grouped: dict[str, list[float]] = {}
+    for r in results:
+        key = r.get("env_key") or "env=unknown"
+        grouped.setdefault(key, []).append(r.get("return_pct", 0.0))
+
+    if not grouped:
+        return {
+            "condition_confidence": 0.0,
+            "condition_count": 0,
+            "positive_condition_rate": 0.0,
+            "condition_metrics": [],
+        }
+
+    rows: list[dict[str, Any]] = []
+    total = max(sum(len(v) for v in grouped.values()), 1)
+    weighted_conf = 0.0
+    positive_conditions = 0
+    for key, vals in grouped.items():
+        conf = _confidence_metrics(vals)
+        expectancy = statistics.mean(vals) if vals else 0.0
+        if expectancy > 0:
+            positive_conditions += 1
+        row = {
+            "env_key": key,
+            "trades": len(vals),
+            "expectancy": round(expectancy, 4),
+            "ci95_low": round(float(conf["ci95_low"]), 4),
+            "ci95_high": round(float(conf["ci95_high"]), 4),
+            "confidence_score": round(float(conf["confidence_score"]), 4),
+            "luck_pressure": round(float(conf["luck_pressure"]), 4),
+            "ci_excludes_zero": bool(conf["ci_excludes_zero"]),
+        }
+        rows.append(row)
+        weighted_conf += float(conf["confidence_score"]) * len(vals)
+
+    rows.sort(key=lambda x: (-x["trades"], -x["confidence_score"], -x["expectancy"]))
+    return {
+        "condition_confidence": weighted_conf / total,
+        "condition_count": len(rows),
+        "positive_condition_rate": positive_conditions / len(rows) if rows else 0.0,
+        "condition_metrics": rows,
+    }
+
+# ── Slippage presets ─────────────────────────────────────────────
+# Each preset maps order_type to (entry_slippage_bps, exit_slippage_bps).
+# 'fast' is used for the inner research loop (throughput-optimised).
+# 'strict' is used for promotion-grade stock evaluation (harsher).
+_SLIPPAGE_PRESETS: dict[str, dict[str, tuple[float, float]]] = {
+    "fast": {
+        "market":               (SLIPPAGE_BPS, SLIPPAGE_BPS),
+        "limit":                (0, SLIPPAGE_BPS),
+        "stop_entry":           (SLIPPAGE_BPS * 1.5, SLIPPAGE_BPS),
+        "bracket":              (SLIPPAGE_BPS, SLIPPAGE_BPS),
+        "trailing_stop_exit":   (SLIPPAGE_BPS, SLIPPAGE_BPS),
+        "oca_exit":             (SLIPPAGE_BPS, SLIPPAGE_BPS),
+        "midprice":             (SLIPPAGE_BPS * 0.5, SLIPPAGE_BPS * 0.5),
+        "vwap":                 (SLIPPAGE_BPS * 0.5, SLIPPAGE_BPS * 0.5),
+        "moc":                  (SLIPPAGE_BPS, SLIPPAGE_BPS * 2),
+        "moo":                  (SLIPPAGE_BPS * 2, SLIPPAGE_BPS),
+        "_options":             (0, 0),   # options: handled by separate pricers
+    },
+    "strict": {
+        "market":               (SLIPPAGE_BPS * 3, SLIPPAGE_BPS * 3),
+        "limit":                (0, SLIPPAGE_BPS * 2),
+        "stop_entry":           (SLIPPAGE_BPS * 4, SLIPPAGE_BPS * 2),
+        "bracket":              (SLIPPAGE_BPS * 3, SLIPPAGE_BPS * 3),
+        "trailing_stop_exit":   (SLIPPAGE_BPS * 3, SLIPPAGE_BPS * 3),
+        "oca_exit":             (SLIPPAGE_BPS * 3, SLIPPAGE_BPS * 3),
+        "midprice":             (SLIPPAGE_BPS * 2, SLIPPAGE_BPS * 2),
+        "vwap":                 (SLIPPAGE_BPS * 2, SLIPPAGE_BPS * 2),
+        "moc":                  (SLIPPAGE_BPS * 2, SLIPPAGE_BPS * 4),
+        "moo":                  (SLIPPAGE_BPS * 4, SLIPPAGE_BPS * 2),
+        "_options":             (0, 0),
+    },
+}
+
+# Time-of-day slippage multiplier: first and last 15 minutes are more expensive
+_TOD_SLIPPAGE: list[tuple[int, int, float]] = [
+    # (start_minute_inclusive, end_minute_exclusive, multiplier)
+    (570, 585,  2.0),   # 09:30–09:45 open auction
+    (945, 960,  1.5),   # 15:45–16:00 close approach
+]
+
+
+def _tod_multiplier(bar_minute: int | None) -> float:
+    if bar_minute is None:
+        return 1.0
+    for start, end, mult in _TOD_SLIPPAGE:
+        if start <= bar_minute < end:
+            return mult
+    return 1.0
+
+
+def simulate(
+    signals: list[dict],
+    candles: pd.DataFrame,
+    slippage_preset: str = "fast",
+) -> list[dict]:
     """
     Simulate trades from signals against 1-min candle data.
 
@@ -26,6 +214,7 @@ def simulate(signals: list[dict], candles: pd.DataFrame) -> list[dict]:
     Args:
         signals: list of signal dicts from strategy.scan()
         candles: DataFrame with columns [ts, open, high, low, close, volume]
+        slippage_preset: 'fast' (default, inner loop) or 'strict' (promotion grade)
 
     Returns:
         list of result dicts with outcome fields added
@@ -35,13 +224,13 @@ def simulate(signals: list[dict], candles: pd.DataFrame) -> list[dict]:
 
     results = []
     for sig in signals:
-        result = _simulate_one(sig, candles)
+        result = _simulate_one(sig, candles, slippage_preset=slippage_preset)
         if result is not None:
             results.append(result)
     return results
 
 
-def _simulate_one(sig: dict, candles: pd.DataFrame) -> dict | None:
+def _simulate_one(sig: dict, candles: pd.DataFrame, slippage_preset: str = "fast") -> dict | None:
     """Simulate a single signal to completion."""
     entry_bar = sig.get("entry_bar")
     if entry_bar is None or entry_bar < 0 or entry_bar >= len(candles):
@@ -56,6 +245,15 @@ def _simulate_one(sig: dict, candles: pd.DataFrame) -> dict | None:
 
     if entry_price is None or target_price is None or stop_price is None:
         return None
+
+    # Validate legs_json schema early — reject invalid payloads rather than propagating
+    # garbage P&L all the way through the promotion pipeline
+    legs_early = sig.get("legs_json")
+    if legs_early and isinstance(legs_early, dict):
+        err = validate_legs_json(legs_early)
+        if err:
+            logger.debug(f"Skipping signal with invalid legs_json: {err}")
+            return None
 
     # Determine fill bar and fill price based on order type
     fill_bar, fill_price = _get_fill(order_type, entry_bar, entry_price, candles, direction)
@@ -153,12 +351,26 @@ def _simulate_one(sig: dict, candles: pd.DataFrame) -> dict | None:
         exit_price = candles.iloc[-1]["close"]
         timed_out = 1
 
-    # Compute return (subtract slippage + commission)
+    # Compute return (subtract slippage + commission based on preset + time-of-day)
     if is_long:
         return_pct = (exit_price - fill_price) / fill_price * 100
     else:
         return_pct = (fill_price - exit_price) / fill_price * 100
-    return_pct -= SLIPPAGE_BPS / 100  # subtract slippage per trade
+
+    preset = _SLIPPAGE_PRESETS.get(slippage_preset, _SLIPPAGE_PRESETS["fast"])
+    is_options = order_type in (
+        "vertical_spread", "iron_condor", "straddle", "strangle",
+        "calendar_spread", "diagonal_spread", "butterfly",
+    )
+    slip_key = "_options" if is_options else order_type
+    entry_slip_bps, exit_slip_bps = preset.get(slip_key, (SLIPPAGE_BPS, SLIPPAGE_BPS))
+    fill_bar_minute = _minute_of_day(candles.iloc[fill_bar]["ts"]) if fill_bar < len(candles) else None
+    entry_mult = _tod_multiplier(fill_bar_minute)
+    exit_bar_minute = _minute_of_day(candles.iloc[exit_bar]["ts"]) if exit_bar < len(candles) else None
+    exit_mult = _tod_multiplier(exit_bar_minute)
+    total_slip = (entry_slip_bps * entry_mult + exit_slip_bps * exit_mult) / 100
+    if not is_options:
+        return_pct -= total_slip
 
     # Handle options legs if present
     legs = sig.get("legs_json")
@@ -296,13 +508,13 @@ def _simulate_options_return(legs: dict, underlying_entry: float, underlying_exi
 
     elif strategy == "iron_condor":
         # Credit received ~30% of wing width, max loss = wing - credit
-        wing_width = legs.get("wing_width", 5.0)
-        credit = wing_width * 0.3
-        max_loss = wing_width - credit
-
-        # Iron condor profits when price stays in range
+        put_long = legs.get("put_long_strike", underlying_entry * 0.95)
         put_short = legs.get("put_short_strike", underlying_entry * 0.97)
         call_short = legs.get("call_short_strike", underlying_entry * 1.03)
+        call_long = legs.get("call_long_strike", underlying_entry * 1.05)
+        wing_width = max(abs(put_short - put_long), abs(call_long - call_short), 1.0)
+        credit = wing_width * 0.3
+        max_loss = wing_width - credit
 
         if put_short <= underlying_exit <= call_short:
             # Price in range — profit is theta decay
@@ -331,10 +543,12 @@ def _simulate_options_return(legs: dict, underlying_entry: float, underlying_exi
         return (pnl / debit) * 100
 
     elif strategy == "butterfly":
-        width = legs.get("wing_width", 5.0)
+        low = legs.get("low_strike", underlying_entry - 5)
+        mid = legs.get("mid_strike", underlying_entry)
+        high = legs.get("high_strike", underlying_entry + 5)
+        width = max(abs(high - low) / 2, 0.5)
         debit = width * 0.2
-        center = legs.get("center_strike", underlying_entry)
-        dist_from_center = abs(underlying_exit - center)
+        dist_from_center = abs(underlying_exit - mid)
         if dist_from_center <= width * 0.3:
             pnl = (width - debit) * (1 - dist_from_center / (width * 0.3)) * 0.5
         else:
@@ -366,10 +580,11 @@ def _minute_of_day(ts: Any) -> int | None:
 
 def compute_expectancy(results: list[dict]) -> dict:
     """
-    Compute aggregate statistics from simulation results.
+    Compute aggregate statistics plus search fitness from simulation results.
 
     Returns dict with: hit_rate, avg_win, avg_loss, expectancy,
-    profit_factor, max_drawdown, sharpe_approx, total_signals.
+    profit_factor, max_drawdown, sharpe_approx, total_signals,
+    stability_score, search_fitness.
     """
     if not results:
         return {
@@ -377,6 +592,21 @@ def compute_expectancy(results: list[dict]) -> dict:
             "expectancy": 0.0, "profit_factor": 0.0,
             "max_drawdown": 0.0, "sharpe_approx": 0.0,
             "total_signals": 0,
+            "stability_score": 0.0,
+            "return_std": 0.0,
+            "stderr": 0.0,
+            "ci95_low": 0.0,
+            "ci95_high": 0.0,
+            "t_stat": 0.0,
+            "confidence_score": 0.0,
+            "luck_pressure": 1.0,
+            "condition_confidence": 0.0,
+            "condition_count": 0,
+            "positive_condition_rate": 0.0,
+            "signed_edge_score": 0.0,
+            "raw_search_fitness": 0.0,
+            "condition_metrics": [],
+            "search_fitness": 0.0,
         }
 
     returns = [r["return_pct"] for r in results]
@@ -408,17 +638,66 @@ def compute_expectancy(results: list[dict]) -> dict:
         if dd > max_dd:
             max_dd = dd
 
-    # Sharpe approximation (annualized, assuming ~252 trading days, ~6.5 hr/day)
+    # Sharpe approximation (annualized, assumes uniform sampling)
     if len(returns) >= 2:
-        import statistics
         mean_r = statistics.mean(returns)
         std_r = statistics.stdev(returns)
         sharpe = (mean_r / std_r * math.sqrt(252)) if std_r > 0 else 0.0
     else:
         sharpe = 0.0
 
+    confidence = _confidence_metrics(returns)
+    condition = _condition_metrics(results)
+
     # Average R:R
     avg_rr = abs(avg_win / avg_loss) if avg_loss != 0 else float("inf") if avg_win > 0 else 0.0
+
+    # ── Stability score ───────────────────────────────────────────
+    # Measures how consistently the strategy performs across symbols and days.
+    # 1.0 = perfectly consistent, 0.0 = all results on one day/symbol only.
+    symbols_seen = {r.get("symbol", "unknown") for r in results}
+    dates_seen: set[str] = set()
+    for r in results:
+        ts = r.get("entry_ts") or r.get("exit_ts")
+        if ts:
+            dates_seen.add(str(ts)[:10])
+    n_symbols = max(len(symbols_seen), 1)
+    n_days = max(len(dates_seen), 1)
+    stability_score = min(1.0, math.log1p(n_symbols) * math.log1p(n_days) / 10.0)
+
+    # ── Search fitness: composite fast-search score ───────────────
+    # Penalizes:
+    #   - too few signals (< 5 not trustworthy)
+    #   - large drawdown relative to expectancy
+    #   - low symbol/day diversity (concentration penalty)
+    # Rewards:
+    #   - positive expectancy
+    #   - high profit factor
+    #   - cross-symbol stability
+    sample_penalty = min(1.0, total / 10.0)  # ramp from 0→1 as signals grow 0→10
+    drawdown_penalty = max(0.0, 1.0 - max_dd / 20.0)  # dd>20% kills score quickly
+    fitness_profit_factor = profit_factor if math.isfinite(profit_factor) else 5.0
+    cc = float(condition["condition_confidence"])
+    signed_edge_score = (
+        expectancy
+        * sample_penalty
+        * drawdown_penalty
+        * stability_score
+        * float(confidence["confidence_score"])
+        * (cc if cc > 0 else 0.25)
+    )
+    fitness_raw = (
+        expectancy
+        * fitness_profit_factor
+        * sample_penalty
+        * drawdown_penalty
+        * stability_score
+        * float(confidence["confidence_score"])
+        * (cc if cc > 0 else 0.25)
+    )
+    signed_edge_score = round(signed_edge_score, 6)
+    raw_search_fitness = round(fitness_raw, 6)
+    search_fitness = round(max(fitness_raw, 0.0), 6)
 
     return {
         "hit_rate": round(hit_rate, 2),
@@ -430,4 +709,49 @@ def compute_expectancy(results: list[dict]) -> dict:
         "max_drawdown": round(max_dd, 2),
         "sharpe_approx": round(sharpe, 2),
         "total_signals": total,
+        "stability_score": round(stability_score, 4),
+        "return_std": round(float(confidence["return_std"]), 4),
+        "stderr": round(float(confidence["stderr"]), 4),
+        "ci95_low": round(float(confidence["ci95_low"]), 4),
+        "ci95_high": round(float(confidence["ci95_high"]), 4),
+        "t_stat": round(float(confidence["t_stat"]), 4),
+        "confidence_score": round(float(confidence["confidence_score"]), 4),
+        "luck_pressure": round(float(confidence["luck_pressure"]), 4),
+        "condition_confidence": round(float(condition["condition_confidence"]), 4),
+        "condition_count": int(condition["condition_count"]),
+        "positive_condition_rate": round(float(condition["positive_condition_rate"]), 4),
+        "signed_edge_score": signed_edge_score,
+        "raw_search_fitness": raw_search_fitness,
+        "condition_metrics": condition["condition_metrics"][:6],
+        "search_fitness": search_fitness,
     }
+
+
+def format_confidence_line(
+    label: str, values: list[float], kind: str = "raw"
+) -> str | None:
+    """Format a confidence summary line using compute_sample_confidence.
+
+    Used in trade feedback and research briefing for consistent reporting
+    of means, CI95, confidence_score, and luck_pressure.
+    """
+    samples = [float(v) for v in values if v is not None]
+    if not samples:
+        return None
+
+    summary = compute_sample_confidence(samples)
+
+    def _fmt(value: float) -> str:
+        if kind == "pct":
+            return f"{value:+.2f}%"
+        if kind == "usd":
+            return f"${value:+.2f}"
+        return f"{value:+.2f}"
+
+    return (
+        f"  {label}: mean={_fmt(float(summary['sample_mean']))} "
+        f"ci95=[{_fmt(float(summary['ci95_low']))}, {_fmt(float(summary['ci95_high']))}] "
+        f"conf={float(summary['confidence_score']):.2f} "
+        f"luck={float(summary['luck_pressure']):.2f} "
+        f"(n={int(summary['sample_count'])})"
+    )

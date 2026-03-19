@@ -20,9 +20,158 @@ logger = logging.getLogger(__name__)
 
 # ── Regime labels ───────────────────────────────────────────────
 
-VOLATILITY_REGIMES = ("low", "normal", "high", "extreme")
-TREND_REGIMES = ("strong_down", "down", "sideways", "up", "strong_up")
-BREADTH_REGIMES = ("bearish", "mixed", "neutral", "bullish")
+VOLATILITY_REGIMES = ("low", "normal", "high")
+TREND_REGIMES = ("down", "flat", "up")
+BREADTH_REGIMES = ("bearish", "neutral", "bullish")
+
+
+def make_environment_key(snapshot: dict[str, Any]) -> str:
+    """Build a compact regime key for grouping strategy results by condition."""
+    return (
+        f"vol={snapshot.get('volatility_regime', 'unknown')}|"
+        f"trend={snapshot.get('trend_regime', 'unknown')}|"
+        f"breadth={snapshot.get('breadth_regime', 'unknown')}"
+    )
+
+
+def compute_session_environment(session_universe: dict[str, pd.DataFrame], session_date: str) -> dict[str, Any]:
+    """Compute a same-day environment snapshot across all symbols for one session."""
+    rows: list[dict[str, float]] = []
+    for sym, df in session_universe.items():
+        if df is None or df.empty:
+            continue
+        open_px = float(df["open"].iloc[0])
+        close_px = float(df["close"].iloc[-1])
+        if open_px <= 0:
+            continue
+
+        first_n = max(1, min(len(df), len(df) // 3 or 1))
+        last_n = max(1, min(len(df), len(df) // 3 or 1))
+        morning_close = float(df["close"].iloc[first_n - 1])
+        afternoon_open = float(df["open"].iloc[-last_n])
+        first_vol = float(df["volume"].iloc[:first_n].sum())
+        last_vol = float(df["volume"].iloc[-last_n:].sum())
+
+        rows.append({
+            "symbol": sym,
+            "session_return_pct": (close_px - open_px) / open_px * 100,
+            "intraday_range_pct": (float(df["high"].max()) - float(df["low"].min())) / open_px * 100,
+            "morning_return_pct": (morning_close - open_px) / open_px * 100,
+            "afternoon_return_pct": (
+                (close_px - afternoon_open) / afternoon_open * 100 if afternoon_open > 0 else 0.0
+            ),
+            "late_volume_ratio": (last_vol / first_vol) if first_vol > 0 else 1.0,
+        })
+
+    if not rows:
+        snapshot = {
+            "timestamp": session_date,
+            "symbols_analyzed": 0,
+            "volatility_regime": "unknown",
+            "trend_regime": "unknown",
+            "breadth_regime": "unknown",
+            "momentum_regime": "unknown",
+            "volume_regime": "unknown",
+            "dispersion": 0.0,
+            "strategy_fit": {},
+        }
+        snapshot["env_key"] = make_environment_key(snapshot)
+        return snapshot
+
+    frame = pd.DataFrame(rows)
+    n = len(frame)
+    avg_intraday = float(frame["intraday_range_pct"].mean())
+    returns = frame["session_return_pct"].tolist()
+    positive = sum(1 for r in returns if r > 0.15)
+    negative = sum(1 for r in returns if r < -0.15)
+    pct_up = positive / n if n else 0.0
+    pct_down = negative / n if n else 0.0
+    advance_decline = (positive - negative) / n if n else 0.0
+    avg_accel = float((frame["afternoon_return_pct"] - frame["morning_return_pct"]).mean())
+    avg_late_vol = float(frame["late_volume_ratio"].mean())
+    dispersion = float(frame["session_return_pct"].std(ddof=0) + frame["intraday_range_pct"].std(ddof=0))
+
+    # 3-level volatility (low / normal / high) — 27 total bins
+    if avg_intraday < 1.5:
+        vol_regime = "low"
+    elif avg_intraday < 3.0:
+        vol_regime = "normal"
+    else:
+        vol_regime = "high"
+
+    # 3-level trend (down / flat / up)
+    if pct_down > 0.45:
+        trend_regime = "down"
+    elif pct_up > 0.45:
+        trend_regime = "up"
+    else:
+        trend_regime = "flat"
+
+    # 3-level breadth (bearish / neutral / bullish)
+    if advance_decline > 0.2:
+        breadth_regime = "bullish"
+    elif advance_decline < -0.2:
+        breadth_regime = "bearish"
+    else:
+        breadth_regime = "neutral"
+
+    # Momentum & volume are stored as continuous values and kept as
+    # descriptive labels for the LLM prompt, but excluded from env_key
+    # to keep bins manageable (3×3×3 = 27).
+    if avg_accel > 0.15:
+        momentum_regime = "accelerating"
+    elif avg_accel > -0.15:
+        momentum_regime = "steady"
+    else:
+        momentum_regime = "decelerating"
+
+    if avg_late_vol > 1.15:
+        volume_regime = "expanding"
+    elif avg_late_vol < 0.85:
+        volume_regime = "contracting"
+    else:
+        volume_regime = "normal"
+
+    snapshot = {
+        "timestamp": session_date,
+        "symbols_analyzed": n,
+        "volatility_regime": vol_regime,
+        "trend_regime": trend_regime,
+        "breadth_regime": breadth_regime,
+        "momentum_regime": momentum_regime,
+        "volume_regime": volume_regime,
+        "avg_intraday_range_pct": round(avg_intraday, 4),
+        "advance_decline_ratio": round(advance_decline, 4),
+        "dispersion": round(dispersion, 4),
+        "avg_momentum_shift": round(avg_accel, 4),
+        "avg_volume_ratio": round(avg_late_vol, 4),
+        "pct_trending_up": round(pct_up, 2),
+        "pct_trending_down": round(pct_down, 2),
+        "strategy_fit": _compute_strategy_fit(
+            vol_regime=vol_regime,
+            trend_regime=trend_regime,
+            breadth_regime=breadth_regime,
+            momentum_regime=momentum_regime,
+            dispersion=dispersion,
+            avg_atr=avg_intraday,
+            avg_intraday=avg_intraday,
+        ),
+    }
+    snapshot["env_key"] = make_environment_key(snapshot)
+    return snapshot
+
+
+def compute_environment_by_date(universe: dict[str, dict[str, pd.DataFrame]]) -> dict[str, dict[str, Any]]:
+    """Compute one same-day environment snapshot per eval date across the universe."""
+    date_map: dict[str, dict[str, pd.DataFrame]] = {}
+    for sym, days in universe.items():
+        for day_str, df in days.items():
+            date_map.setdefault(day_str, {})[sym] = df
+
+    return {
+        day_str: compute_session_environment(day_universe, day_str)
+        for day_str, day_universe in date_map.items()
+    }
 
 
 # ── Per-symbol feature extraction ───────────────────────────────
@@ -159,15 +308,13 @@ def compute_environment(
     avg_atr = np.mean(atr_values)
     avg_intraday = np.mean(intraday_ranges)
 
-    # Classify volatility
-    if avg_atr < 1.0:
+    # 3-level volatility (low / normal / high) — keeps total bins at 3×3×3 = 27
+    if avg_atr < 1.5:
         vol_regime = "low"
-    elif avg_atr < 2.0:
+    elif avg_atr < 3.0:
         vol_regime = "normal"
-    elif avg_atr < 3.5:
-        vol_regime = "high"
     else:
-        vol_regime = "extreme"
+        vol_regime = "high"
 
     # ── Trend regime (breadth-based) ────────────────────────────
     trends = [f["trend_strength"] for f in sym_features.values()]
@@ -180,30 +327,26 @@ def compute_environment(
     pct_up = up_trending / n
     pct_down = down_trending / n
 
-    if pct_up > 0.6:
-        trend_regime = "strong_up"
-    elif pct_up > 0.4:
-        trend_regime = "up"
-    elif pct_down > 0.6:
-        trend_regime = "strong_down"
-    elif pct_down > 0.4:
+    # 3-level trend (down / flat / up)
+    if pct_down > 0.45:
         trend_regime = "down"
+    elif pct_up > 0.45:
+        trend_regime = "up"
     else:
-        trend_regime = "sideways"
+        trend_regime = "flat"
 
     # ── Breadth ─────────────────────────────────────────────────
     positive_returns = sum(1 for r in cum_returns if r > 0)
     negative_returns = sum(1 for r in cum_returns if r < 0)
     advance_decline = (positive_returns - negative_returns) / n if n > 0 else 0
 
-    if advance_decline > 0.3:
+    # 3-level breadth (bearish / neutral / bullish)
+    if advance_decline > 0.2:
         breadth_regime = "bullish"
-    elif advance_decline > 0.0:
-        breadth_regime = "neutral"
-    elif advance_decline > -0.3:
-        breadth_regime = "mixed"
-    else:
+    elif advance_decline < -0.2:
         breadth_regime = "bearish"
+    else:
+        breadth_regime = "neutral"
 
     # ── Dispersion (how differently symbols are behaving) ───────
     return_std = np.std(cum_returns) if len(cum_returns) > 1 else 0
@@ -327,31 +470,30 @@ def _compute_strategy_fit(
 
     # ── Momentum / Breakout strategies ──────────────────────────
     # Favor: trending markets, expanding volume, higher vol
+    # Use continuous avg_atr for granularity within the 3-level labels
     momentum_score = 0.5
-    if trend_regime in ("strong_up", "strong_down"):
-        momentum_score += 0.3
-    elif trend_regime in ("up", "down"):
-        momentum_score += 0.15
-    elif trend_regime == "sideways":
+    if trend_regime in ("up", "down"):
+        momentum_score += 0.25
+    elif trend_regime == "flat":
         momentum_score -= 0.2
     if momentum_regime == "accelerating":
         momentum_score += 0.15
-    if vol_regime in ("high", "extreme"):
+    if avg_atr > 2.5:
         momentum_score += 0.1
-    elif vol_regime == "low":
+    elif avg_atr < 1.0:
         momentum_score -= 0.15
     scores["momentum_breakout"] = max(0, min(1, momentum_score))
 
     # ── Mean Reversion strategies ───────────────────────────────
-    # Favor: sideways markets, normal vol, high intraday range
+    # Favor: flat markets, moderate vol, wide intraday range
     reversion_score = 0.5
-    if trend_regime == "sideways":
+    if trend_regime == "flat":
         reversion_score += 0.25
-    elif trend_regime in ("strong_up", "strong_down"):
-        reversion_score -= 0.2
-    if vol_regime == "normal":
+    elif trend_regime in ("up", "down"):
+        reversion_score -= 0.15
+    if 1.0 <= avg_atr <= 2.5:
         reversion_score += 0.15
-    elif vol_regime == "extreme":
+    elif avg_atr > 3.5:
         reversion_score -= 0.2
     if avg_intraday > 2.0:
         reversion_score += 0.1
@@ -364,35 +506,31 @@ def _compute_strategy_fit(
         vwap_score += 0.15
     if trend_regime in ("up", "down"):
         vwap_score += 0.15
-    elif trend_regime == "sideways":
+    elif trend_regime == "flat":
         vwap_score += 0.1
     scores["vwap"] = max(0, min(1, vwap_score))
 
     # ── Options — Long calls/puts (directional) ────────────────
-    # Favor: strong trend, expanding vol (IV rise helps)
+    # Favor: trending, moderate vol (cheap enough to buy, enough movement)
     long_options_score = 0.5
-    if trend_regime in ("strong_up", "strong_down"):
-        long_options_score += 0.25
-    elif trend_regime in ("up", "down"):
-        long_options_score += 0.1
-    if vol_regime == "high":
-        long_options_score += 0.1  # some vol good for movement
-    elif vol_regime == "extreme":
-        long_options_score -= 0.1  # IV too high = expensive
-    elif vol_regime == "low":
-        long_options_score += 0.05  # cheap entry but less movement
+    if trend_regime in ("up", "down"):
+        long_options_score += 0.2
+    if 1.5 <= avg_atr <= 3.0:
+        long_options_score += 0.1  # affordable IV + movement
+    elif avg_atr > 3.5:
+        long_options_score -= 0.1  # IV too expensive
     scores["long_options"] = max(0, min(1, long_options_score))
 
     # ── Options — Short premium (strangles, iron condors) ──────
-    # Favor: sideways + high vol (sell into IV), contracting momentum
+    # Favor: flat + elevated vol (sell into IV), contracting momentum
     short_premium_score = 0.5
-    if trend_regime == "sideways":
+    if trend_regime == "flat":
         short_premium_score += 0.25
-    elif trend_regime in ("strong_up", "strong_down"):
-        short_premium_score -= 0.25
-    if vol_regime in ("high", "extreme"):
+    elif trend_regime in ("up", "down"):
+        short_premium_score -= 0.15
+    if avg_atr > 2.0:
         short_premium_score += 0.2  # rich premium to sell
-    elif vol_regime == "low":
+    elif avg_atr < 1.0:
         short_premium_score -= 0.15  # not enough premium
     if momentum_regime == "decelerating":
         short_premium_score += 0.1
@@ -401,9 +539,9 @@ def _compute_strategy_fit(
     # ── Options — Straddle (volatility play) ────────────────────
     # Favor: low vol (cheap) with expected expansion, high dispersion
     straddle_score = 0.5
-    if vol_regime == "low":
+    if avg_atr < 1.5:
         straddle_score += 0.2  # cheap entry
-    elif vol_regime == "extreme":
+    elif avg_atr > 3.5:
         straddle_score -= 0.2  # too expensive
     if dispersion > 3.0:
         straddle_score += 0.15  # stocks moving independently = events
@@ -416,8 +554,6 @@ def _compute_strategy_fit(
     spread_score = 0.5
     if trend_regime in ("up", "down"):
         spread_score += 0.2
-    elif trend_regime in ("strong_up", "strong_down"):
-        spread_score += 0.1
     if vol_regime in ("normal", "high"):
         spread_score += 0.15
     scores["vertical_spread"] = max(0, min(1, spread_score))
@@ -425,7 +561,7 @@ def _compute_strategy_fit(
     # ── Bracket / range-bound ───────────────────────────────────
     # Similar to mean reversion but with tighter parameters
     bracket_score = 0.5
-    if trend_regime == "sideways":
+    if trend_regime == "flat":
         bracket_score += 0.2
     if vol_regime == "normal":
         bracket_score += 0.15
@@ -456,12 +592,21 @@ def format_environment_for_prompt(snapshot: dict) -> str:
     opt_candidates = snapshot.get("options_candidates", [])
 
     return f"""CURRENT MARKET ENVIRONMENT (computed from {snapshot['symbols_analyzed']} symbols, last {snapshot.get('num_days', '?')} trading days):
-  Volatility:  {snapshot['volatility_regime']} (ATR {snapshot['avg_atr_pct']:.2f}%, intraday range {snapshot['avg_intraday_range_pct']:.2f}%)
-  Trend:       {snapshot['trend_regime']} ({snapshot['pct_trending_up']:.0%} up, {snapshot['pct_trending_down']:.0%} down)
-  Breadth:     {snapshot['breadth_regime']} (A/D ratio {snapshot['advance_decline_ratio']:+.2f})
-  Momentum:    {snapshot['momentum_regime']} (shift {snapshot['avg_momentum_shift']:+.2f})
-  Volume:      {snapshot['volume_regime']} (ratio {snapshot['avg_volume_ratio']:.2f}x)
-  Dispersion:  {snapshot['dispersion']:.2f}
+
+  CONTINUOUS METRICS (use these for nuanced strategy design, not just the labels):
+    ATR:             {snapshot['avg_atr_pct']:.2f}%  [low <1.0 | normal 1-2 | high 2-3.5 | extreme >3.5]
+    Intraday range:  {snapshot['avg_intraday_range_pct']:.2f}%
+    Cumulative ret:  {snapshot.get('avg_cumulative_return', 0):.2f}%
+    A/D ratio:       {snapshot['advance_decline_ratio']:+.2f}  [bearish <-0.3 | mixed -0.3-0 | neutral 0-0.3 | bullish >0.3]
+    Momentum shift:  {snapshot['avg_momentum_shift']:+.2f}  [decel <-0.5 | steady -0.5-0.5 | accel >0.5]
+    Volume ratio:    {snapshot['avg_volume_ratio']:.2f}x  [contracting <0.8 | normal 0.8-1.3 | expanding >1.3]
+    % trending up:   {snapshot['pct_trending_up']:.0%}
+    % trending down: {snapshot['pct_trending_down']:.0%}
+    Dispersion:      {snapshot['dispersion']:.2f}
+
+  REGIME LABELS (summary of the above):
+    Volatility={snapshot['volatility_regime']}  Trend={snapshot['trend_regime']}  Breadth={snapshot['breadth_regime']}
+    Momentum={snapshot['momentum_regime']}  Volume={snapshot['volume_regime']}
 
 STRATEGY-ENVIRONMENT FIT (higher = better match for current conditions):
 {chr(10).join(fit_lines)}

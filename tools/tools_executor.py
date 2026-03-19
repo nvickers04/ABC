@@ -100,7 +100,8 @@ jade_lizard: {symbol, expiration, put_strike, call_short_strike, call_long_strik
 === OPTIONS - MANAGEMENT ===
 close_option: {symbol, expiration, strike, right, limit_price?} -> auto-midpoint if no limit_price
 roll_option: {symbol, old_expiration, old_strike, new_expiration, new_strike, right, quantity?=1}
-option_chain: {symbol, expiration?='YYYY-MM-DD', side?='call'|'put', dte_min?, dte_max?, strike_min?, strike_max?, limit?=20} -> contracts with Greeks (widen DTE or omit expiration if empty)
+option_chain: {symbol, expiration?='YYYY-MM-DD', side?='call'|'put', dte_min?, dte_max?, strike_min?, strike_max?, limit?=20, date?='YYYY-MM-DD'} -> contracts with Greeks; add 'date' for historical snapshot (back to 2005)
+option_quote: {option_symbol, date?='YYYY-MM-DD', from_date?='YYYY-MM-DD', to_date?='YYYY-MM-DD'} -> single contract quote; add date for historical, from_date+to_date for daily series
 option_greeks: {symbol, expiration, strike, right} -> delta, gamma, theta, vega, IV for specific contract
 position_greeks: {symbol?} -> Greeks for all option positions (or filtered by symbol)
 multi_leg: {type, symbol, legs?=[{strike,right,expiration,side},...], ...} -> generic multi-leg dispatcher (debit_spread, iron_condor, calendar, etc.)
@@ -455,7 +456,7 @@ class ToolExecutor:
         "iron_condor", "iron_butterfly", "straddle", "strangle",
         "collar", "calendar_spread", "diagonal_spread", "butterfly",
         "ratio_spread", "jade_lizard", "multi_leg", "enter_option",
-        "option_chain", "option_greeks", "position_greeks",
+        "option_chain", "option_greeks", "option_quote", "position_greeks",
         # Position management tools — these modify/protect existing positions,
         # never open naked shorts. Trailing stops and OCA always need an existing position.
         "trailing_stop", "trailing_stop_limit", "oca_order",

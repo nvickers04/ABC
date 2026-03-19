@@ -7,6 +7,25 @@ any order type or options structure. A selector agent periodically replaces the
 weakest slots.
 """
 
+from pathlib import Path
+
+
+_PROGRAM_PATH = Path(__file__).resolve().parent.parent / "program.md"
+
+
+def _escape_prompt_braces(text: str) -> str:
+  return text.replace("{", "{{").replace("}", "}}")
+
+
+def _load_program_markdown() -> str:
+  try:
+    return _PROGRAM_PATH.read_text(encoding="utf-8").strip()
+  except FileNotFoundError:
+    return ""
+
+
+RESEARCH_PROGRAM_MARKDOWN = _escape_prompt_braces(_load_program_markdown())
+
 # ── Medium-cap optionable universe ──────────────────────────────
 # $2B-$15B market cap, options available, avg volume >1M
 # Deliberately avoiding mega-caps to stay away from the crowd.
@@ -23,6 +42,9 @@ CANDLE_RESOLUTION = "1"         # 1-min bars
 EVAL_DAYS_BACK = 10             # evaluate against each of the last 10 trading days
 FORCE_EXIT_MINUTE = 955         # 15:55 ET — force exit 5 min before close (minute of day)
 SLIPPAGE_BPS = 2                # 2 basis points per trade (slippage + commission)
+MIN_KEEP_TEST_SIGNALS = 15      # minimum out-of-sample trades before a strategy can be kept
+MIN_KEEP_CONFIDENCE_SCORE = 0.25  # minimum confidence score before a strategy can be kept
+MIN_KEEP_CONDITION_TRADES = 3   # require repeated evidence inside at least one condition bucket
 
 # ── Sandbox ─────────────────────────────────────────────────────
 SANDBOX_ALLOWED_IMPORTS = {"pandas", "numpy", "math", "statistics"}
@@ -35,6 +57,17 @@ BATCH_SIZE = 4                  # slots per batch (matches LLM semaphore)
 SELECTOR_EVERY_N_ROUNDS = 3     # run selector agent every N rounds
 MAX_SELECTOR_REPLACEMENTS = 3   # max slots the selector can replace per run
 
+# ── Darwinian weighting ─────────────────────────────────────────
+DARWINIAN_WEIGHT_FLOOR = 0.3    # minimum weight (near-silenced)
+DARWINIAN_WEIGHT_CEILING = 2.5  # maximum weight (highly trusted)
+DARWINIAN_WEIGHT_UP = 1.05      # top quartile boost per round
+DARWINIAN_WEIGHT_DOWN = 0.95    # bottom quartile decay per round
+SLOT_CORRELATION_THRESHOLD = 0.7  # r > this flags redundant pair
+
+# ── Environment regime gates ────────────────────────────────────
+REGIME_GATE_ENABLED = True       # hard gate: suppress mismatched directional strategies
+EXTREME_VOL_FITNESS_BOOST = 1.05 # require 5% higher fitness in extreme vol
+
 # ── Available order types (referenced in system prompt for Grok) ─
 STOCK_ORDER_TYPES = [
     "market", "limit", "stop_entry", "bracket", "trailing_stop_exit",
@@ -45,6 +78,144 @@ OPTIONS_STRATEGIES = [
     "vertical_spread", "iron_condor", "straddle", "strangle",
     "calendar_spread", "diagonal_spread", "butterfly",
 ]
+
+# ── Canonical legs_json field contracts per strategy ────────────
+# These are the REQUIRED fields for each options structure.
+# The simulator and promotion engine use these for deterministic contract
+# reconstruction from historical chains.  Any signal that omits required
+# fields is rejected during validation rather than silently producing garbage.
+
+LEGS_JSON_SCHEMAS: dict[str, dict] = {
+    # Long or short vertical spread (debit/credit call or put spread)
+    # right: 'C' or 'P'
+    # long_strike/short_strike: the two strikes
+    # direction on the parent signal governs debit vs. credit
+    "vertical_spread": {
+        "required": ["expiration", "long_strike", "short_strike", "right"],
+        "optional": ["quantity"],
+        "description": (
+            "Two-leg spread. long_strike < short_strike for calls; "
+            "long_strike > short_strike for puts is also fine. "
+            "right: 'C' or 'P'."
+        ),
+    },
+    # Short iron condor: sell OTM put spread + sell OTM call spread
+    "iron_condor": {
+        "required": [
+            "expiration",
+            "put_long_strike", "put_short_strike",
+            "call_short_strike", "call_long_strike",
+        ],
+        "optional": ["quantity"],
+        "description": (
+            "Four legs. put_long < put_short <= call_short < call_long. "
+            "Net credit strategy."
+        ),
+    },
+    # Long straddle: buy ATM call + buy ATM put, same strike + expiration
+    "straddle": {
+        "required": ["expiration", "strike"],
+        "optional": ["quantity"],
+        "description": "Long ATM call + long ATM put. Single strike.",
+    },
+    # Long strangle: buy OTM call + buy OTM put, different strikes
+    "strangle": {
+        "required": ["expiration", "put_strike", "call_strike"],
+        "optional": ["quantity"],
+        "description": "Long OTM call + long OTM put. put_strike < call_strike.",
+    },
+    # Calendar spread: sell near-term, buy far-term, same strike + right
+    "calendar_spread": {
+        "required": ["near_expiration", "far_expiration", "strike", "right"],
+        "optional": ["quantity"],
+        "description": "Sell near_expiration, buy far_expiration at the same strike.",
+    },
+    # Diagonal spread: sell near-term near-strike, buy far-term different-strike
+    "diagonal_spread": {
+        "required": [
+            "near_expiration", "far_expiration",
+            "near_strike", "far_strike", "right",
+        ],
+        "optional": ["quantity"],
+        "description": "Sell near_expiration/near_strike, buy far_expiration/far_strike.",
+    },
+    # Long butterfly: buy low + buy high, sell 2x middle
+    "butterfly": {
+        "required": ["expiration", "low_strike", "mid_strike", "high_strike", "right"],
+        "optional": ["quantity"],
+        "description": (
+            "Three strikes. low_strike < mid_strike < high_strike; "
+            "mid_strike should be equidistant from both wings."
+        ),
+    },
+}
+
+
+def validate_legs_json(legs: dict) -> str | None:
+    """
+    Validate a legs_json dict against the canonical schema.
+
+    Returns an error message string if validation fails, or None if valid.
+    Does NOT raise — callers decide how to handle failures.
+    """
+    if not isinstance(legs, dict):
+        return "legs_json must be a dict"
+
+    strategy = legs.get("strategy")
+    if not strategy:
+        return "legs_json missing 'strategy' key"
+
+    schema = LEGS_JSON_SCHEMAS.get(strategy)
+    if schema is None:
+        valid = list(LEGS_JSON_SCHEMAS)
+        return f"Unknown strategy '{strategy}'. Valid: {valid}"
+
+    missing = [f for f in schema["required"] if f not in legs]
+    if missing:
+        return f"legs_json[{strategy}] missing required fields: {missing}"
+
+    # Type-check numeric fields
+    numeric_keys = [
+        "long_strike", "short_strike", "put_long_strike", "put_short_strike",
+        "call_short_strike", "call_long_strike", "strike", "put_strike",
+        "call_strike", "near_strike", "far_strike",
+        "low_strike", "mid_strike", "high_strike",
+    ]
+    for key in numeric_keys:
+        if key in legs and not isinstance(legs[key], (int, float)):
+            return f"legs_json field '{key}' must be a number, got {type(legs[key]).__name__}"
+
+    # Strategy-specific sanity checks
+    if strategy == "vertical_spread":
+        r = legs.get("right", "")
+        if r.upper() not in ("C", "P", "CALL", "PUT"):
+            return f"vertical_spread 'right' must be C or P, got '{r}'"
+
+    elif strategy == "iron_condor":
+        pl, ps = legs.get("put_long_strike", 0), legs.get("put_short_strike", 0)
+        cs, cl = legs.get("call_short_strike", 0), legs.get("call_long_strike", 0)
+        if not (pl < ps <= cs < cl):
+            return (
+                f"iron_condor strikes must satisfy put_long < put_short <= "
+                f"call_short < call_long, got {pl} {ps} {cs} {cl}"
+            )
+
+    elif strategy == "strangle":
+        ps, cs = legs.get("put_strike", 0), legs.get("call_strike", 0)
+        if ps >= cs:
+            return f"strangle put_strike ({ps}) must be < call_strike ({cs})"
+
+    elif strategy == "butterfly":
+        lo, mid, hi = (
+            legs.get("low_strike", 0),
+            legs.get("mid_strike", 1),
+            legs.get("high_strike", 2),
+        )
+        if not (lo < mid < hi):
+            return f"butterfly strikes must be low < mid < high, got {lo} {mid} {hi}"
+
+    return None  # valid
+
 
 # ── Signal schema documentation (given to Grok) ─────────────────
 SIGNAL_SCHEMA = """
@@ -58,13 +229,23 @@ Each signal returned by scan() must be a dict with these keys:
   stop_price: float       — stop-loss level
   max_hold_bars: int      — max bars to hold before forced exit (also forced at 15:55 ET)
   setup_type: str         — descriptive label (e.g. "breakout_volume", "mean_reversion_rsi")
-  legs_json: dict | None  — for options strategies only, e.g.:
-      {"strategy": "vertical_spread", "expiration": "YYYYMMDD",
-       "long_strike": 180.0, "short_strike": 185.0, "right": "C"}
+  legs_json: dict | None  — for options strategies only. Required fields by strategy:
+      vertical_spread:  {strategy, expiration, long_strike, short_strike, right}
+      iron_condor:      {strategy, expiration, put_long_strike, put_short_strike,
+                         call_short_strike, call_long_strike}
+      straddle:         {strategy, expiration, strike}
+      strangle:         {strategy, expiration, put_strike, call_strike}
+      calendar_spread:  {strategy, near_expiration, far_expiration, strike, right}
+      diagonal_spread:  {strategy, near_expiration, far_expiration,
+                         near_strike, far_strike, right}
+      butterfly:        {strategy, expiration, low_strike, mid_strike, high_strike, right}
 """
 
 # ── System prompt for strategy evolution (slot-aware + environment-aware) ──
 RESEARCH_SYSTEM_PROMPT = """You are an autonomous research agent evolving day trading strategies.
+
+HUMAN PROGRAM:
+{program_markdown}
 
 YOUR JOB: Modify strategy.py to improve its expectancy (expected profit per trade).
 You receive the current strategy code, its evaluation results, and history of past attempts.
@@ -117,6 +298,12 @@ Output ONLY the Python code for strategy.py. No markdown fences, no explanation 
 Use docstrings and comments inside the code to explain your reasoning.
 """
 
+# Inject program_markdown at load time (other {placeholders} remain for runtime .format())
+RESEARCH_SYSTEM_PROMPT = RESEARCH_SYSTEM_PROMPT.replace(
+    "{program_markdown}",
+    RESEARCH_PROGRAM_MARKDOWN or "(No program.md found. Use the repository defaults.)",
+)
+
 # ── LLM analysis prompt (runs after mechanical evaluation) ──────
 ANALYSIS_PROMPT_TEMPLATE = """You are analyzing the results of a day trading strategy backtest.
 
@@ -142,14 +329,22 @@ AGGREGATE STATS:
 - Expectancy: {expectancy:.4f}
 - Profit factor: {profit_factor:.2f}
 - Max drawdown: {max_drawdown:.2f}%
+- 95% CI for mean return: [{ci95_low:+.4f}, {ci95_high:+.4f}]
+- Confidence score: {confidence_score:.2f} (higher = less likely luck)
+- Luck pressure: {luck_pressure:.2f} (higher = more likely luck/noise)
+- Condition confidence: {condition_confidence:.2f}
+
+CONDITION SUMMARY:
+{condition_summary}
 
 Analyze:
 1. What's working and why? How does this relate to the current market environment?
 2. What's failing and why? Is it an environment mismatch?
 3. Time-of-day patterns (are morning entries better than afternoon?)
-4. Which setup types perform best in THIS environment?
-5. Are stops too tight or too loose given current volatility regime?
-6. Specific, actionable suggestions for the next strategy modification that
+4. Which conditions look genuinely repeatable vs. likely lucky?
+5. Which setup types perform best in THIS environment?
+6. Are stops too tight or too loose given current volatility regime?
+7. Specific, actionable suggestions for the next strategy modification that
    ACCOUNT FOR the current market environment.
 
 Be concise and specific. Focus on patterns in the data, not general advice."""

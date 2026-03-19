@@ -28,9 +28,11 @@ Grok (ReAct Brain)  →  Tools (thin wrappers)  →  IBKR Execution
 │   ├── agent.py    # Pure ReAct loop
 │   ├── grok_llm.py # xAI API wrapper
 │   └── config.py   # System prompt + risk constants (reads .env)
+├── program.md      # Human-edited research brief for the research subsystem
 ├── tools/          # Thin tool wrappers (account, orders, research, options, etc.)
 ├── data/           # Market data client, data provider, cost tracker, broker gateway
 ├── execution/      # IBKR core, orders, options, queries
+├── research/       # Autoresearch-style strategy evolution package
 ├── __main__.py     # Entry point
 ├── .env.template   # Copy to .env and fill in
 ├── requirements.txt

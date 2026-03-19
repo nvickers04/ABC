@@ -15,7 +15,7 @@ import asyncio
 import json
 import logging
 import re
-from datetime import datetime
+from datetime import datetime, timezone, timedelta
 from typing import Any, Optional
 
 from core.config import (
@@ -39,6 +39,8 @@ from data.cost_tracker import get_cost_tracker
 from data.data_provider import get_data_provider
 from data.broker_gateway import create_gateway, BrokerConfigError
 from data.market_hours import get_market_hours_provider
+from research.simulator import compute_sample_confidence, format_confidence_line
+from research.agent import _get_env_slot_history
 from tools.tools_executor import ToolExecutor
 
 logger = logging.getLogger(__name__)
@@ -300,6 +302,16 @@ class TradingAgent:
                 except (json.JSONDecodeError, TypeError):
                     pass
 
+            # ── Environment history from research (what works/doesn't) ──
+            try:
+                history = _get_env_slot_history()
+                if history and len(history) > 20:
+                    lines.append("")
+                    lines.append("ENVIRONMENT HISTORY:")
+                    lines.append(history[:500] + "\n... (truncated)")
+            except Exception:
+                pass
+
             # ── Best strategy per slot ──────────────────────────
             rows = db.execute(
                 """SELECT s.id, s.slot, s.expectancy, s.hit_rate, s.avg_rr,
@@ -366,20 +378,94 @@ class TradingAgent:
                     lines.append(f"  ... and {len(live) - 20} more")
 
             # ── Trade feedback summary ──────────────────────────
-            feedback = db.execute(
-                """SELECT COUNT(*) as cnt,
-                          AVG(execution_gap) as avg_gap,
-                          AVG(actual_pnl) as avg_pnl
+            feedback_rows = db.execute(
+                """SELECT simulated_return, actual_pnl, execution_gap
                    FROM trade_feedback
-                   WHERE ts > datetime('now', '-7 days')"""
-            ).fetchone()
+                   WHERE ts > datetime('now', '-7 days')
+                   ORDER BY ts DESC"""
+            ).fetchall()
 
-            if feedback and feedback["cnt"] > 0:
+            if feedback_rows:
+                feedback = {
+                    "cnt": len(feedback_rows),
+                    "avg_gap": sum(r["execution_gap"] or 0 for r in feedback_rows) / len(feedback_rows),
+                    "avg_pnl": sum(r["actual_pnl"] or 0 for r in feedback_rows) / len(feedback_rows),
+                }
+                sim_returns = [r["simulated_return"] for r in feedback_rows if r["simulated_return"] is not None]
+                actual_pnls = [r["actual_pnl"] for r in feedback_rows if r["actual_pnl"] is not None]
+                gaps = [r["execution_gap"] for r in feedback_rows if r["execution_gap"] is not None]
+
                 lines.append("")
                 lines.append("TRADE FEEDBACK (last 7 days):")
                 lines.append(f"  Matched trades: {feedback['cnt']}")
                 lines.append(f"  Avg actual P&L: ${feedback['avg_pnl']:.2f}")
                 lines.append(f"  Avg execution gap: {feedback['avg_gap']:+.3f}")
+                for line in (
+                    format_confidence_line("Simulated return", sim_returns, kind="pct"),
+                    format_confidence_line("Actual P&L", actual_pnls, kind="usd"),
+                    format_confidence_line("Execution gap metric", gaps),
+                ):
+                    if line:
+                        lines.append(line)
+
+                # Hypothesis: large persistent execution gap indicates slippage model drift
+                if feedback["cnt"] >= 5 and feedback["avg_gap"] is not None:
+                    gap = float(feedback["avg_gap"])
+                    if abs(gap) > 0.5:
+                        direction = "positive" if gap > 0 else "negative"
+                        self._emit_hypothesis(
+                            hypothesis_type="execution_gap",
+                            description=(
+                                f"Avg execution gap is {gap:+.3f} over last {feedback['cnt']} trades "
+                                f"({direction} drift) — simulated vs. actual diverging."
+                            ),
+                            suggested_action=(
+                                "Review slippage_preset settings in research/simulator.py. "
+                                "Consider adjusting slippage presets to reflect observed gaps."
+                            ),
+                            priority=4 if abs(gap) > 1.0 else 6,
+                        )
+
+            # ── Hypothesis: regime mismatch ─────────────────────
+            # If the current env regime is not well covered by any kept strategy, note it.
+            if env and rows:
+                vol_regime = env["volatility_regime"]
+                covered_types = set()
+                for row in rows:
+                    if row["llm_analysis"]:
+                        a = row["llm_analysis"].lower()
+                        for stype in ("momentum", "mean_reversion", "breakout", "options",
+                                      "scalp", "trend", "volatility"):
+                            if stype in a:
+                                covered_types.add(stype)
+                if vol_regime == "high" and "volatility" not in covered_types:
+                    self._emit_hypothesis(
+                        hypothesis_type="regime_mismatch",
+                        description=(
+                            f"High-volatility regime detected but no volatility-focused strategy "
+                            f"is currently kept. Covered types: {covered_types or 'unknown'}."
+                        ),
+                        suggested_action=(
+                            "Allocate a research slot to a volatility/options-centric strategy "
+                            "(straddles, strangles, or vol-breakout patterns) for the current regime."
+                        ),
+                        priority=5,
+                    )
+
+            # ── Hypothesis: no live signals ─────────────────────
+            if not live and rows:
+                self._emit_hypothesis(
+                    hypothesis_type="missed_opportunity",
+                    description=(
+                        "Research has kept strategies but no live signals were generated today. "
+                        "Possible causes: signal filters too strict, wrong market session, data lag."
+                    ),
+                    suggested_action=(
+                        "Lower entry threshold or widen scanning window. "
+                        "Check that candle data is flowing and RESEARCH_UNIVERSE symbols are liquid."
+                    ),
+                    priority=7,
+                )
 
             return "\n".join(lines) if len(lines) > 1 else None
         except Exception:
@@ -389,7 +475,6 @@ class TradingAgent:
         """Record a closed trade into the research memory DB."""
         try:
             from memory import get_db
-            from datetime import datetime, timezone
             db = get_db()
             db.execute(
                 """INSERT INTO trades (ts, symbol, side, pnl, held_minutes)
@@ -399,6 +484,52 @@ class TradingAgent:
             db.commit()
         except Exception as e:
             logger.debug(f"Failed to record trade: {e}")
+
+    def _emit_hypothesis(
+        self,
+        hypothesis_type: str,
+        description: str,
+        suggested_action: str,
+        priority: int = 5,
+        related_slot: int | None = None,
+        related_trade_id: int | None = None,
+    ) -> None:
+        """Write a self-improvement hypothesis to the trader_hypotheses table.
+
+        Deduplicates by skipping if an identical (type, description) hypothesis
+        was emitted within the last 6 hours.
+        """
+        try:
+            from memory import get_db
+            db = get_db()
+            cutoff = (datetime.now(timezone.utc) - timedelta(hours=6)).isoformat()
+            dup = db.execute(
+                """SELECT 1 FROM trader_hypotheses
+                   WHERE hypothesis_type = ? AND description = ? AND ts > ?
+                   LIMIT 1""",
+                (hypothesis_type, description, cutoff),
+            ).fetchone()
+            if dup:
+                return
+            db.execute(
+                """INSERT INTO trader_hypotheses
+                   (ts, source, hypothesis_type, description, suggested_action,
+                    priority, status, related_slot, related_trade_id, env_key, signed_fitness, kept)
+                   VALUES (?, 'trader_agent', ?, ?, ?, ?, 'open', ?, ?, NULL, NULL, 0)""",
+                (
+                    datetime.now(timezone.utc).isoformat(),
+                    hypothesis_type,
+                    description,
+                    suggested_action,
+                    priority,
+                    related_slot,
+                    related_trade_id,
+                ),
+            )
+            db.commit()
+            logger.debug(f"Hypothesis emitted: [{hypothesis_type}] {description[:80]}")
+        except Exception as exc:
+            logger.debug(f"Failed to emit hypothesis: {exc}")
 
     async def _build_state_context(self) -> str:
         """Build the complete dynamic state context for the agent.

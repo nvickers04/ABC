@@ -671,6 +671,14 @@ class DataProvider:
         date: Optional[str] = None,
         from_date: Optional[str] = None,
         to_date: Optional[str] = None,
+        # Server-side filters
+        delta: Optional[float] = None,
+        strike_limit: Optional[int] = None,
+        range_filter: Optional[str] = None,
+        min_bid: Optional[float] = None,
+        max_bid_ask_spread_pct: Optional[float] = None,
+        min_open_interest: Optional[int] = None,
+        min_volume: Optional[int] = None,
     ) -> Optional[OptionChain]:
         """
         Get options chain with Greeks and IV.
@@ -684,6 +692,13 @@ class DataProvider:
             date: Historical snapshot date (YYYY-MM-DD)
             from_date: Start of historical range (YYYY-MM-DD)
             to_date: End of historical range (YYYY-MM-DD)
+            delta: Server-side delta filter
+            strike_limit: Max strikes per expiration
+            range_filter: 'itm', 'otm', 'all'
+            min_bid: Minimum bid filter
+            max_bid_ask_spread_pct: Max bid-ask spread %
+            min_open_interest: Minimum OI filter
+            min_volume: Minimum volume filter
 
         Returns:
             OptionChain with contracts and source tracking
@@ -691,7 +706,9 @@ class DataProvider:
         cache_prefix = 'option_chain_hist' if (date or from_date or to_date) else 'option_chain'
         cache_key = (
             f"{cache_prefix}:{symbol.upper()}:{expiration or '*'}:{side or '*'}:"
-            f"{strike_range or '*'}:{dte_range or '*'}:{date or '*'}:{from_date or '*'}:{to_date or '*'}"
+            f"{strike_range or '*'}:{dte_range or '*'}:{date or '*'}:{from_date or '*'}:{to_date or '*'}:"
+            f"{delta or '*'}:{strike_limit or '*'}:{range_filter or '*'}:{min_bid or '*'}:"
+            f"{max_bid_ask_spread_pct or '*'}:{min_open_interest or '*'}:{min_volume or '*'}"
         )
         cached = self._get_cached(cache_key)
         if cached is not _CACHE_MISS:
@@ -708,6 +725,13 @@ class DataProvider:
                     date=date,
                     from_date=from_date,
                     to_date=to_date,
+                    delta=delta,
+                    strike_limit=strike_limit,
+                    range_filter=range_filter,
+                    min_bid=min_bid,
+                    max_bid_ask_spread_pct=max_bid_ask_spread_pct,
+                    min_open_interest=min_open_interest,
+                    min_volume=min_volume,
                 )
             )
 
@@ -1005,17 +1029,14 @@ class DataProvider:
             logger.warning(f"Failed to get fundamentals for {symbol}: {e}")
             return None
 
-    # ==================== EARNINGS ====================
+    # ==================== EARNINGS (MDA) ====================
 
     def get_earnings_info(self, symbol: str) -> Optional[EarningsInfo]:
         """
-        Get earnings calendar information for a symbol.
+        Get earnings calendar information via MarketData.app.
 
-        Args:
-            symbol: Stock ticker
-
-        Returns:
-            EarningsInfo with next earnings date and days until
+        Fetches the most recent + upcoming earnings report and derives
+        next_earnings_date / days_until_earnings from reportDate.
         """
         cache_key = f"earnings:{symbol}"
         cached = self._get_cached(cache_key)
@@ -1023,62 +1044,73 @@ class DataProvider:
             return cached
 
         try:
-            import yfinance as yf
+            data = self._run_async(self._mda_client.get_earnings(symbol, countback=4))
+            if not data or not data.get("earnings"):
+                return None
 
-            ticker = yf.Ticker(symbol)
-            calendar = ticker.calendar
-
+            now = datetime.now()
             earnings_date = None
-            
-            # yfinance returns dict in newer versions, DataFrame in older
-            if isinstance(calendar, dict):
-                # Dict format: {'Earnings Date': [Timestamp, ...], ...}
-                earnings_dates = calendar.get('Earnings Date')
-                if not earnings_dates:
-                    # Also try lowercase or alternate keys
-                    earnings_dates = calendar.get('earnings_date') or calendar.get('Earnings Dates')
-                if earnings_dates:
-                    raw = earnings_dates[0] if isinstance(earnings_dates, list) else earnings_dates
-                    if hasattr(raw, 'to_pydatetime'):
-                        earnings_date = raw.to_pydatetime()
-                    elif isinstance(raw, str):
-                        from dateutil.parser import parse as dateparse
-                        earnings_date = dateparse(raw)
-                    else:
-                        earnings_date = raw
-            elif calendar is not None and hasattr(calendar, 'empty') and not calendar.empty:
-                # DataFrame format (older yfinance)
-                if 'Earnings Date' in calendar.index:
-                    earnings_date = calendar.loc['Earnings Date'].iloc[0]
-                    if hasattr(earnings_date, 'to_pydatetime'):
-                        earnings_date = earnings_date.to_pydatetime()
-
             days_until = None
-            if earnings_date:
-                # Normalize: earnings_date may be date or datetime
-                import datetime as dt_module
-                if isinstance(earnings_date, dt_module.datetime):
-                    days_until = (earnings_date - datetime.now()).days
-                elif isinstance(earnings_date, dt_module.date):
-                    days_until = (earnings_date - datetime.now().date()).days
-                else:
-                    # Last resort: try string conversion
+
+            # Find the nearest future report_date
+            for rec in data["earnings"]:
+                rd = rec.get("report_date")
+                if rd is None:
+                    continue
+                # report_date is a unix timestamp
+                try:
+                    dt = datetime.utcfromtimestamp(int(rd))
+                except (ValueError, TypeError, OSError):
+                    continue
+                if dt >= now:
+                    earnings_date = dt
+                    days_until = (dt.date() - now.date()).days
+                    break
+
+            # If no future date found, use the most recent as reference
+            if earnings_date is None and data["earnings"]:
+                rd = data["earnings"][-1].get("report_date")
+                if rd is not None:
                     try:
-                        days_until = (earnings_date - datetime.now()).days
-                    except TypeError:
-                        days_until = None
+                        dt = datetime.utcfromtimestamp(int(rd))
+                        earnings_date = dt
+                        days_until = (dt.date() - now.date()).days
+                    except (ValueError, TypeError, OSError):
+                        pass
 
             result = EarningsInfo(
                 symbol=symbol,
                 next_earnings_date=earnings_date,
                 days_until_earnings=days_until,
-                source='yfinance'
+                source='marketdata',
             )
             self._set_cached(cache_key, result)
             return result
 
         except Exception as e:
             logger.debug(f"Failed to get earnings for {symbol}: {e}")
+            return None
+
+    def get_earnings_history(self, symbol: str, countback: int = 8) -> Optional[list]:
+        """
+        Get historical earnings records (EPS, surprise, report dates) via MDA.
+
+        Returns list of dicts with fiscal_year, fiscal_quarter, reported_eps,
+        estimated_eps, surprise_eps, surprise_eps_pct, report_date, report_time.
+        """
+        cache_key = f"earnings_hist:{symbol}:{countback}"
+        cached = self._get_cached(cache_key)
+        if cached is not _CACHE_MISS:
+            return cached
+
+        try:
+            data = self._run_async(self._mda_client.get_earnings(symbol, countback=countback))
+            if not data or not data.get("earnings"):
+                return None
+            self._set_cached(cache_key, data["earnings"])
+            return data["earnings"]
+        except Exception as e:
+            logger.debug(f"Failed to get earnings history for {symbol}: {e}")
             return None
 
     def get_sector(self, symbol: str) -> Optional[str]:
@@ -1340,7 +1372,7 @@ class DataProvider:
 
     def get_news(self, symbol: str) -> Optional[NewsData]:
         """
-        Get recent news and basic sentiment.
+        Get recent news and basic sentiment via MarketData.app.
         """
         cache_key = f"news:{symbol}"
         cached = self._get_cached(cache_key)
@@ -1348,40 +1380,35 @@ class DataProvider:
             return cached
 
         try:
-            import yfinance as yf
-            ticker = yf.Ticker(symbol)
+            data = self._run_async(self._mda_client.get_news(symbol, countback=10))
+            if not data or not data.get("articles"):
+                return None
+
+            positive_words = ['surge', 'jump', 'rise', 'gain', 'beat', 'strong', 'upgrade', 'buy']
+            negative_words = ['fall', 'drop', 'decline', 'miss', 'weak', 'downgrade', 'sell', 'crash']
 
             items = []
-            sentiment = 'neutral'
+            all_titles = []
+            for article in data["articles"]:
+                headline = article.get("headline") or ""
+                items.append(NewsItem(
+                    title=headline[:200],
+                    publisher=None,  # MDA doesn't provide publisher name
+                    link=article.get("source"),
+                    timestamp=article.get("publication_date"),
+                ))
+                all_titles.append(headline.lower())
 
-            try:
-                news = ticker.news
-                if news:
-                    positive_words = ['surge', 'jump', 'rise', 'gain', 'beat', 'strong', 'upgrade', 'buy']
-                    negative_words = ['fall', 'drop', 'decline', 'miss', 'weak', 'downgrade', 'sell', 'crash']
-
-                    all_titles = []
-                    for item in news[:10]:
-                        title = item.get('title', '')
-                        items.append(NewsItem(
-                            title=title[:200],
-                            publisher=item.get('publisher'),
-                            link=item.get('link'),
-                            timestamp=item.get('providerPublishTime'),
-                        ))
-                        all_titles.append(title.lower())
-
-                    combined = ' '.join(all_titles)
-                    pos_count = sum(1 for w in positive_words if w in combined)
-                    neg_count = sum(1 for w in negative_words if w in combined)
-                    sentiment = 'positive' if pos_count > neg_count else 'negative' if neg_count > pos_count else 'neutral'
-            except Exception:
-                pass
+            combined = ' '.join(all_titles)
+            pos_count = sum(1 for w in positive_words if w in combined)
+            neg_count = sum(1 for w in negative_words if w in combined)
+            sentiment = 'positive' if pos_count > neg_count else 'negative' if neg_count > pos_count else 'neutral'
 
             result = NewsData(
                 symbol=symbol,
                 items=items,
                 sentiment=sentiment,
+                source='marketdata',
             )
             self._set_cached(cache_key, result)
             return result
@@ -1394,7 +1421,7 @@ class DataProvider:
         """
         Compare symbol performance to sector peers.
 
-        Uses sector ETFs to measure relative performance over 20 days.
+        Uses yfinance for sector identification, MDA daily candles for performance.
         """
         cache_key = f"peer:{symbol}"
         cached = self._get_cached(cache_key)
@@ -1402,16 +1429,13 @@ class DataProvider:
             return cached
 
         try:
-            import yfinance as yf
-
-            ticker = yf.Ticker(symbol)
-            info = ticker.info
-            sector = info.get('sector')
+            # Sector lookup still from yfinance (MDA has no fundamentals)
+            fundamentals = self.get_fundamentals(symbol)
+            sector = fundamentals.sector if fundamentals else None
 
             if not sector:
                 return PeerComparison(symbol=symbol)
 
-            # Sector ETF mapping
             SECTOR_ETFS = {
                 'Technology': 'XLK',
                 'Healthcare': 'XLV',
@@ -1430,25 +1454,29 @@ class DataProvider:
             if not sector_etf:
                 return PeerComparison(symbol=symbol, sector=sector)
 
-            # Compare 20-day performance
-            symbol_data = yf.download(symbol, period='1mo', progress=False)
-            etf_data = yf.download(sector_etf, period='1mo', progress=False)
+            # Fetch 20-day daily candles from MDA for both symbol and sector ETF
+            from_date = (datetime.now() - timedelta(days=35)).strftime('%Y-%m-%d')
+            to_date = datetime.now().strftime('%Y-%m-%d')
 
-            if symbol_data.empty or etf_data.empty:
+            sym_candles = self.get_candles(symbol, resolution='D', from_date=from_date, to_date=to_date)
+            etf_candles = self.get_candles(sector_etf, resolution='D', from_date=from_date, to_date=to_date)
+
+            if not sym_candles or not etf_candles or len(sym_candles) < 2 or len(etf_candles) < 2:
                 return PeerComparison(symbol=symbol, sector=sector, sector_etf=sector_etf)
 
-            symbol_return = (symbol_data['Close'].iloc[-1] / symbol_data['Close'].iloc[0] - 1) * 100
-            sector_return = (etf_data['Close'].iloc[-1] / etf_data['Close'].iloc[0] - 1) * 100
-            vs_sector = symbol_return - sector_return
+            sym_return = (sym_candles.close[-1] / sym_candles.close[0] - 1) * 100
+            etf_return = (etf_candles.close[-1] / etf_candles.close[0] - 1) * 100
+            vs_sector = sym_return - etf_return
 
             result = PeerComparison(
                 symbol=symbol,
                 sector=sector,
                 sector_etf=sector_etf,
-                symbol_return_20d=round(float(symbol_return), 2),
-                sector_return_20d=round(float(sector_return), 2),
+                symbol_return_20d=round(float(sym_return), 2),
+                sector_return_20d=round(float(etf_return), 2),
                 vs_sector=round(float(vs_sector), 2),
                 outperforming_sector=vs_sector > 0,
+                source='marketdata',
             )
             self._set_cached(cache_key, result)
             return result

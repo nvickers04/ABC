@@ -23,6 +23,8 @@ from typing import Dict, Any, List, Optional, Tuple
 from ib_insync import Order, Option, ComboLeg, Contract
 from ib_insync.contract import Stock
 
+from data.data_provider import get_data_provider
+
 logger = logging.getLogger(__name__)
 
 
@@ -139,6 +141,14 @@ class IBKROptionsMixin:
             # Check for immediate broker rejection
             rejection = await self._check_order_rejection(trade, strategy_name, symbol)
             if rejection:
+                err_msg = rejection.get('error', '')
+                # Error 201 (Guaranteed-to-Lose) is common on paper combos — hint single-leg alternative
+                if '201' in str(err_msg) or 'guaranteed' in str(err_msg).lower():
+                    rejection['hint'] = (
+                        f'Paper account rejected this combo. Try placing legs individually: '
+                        f'buy_option for the long leg, then sell via close_option for the short leg.'
+                    )
+                    logger.warning(f"{strategy_name} combo rejected (201) for {symbol} — suggest single-leg fallback")
                 return rejection
 
             strikes_str = '/'.join(str(s) for s, _, _, _ in strikes_rights_actions)
@@ -280,10 +290,26 @@ class IBKROptionsMixin:
         spread_type = 'Bull' if long_strike < short_strike else 'Bear'
         strategy = f"{spread_type} {'Call' if right == 'C' else 'Put'} Spread"
 
+        # Credit spreads (bear call, bull put) use SELL combo; debit use BUY
+        is_credit = (
+            (right == 'C' and long_strike > short_strike) or
+            (right == 'P' and long_strike < short_strike)
+        )
+        combo_action = 'SELL' if is_credit else 'BUY'
+
+        # Avoid Guaranteed-to-Lose rejections (Error 201) by ensuring reasonable prices
+        width = abs(long_strike - short_strike)
+        if limit_price is None:
+            limit_price = round(width * 0.3, 2) if is_credit else round(width * 0.6, 2)
+        elif is_credit and limit_price < 0.05:
+            limit_price = 0.05  # min credit to avoid rejection
+        elif not is_credit and limit_price > width - 0.05:
+            limit_price = round(width * 0.5, 2)
+
         result = await self._place_combo_order(
             symbol, expiration,
             [(long_strike, right, 'BUY', 1), (short_strike, right, 'SELL', 1)],
-            quantity, 'BUY', limit_price, strategy
+            quantity, combo_action, limit_price, strategy
         )
         if 'success' in result:
             result.update({'long_strike': long_strike, 'short_strike': short_strike, 'right': right})
@@ -727,18 +753,22 @@ class IBKROptionsMixin:
             action = 'SELL' if current_qty > 0 else 'BUY'
             close_qty = quantity or abs(current_qty)
 
-            # Auto-calculate midpoint if no limit_price provided
+            # Use external market data app (user subscription) for safe limit price to avoid wide MKT fills + IBKR subscription errors
             if limit_price is None:
                 try:
-                    ticker = self.ib.reqMktData(contract, '', snapshot=True, regulatorySnapshot=False)
-                    await asyncio.sleep(1)  # Wait for snapshot data
-                    if ticker.bid and ticker.bid > 0 and ticker.ask and ticker.ask > 0:
-                        limit_price = round((ticker.bid + ticker.ask) / 2, 2)
-                        logger.info(f"Auto midpoint for {symbol} {contract.strike}{contract.right}: "
-                                   f"bid={ticker.bid} ask={ticker.ask} mid={limit_price}")
-                    self.ib.cancelMktData(contract)
+                    provider = get_data_provider()
+                    chain = provider.get_option_chain(symbol, min_dte=0, max_dte=7)
+                    if chain and chain.contracts:
+                        side = 'call' if right.upper() == 'C' else 'put'
+                        matching = [c for c in chain.contracts if abs(c.strike - strike) < 0.01 and c.side == side]
+                        if matching:
+                            c = matching[0]
+                            limit_price = c.mid or c.last or (c.bid + c.ask) / 2 if c.bid and c.ask else None
+                            logger.info(f"External mid for close {symbol} {strike}{right}: {limit_price}")
                 except Exception as e:
-                    logger.debug(f"Could not get midpoint for {symbol}, falling back to MKT: {e}")
+                    logger.debug(f"External price fallback failed for {symbol}: {e}")
+                if not limit_price:
+                    limit_price = None  # MKT fallback only as last resort
 
             # Create order
             order = Order()

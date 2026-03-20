@@ -281,14 +281,31 @@ def _load_strategy_module(source: str):
     return mod
 
 
-def _execute_strategy(source: str, candles: pd.DataFrame, symbol: str) -> list[dict]:
-    """Execute strategy.scan() in sandbox. Returns signals or empty list."""
+def _execute_strategy(
+    source: str,
+    candles: pd.DataFrame,
+    symbol: str,
+    env: dict | None = None,
+) -> list[dict]:
+    """Execute strategy.scan() in sandbox. Returns signals or empty list.
+
+    If the strategy's scan() accepts a third `env` parameter it receives
+    a dict with regime/environment data (volatility_regime, trend_regime, etc.).
+    Strategies that only accept (candles, symbol) continue to work unchanged.
+    """
     try:
         mod = _load_strategy_module(source)
         scan_fn = getattr(mod, "scan", None)
         if scan_fn is None:
             return []
-        signals = scan_fn(candles, symbol)
+        # Try 3-arg call first (candles, symbol, env); fall back to 2-arg
+        if env is not None:
+            try:
+                signals = scan_fn(candles, symbol, env)
+            except TypeError:
+                signals = scan_fn(candles, symbol)
+        else:
+            signals = scan_fn(candles, symbol)
         if not isinstance(signals, list):
             return []
         return signals
@@ -337,7 +354,8 @@ def _evaluate_strategy(
 
     for sym, days in universe.items():
         for day_str, day_df in days.items():
-            signals = _execute_strategy(source, day_df, sym)
+            day_env = env_by_date.get(day_str, {})
+            signals = _execute_strategy(source, day_df, sym, env=day_env)
             if not signals:
                 continue
             # Deduplicate overlapping signals per symbol/day
@@ -345,8 +363,6 @@ def _evaluate_strategy(
             sim_results = simulate(signals, day_df, slippage_preset=slippage)
             if not sim_results:
                 continue
-
-            day_env = env_by_date.get(day_str, {})
 
             # Tag with symbol and date
             for r in sim_results:
@@ -383,7 +399,7 @@ async def _call_llm(
     """Unified LLM call helper to reduce duplication across analyze/propose/selector.
 
     Centralizes client setup, async sampling, and cost tracking.
-    Returns the full response object.
+    Returns response.content (str) for compatibility with callers.
     """
     llm = get_grok_llm()
     chat = llm.client.chat.create(
@@ -403,7 +419,7 @@ async def _call_llm(
         purpose=purpose,
     )
 
-    return response
+    return response.content
 
 
 async def _llm_analyze(

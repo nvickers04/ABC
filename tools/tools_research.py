@@ -164,30 +164,26 @@ async def handle_candles(executor, params: dict) -> Any:
         
         candles = executor.data_provider.get_candles(symbol, resolution=resolution, days_back=days)
         if candles and len(candles) > 0:
-            candle_list = []
             n = len(candles)
+            dates = []
             for i in range(n):
                 ts = candles.timestamps[i]
                 if resolution == 'D':
-                    dt = datetime.datetime.fromtimestamp(ts).strftime('%Y-%m-%d') if ts else ''
+                    dates.append(datetime.datetime.fromtimestamp(ts).strftime('%Y-%m-%d') if ts else '')
                 else:
-                    dt = datetime.datetime.fromtimestamp(ts).strftime('%Y-%m-%d %H:%M') if ts else ''
-                candle_list.append({
-                    "date": dt,
-                    "open": round(candles.open[i], 2),
-                    "high": round(candles.high[i], 2),
-                    "low": round(candles.low[i], 2),
-                    "close": round(candles.close[i], 2),
-                    "volume": candles.volume[i]
-                })
+                    dates.append(datetime.datetime.fromtimestamp(ts).strftime('%Y-%m-%d %H:%M') if ts else '')
             return {
                 "symbol": symbol,
                 "resolution": valid_resolutions[resolution],
                 "bars": n,
                 "is_realtime": True,
                 "data_warning": None,
-                "timestamp": datetime.datetime.utcnow().strftime('%Y-%m-%dT%H:%M:%SZ'),
-                "candles": candle_list
+                "dates": dates,
+                "open": [round(candles.open[i], 2) for i in range(n)],
+                "high": [round(candles.high[i], 2) for i in range(n)],
+                "low": [round(candles.low[i], 2) for i in range(n)],
+                "close": [round(candles.close[i], 2) for i in range(n)],
+                "volume": [candles.volume[i] for i in range(n)],
             }
         return {"error": f"No candle data for {symbol}"}
     except Exception as e:
@@ -436,6 +432,279 @@ async def handle_economic_calendar(executor, params: dict) -> Any:
         return {"today": [], "upcoming_3d": [], "count_today": 0, "count_upcoming": 0, "warning": str(e)}
 
 
+# ── Briefing tool (hierarchical drill-down) ─────────────────────
+
+
+def _query_briefing_data() -> dict:
+    """Query all briefing data from research DB. Returns raw sections dict."""
+    try:
+        from memory import get_db
+        db = get_db()
+    except Exception:
+        return {}
+
+    result: dict = {}
+
+    # Environment
+    try:
+        env = db.execute(
+            """SELECT volatility_regime, trend_regime, breadth_regime,
+                      momentum_regime, volume_regime, avg_atr_pct,
+                      dispersion, strategy_fit_json
+               FROM environment_snapshots
+               ORDER BY id DESC LIMIT 1"""
+        ).fetchone()
+        if env:
+            result["env"] = dict(env)
+    except Exception:
+        pass
+
+    # Strategy slots
+    try:
+        rows = db.execute(
+            """SELECT s.id, s.slot, s.expectancy, s.hit_rate, s.avg_rr,
+                      s.total_signals, s.llm_analysis
+               FROM strategies s
+               INNER JOIN (
+                   SELECT slot, MAX(expectancy) as max_exp
+                   FROM strategies WHERE kept = 1
+                   GROUP BY slot
+               ) best ON s.slot = best.slot AND s.expectancy = best.max_exp
+               WHERE s.kept = 1
+               ORDER BY s.expectancy DESC"""
+        ).fetchall()
+        if rows:
+            result["strategies"] = [dict(r) for r in rows]
+    except Exception:
+        pass
+
+    # Live signals
+    try:
+        live = db.execute(
+            """SELECT ls.slot, ls.symbol, ls.direction, ls.order_type,
+                      ls.setup_type, ls.entry_price, ls.target_price,
+                      ls.stop_price, ls.legs_json,
+                      s.expectancy as slot_exp, s.hit_rate as slot_hit
+               FROM live_signals ls
+               LEFT JOIN strategies s ON s.id = ls.strategy_id
+               ORDER BY s.expectancy DESC, ls.slot, ls.symbol"""
+        ).fetchall()
+        if live:
+            result["signals"] = [dict(s) for s in live]
+    except Exception:
+        pass
+
+    # Feedback
+    try:
+        feedback_rows = db.execute(
+            """SELECT simulated_return, actual_pnl, execution_gap
+               FROM trade_feedback
+               WHERE ts > datetime('now', '-7 days')
+               ORDER BY ts DESC"""
+        ).fetchall()
+        if feedback_rows:
+            result["feedback"] = [dict(r) for r in feedback_rows]
+    except Exception:
+        pass
+
+    return result
+
+
+def _briefing_summary(data: dict) -> dict:
+    """Compact 3-5 line summary: regime, slot count, top signals, feedback 1-liner."""
+    env = data.get("env")
+    strategies = data.get("strategies", [])
+    signals = data.get("signals", [])
+    feedback = data.get("feedback", [])
+
+    regime = "unknown"
+    if env:
+        regime = f"{env.get('volatility_regime','?')}/{env.get('trend_regime','?')}"
+
+    top_signals = []
+    for sig in signals[:5]:
+        conf = "H" if (sig.get("slot_exp") or 0) > 0.003 else "M" if (sig.get("slot_exp") or 0) > 0 else "L"
+        top_signals.append(f"{sig['symbol']} {sig['direction']} [{conf}]")
+
+    fb_line = None
+    if feedback:
+        avg_pnl = sum(r.get("actual_pnl") or 0 for r in feedback) / len(feedback)
+        fb_line = f"{len(feedback)} trades, avg P&L ${avg_pnl:.2f}"
+
+    return {
+        "regime": regime,
+        "active_slots": len(strategies),
+        "live_signals": len(signals),
+        "top_signals": top_signals,
+        "feedback": fb_line,
+        "detail_options": ["signals", "strategies", "feedback", "environment"],
+    }
+
+
+def _briefing_signals(data: dict) -> dict:
+    """Full live signals list with entry/target/stop/R:R/legs."""
+    import json as _json
+    signals = data.get("signals", [])
+    out = []
+    for sig in signals[:30]:
+        rr = None
+        if sig.get("entry_price") and sig.get("target_price") and sig.get("stop_price"):
+            risk = abs(sig["entry_price"] - sig["stop_price"])
+            reward = abs(sig["target_price"] - sig["entry_price"])
+            if risk > 0:
+                rr = round(reward / risk, 1)
+        legs = None
+        if sig.get("legs_json"):
+            try:
+                ld = _json.loads(sig["legs_json"]) if isinstance(sig["legs_json"], str) else sig["legs_json"]
+                legs = ld.get("strategy")
+            except Exception:
+                pass
+        out.append({
+            "slot": sig.get("slot"),
+            "symbol": sig.get("symbol"),
+            "dir": sig.get("direction"),
+            "type": sig.get("order_type"),
+            "entry": sig.get("entry_price"),
+            "target": sig.get("target_price"),
+            "stop": sig.get("stop_price"),
+            "rr": rr,
+            "legs": legs,
+            "setup": sig.get("setup_type"),
+        })
+    return {"signals": out, "count": len(signals)}
+
+
+def _briefing_strategies(data: dict) -> dict:
+    """Full strategy slot table."""
+    strategies = data.get("strategies", [])
+    out = []
+    for row in strategies:
+        entry = {
+            "slot": row.get("slot"),
+            "id": row.get("id"),
+            "exp": row.get("expectancy"),
+            "hit": row.get("hit_rate"),
+            "rr": row.get("avg_rr"),
+            "sigs": row.get("total_signals"),
+        }
+        if row.get("llm_analysis"):
+            entry["insight"] = row["llm_analysis"][:200].replace("\n", " ")
+        out.append(entry)
+    return {"strategies": out, "count": len(strategies)}
+
+
+def _briefing_feedback(data: dict) -> dict:
+    """Full trade feedback with stats."""
+    from research.simulator import compute_sample_confidence, format_confidence_line
+    feedback = data.get("feedback", [])
+    if not feedback:
+        return {"feedback": "No trade feedback in last 7 days"}
+
+    avg_gap = sum(r.get("execution_gap") or 0 for r in feedback) / len(feedback)
+    avg_pnl = sum(r.get("actual_pnl") or 0 for r in feedback) / len(feedback)
+    sim_returns = [r["simulated_return"] for r in feedback if r.get("simulated_return") is not None]
+    actual_pnls = [r["actual_pnl"] for r in feedback if r.get("actual_pnl") is not None]
+    gaps = [r["execution_gap"] for r in feedback if r.get("execution_gap") is not None]
+
+    result: dict = {
+        "trades": len(feedback),
+        "avg_pnl": round(avg_pnl, 2),
+        "avg_gap": round(avg_gap, 3),
+    }
+    for label, vals, kind in [
+        ("sim_return_ci", sim_returns, "pct"),
+        ("actual_pnl_ci", actual_pnls, "usd"),
+        ("gap_ci", gaps, None),
+    ]:
+        line = format_confidence_line(label, vals, kind=kind)
+        if line:
+            result[label] = line
+    return result
+
+
+def _briefing_environment(data: dict) -> dict:
+    """Full environment regimes, fit scores, history."""
+    import json as _json
+    env = data.get("env")
+    if not env:
+        return {"environment": "No environment data"}
+
+    result = {
+        "volatility": env.get("volatility_regime"),
+        "trend": env.get("trend_regime"),
+        "breadth": env.get("breadth_regime"),
+        "momentum": env.get("momentum_regime"),
+        "volume": env.get("volume_regime"),
+        "atr_pct": env.get("avg_atr_pct"),
+        "dispersion": env.get("dispersion"),
+    }
+    try:
+        fit = _json.loads(env["strategy_fit_json"]) if env.get("strategy_fit_json") else {}
+        if fit:
+            result["strategy_fit"] = {k: round(v, 2) for k, v in sorted(fit.items(), key=lambda x: -x[1])[:8]}
+    except Exception:
+        pass
+
+    try:
+        from research.agent import _get_env_slot_history
+        history = _get_env_slot_history()
+        if history and len(history) > 20:
+            result["history"] = history[:600]
+    except Exception:
+        pass
+
+    return result
+
+
+async def handle_briefing(executor, params: dict) -> Any:
+    """Hierarchical research briefing tool.
+    
+    detail=None or "summary" -> compact overview (~100 tokens)
+    detail="signals"         -> full live signals
+    detail="strategies"      -> full strategy slots
+    detail="feedback"        -> trade feedback stats
+    detail="environment"     -> full regimes + fit scores + history
+    """
+    detail = params.get("detail", "summary")
+    data = _query_briefing_data()
+    if not data:
+        return {"briefing": "No research data available yet. Run research pipeline first."}
+
+    if detail == "signals":
+        return _briefing_signals(data)
+    elif detail == "strategies":
+        return _briefing_strategies(data)
+    elif detail == "feedback":
+        return _briefing_feedback(data)
+    elif detail == "environment":
+        return _briefing_environment(data)
+    else:
+        return _briefing_summary(data)
+
+
+async def handle_prior_research(executor, params: dict) -> Any:
+    """Return the agent's cached research results for reuse."""
+    agent = getattr(executor, '_agent', None)
+    if agent is None:
+        return {"prior_research": [], "note": "No research cache available"}
+
+    cache = getattr(agent, '_research_results', {})
+    if not cache:
+        return {"prior_research": [], "note": "No prior research cached this session"}
+
+    entries = []
+    for query, entry in cache.items():
+        entries.append({
+            "query": query,
+            "summary": entry.get("summary", "")[:600],
+            "time": entry.get("ts", "?"),
+            "category": entry.get("category", "?"),
+        })
+
+    return {"prior_research": entries, "count": len(entries)}
+
+
 HANDLERS = {
     "quote": handle_quote,
     "candles": handle_candles,
@@ -452,4 +721,6 @@ HANDLERS = {
     "market_hours": handle_market_hours,
     "budget": handle_budget,
     "economic_calendar": handle_economic_calendar,
+    "briefing": handle_briefing,
+    "prior_research": handle_prior_research,
 }

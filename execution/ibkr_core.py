@@ -28,6 +28,8 @@ from concurrent.futures import ThreadPoolExecutor
 from ib_insync import IB, Order, Trade, Fill
 from ib_insync.contract import Stock, Option
 
+from execution.ibkr_utils import is_live_trading
+
 from execution.ibkr_utils import resolve_ibkr_endpoint
 from execution.order_types import IBKROrderType
 
@@ -218,6 +220,7 @@ class IBKRConnector(IBKROrdersMixin, IBKROptionsMixin, IBKRQueriesMixin):
         self._disconnect_handler = self._on_disconnect
         self._execution_handler = self._on_execution
         self._order_status_handler = self._on_order_status
+        self._error_handler = self._on_error
 
         # Register event handlers
         self._register_handlers()
@@ -230,6 +233,7 @@ class IBKRConnector(IBKROrdersMixin, IBKROptionsMixin, IBKRQueriesMixin):
         self.ib.disconnectedEvent += self._disconnect_handler
         self.ib.execDetailsEvent += self._execution_handler
         self.ib.orderStatusEvent += self._order_status_handler
+        self.ib.errorEvent += self._error_handler
 
     def is_connected(self) -> bool:
         """Check if connected to IBKR TWS/Gateway."""
@@ -303,6 +307,34 @@ class IBKRConnector(IBKROrdersMixin, IBKROptionsMixin, IBKRQueriesMixin):
             self.ib.orderStatusEvent -= self._order_status_handler
         except Exception:
             pass
+        try:
+            self.ib.errorEvent -= self._error_handler
+        except Exception:
+            pass
+
+    # ── Noisy IBKR error codes to suppress (log at DEBUG instead of WARNING) ──
+    _SUPPRESSED_ERROR_CODES = {
+        10168,  # Market data subscription not found (no IBKR data entitlement — we use external)
+        10147,  # OrderId not found (stale cancel on old/filled orders)
+        2104,   # Market data farm connection is OK
+        2106,   # HMDS data farm connection is OK
+        2158,   # Sec-def data farm connection is OK
+    }
+
+    def _on_error(self, reqId: int, errorCode: int, errorString: str, contract: str) -> None:
+        """Handle IBKR error/warning events. Suppress noisy codes to DEBUG."""
+        if errorCode in self._SUPPRESSED_ERROR_CODES:
+            logger.debug(f"IBKR [{errorCode}] reqId={reqId}: {errorString}")
+        elif errorCode == 202:  # Order cancelled — check attribution
+            attr = self.get_cancel_attribution(reqId)
+            if attr.get('kind') == 'self_cancel':
+                logger.debug(f"IBKR [202] self-cancel confirmed: order {reqId}")
+            else:
+                logger.warning(f"IBKR [202] broker-cancel: order {reqId} — {errorString}")
+        elif errorCode in (201, 10198):
+            logger.warning(f"IBKR [{errorCode}] order rejected reqId={reqId}: {errorString}")
+        else:
+            logger.info(f"IBKR [{errorCode}] reqId={reqId}: {errorString}")
 
     def _on_disconnect(self) -> None:
         """Handle disconnection from TWS."""
@@ -441,9 +473,20 @@ class IBKRConnector(IBKROrdersMixin, IBKROptionsMixin, IBKRQueriesMixin):
                         self._connected = True
                         self.client_id = current_client_id  # Store the working client ID
 
-                        # Force live (real-time) market data — paper accounts have it free
-                        self.ib.reqMarketDataType(1)
-                        logger.info("Market data type set to LIVE (1)")
+                        # Purge stale order tracking from prior session (prevents 10147)
+                        with self._order_state_lock:
+                            self._order_states.clear()
+                            self._bracket_groups.clear()
+                        with self._local_cancel_lock:
+                            self._local_cancel_requests.clear()
+                        logger.debug("Cleared stale order tracking on reconnect")
+
+                        # Always use LIVE data (type 1) per user preference — they have
+                        # active subscription to market data app for real-time live data
+                        # (no extra cost, better than delayed)
+                        data_type = 1
+                        self.ib.reqMarketDataType(data_type)
+                        logger.info(f"Market data type set to LIVE ({data_type})")
 
                         # Get account ID
                         accounts = self.ib.managedAccounts()
@@ -513,7 +556,8 @@ class IBKRConnector(IBKROrdersMixin, IBKROptionsMixin, IBKRQueriesMixin):
                     self.day_trades_remaining = int(float(av.value))
 
             if self.available_funds > 0 or self.net_liquidation > 0:
-                logger.info(f"Account values - Available: ${self.available_funds:,.2f}, Cash: ${self.cash_value:,.2f}, Net Liq: ${self.net_liquidation:,.2f}, Day Trades: {self.day_trades_remaining}")
+                pdt_display = "Unlimited" if self.day_trades_remaining == -1 else self.day_trades_remaining
+                logger.info(f"Account values - Available: ${self.available_funds:,.2f}, Cash: ${self.cash_value:,.2f}, Net Liq: ${self.net_liquidation:,.2f}, Day Trades: {pdt_display}")
             else:
                 # If still zero, request subscription
                 self.ib.reqAccountUpdates(subscribe=True, account=self.account_id)

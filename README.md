@@ -116,11 +116,11 @@ TRADING_MODE=live python __main__.py
 
 ## Model
 
-Using **Grok 4.20 Beta** via the native xAI SDK (`xai-sdk >= 1.8.0`).
+Using **Grok 4.20 0309 Reasoning** via the native xAI SDK (`xai-sdk >= 1.8.0`).
 
 | Slug | Role |
 |------|------|
-| `grok-4.20-experimental-beta-0304-reasoning` | Single-agent ReAct trading loop (client-side tools) |
+| `grok-4.20-0309-reasoning` | Single-agent ReAct trading loop (client-side tools) |
 | `grok-4.20-multi-agent-experimental-beta-0304` | Multi-agent research swarm (built-in web_search/x_search only) |
 
 Model slugs are beta and may change without notice. Update in `core/grok_llm.py`.

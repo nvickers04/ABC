@@ -531,8 +531,13 @@ class ToolExecutor:
         return None
 
     def _standardize_tool_payload(self, result: Any) -> dict:
-        """Normalize all tool outputs to the 4.20-ready envelope shape."""
+        """Normalize all tool outputs to a flat envelope shape.
+        
+        Keys 'success', 'error', 'is_realtime', 'data_warning' are envelope metadata.
+        All other keys from the handler result are merged at top level (no 'data' wrapper).
+        """
         if isinstance(result, dict):
+            # Already a full envelope — pass through
             if all(k in result for k in ("success", "data", "error", "is_realtime", "data_warning")):
                 payload = dict(result)
                 payload["success"] = bool(payload.get("success"))
@@ -542,31 +547,27 @@ class ToolExecutor:
 
             error_text = result.get("error")
             success = bool(result.get("success")) if "success" in result else (error_text is None)
-            is_realtime = bool(result.get("is_realtime", False))
-            data_warning = result.get("data_warning")
+            is_realtime = bool(result.pop("is_realtime", False)) if isinstance(result, dict) else False
+            data_warning = result.pop("data_warning", None) if isinstance(result, dict) else None
 
-            if "data" in result:
-                data = result.get("data")
-            elif error_text is None:
-                data = result
-            else:
-                extra = {k: v for k, v in result.items() if k not in {"error", "success", "is_realtime", "data_warning"}}
-                data = extra if extra else None
-
-            return {
+            # Flat merge: envelope keys + all handler keys at top level
+            payload = {
                 "success": success,
-                "data": data,
                 "error": str(error_text) if error_text is not None else None,
                 "is_realtime": is_realtime,
                 "data_warning": data_warning,
             }
+            for k, v in result.items():
+                if k not in payload:
+                    payload[k] = v
+            return payload
 
         return {
             "success": True,
-            "data": result,
             "error": None,
             "is_realtime": False,
             "data_warning": None,
+            "data": result,
         }
 
     def _plan_order(
@@ -1587,7 +1588,7 @@ class ToolExecutor:
                 err = {"error": f"Unknown action: {action}", "valid_actions": get_valid_actions()[:25]}
                 return ToolResult(
                     action=action, data=err, success=False,
-                    raw_json=json.dumps(err, indent=2, default=str),
+                    raw_json=json.dumps(err, separators=(',',':'), default=str),
                 )
 
             # Check broker connection for order actions
@@ -1605,7 +1606,7 @@ class ToolExecutor:
                 action=action,
                 data=payload,
                 success=bool(payload.get("success")),
-                raw_json=json.dumps(payload, indent=2, default=str),
+                raw_json=json.dumps(payload, separators=(',',':'), default=str),
             )
         except Exception as e:
             logger.error(f"Tool error: {action} - {e}")

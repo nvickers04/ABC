@@ -25,7 +25,7 @@ from xai_sdk import AsyncClient
 logger = logging.getLogger(__name__)
 
 # ── Model Slugs (beta — may change without notice) ─────────────
-REASONING_MODEL = "grok-4.20-experimental-beta-0304-reasoning"
+REASONING_MODEL = "grok-4.20-0309-reasoning"
 MULTI_AGENT_MODEL = "grok-4.20-multi-agent-experimental-beta-0304"
 
 

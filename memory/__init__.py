@@ -19,7 +19,7 @@ _DB_PATH = Path(__file__).parent / "abc.db"
 _connection: sqlite3.Connection | None = None
 
 
-def _ensure_column(conn, table: str, col: str, col_type: str) -> None:
+def _ensure_column(conn: sqlite3.Connection, table: str, col: str, col_type: str) -> None:
     """Helper to idempotently add a column if it doesn't exist (simplifies migrations)."""
     try:
         conn.execute(f"SELECT {col} FROM {table} LIMIT 1")

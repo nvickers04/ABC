@@ -264,7 +264,10 @@ class MarketDataClient:
 
             if self._track_request():
                 return None
-            response = await client.get(f"/stocks/prices/{symbol}/")
+            response = await client.get(
+                f"/stocks/prices/{symbol}/",
+                params={'columns': 'mid,change,changepct,updated'}
+            )
 
             if response.status_code not in (200, 203):
                 # VIX endpoints are not supported by MarketData.app in some plans.
@@ -368,7 +371,7 @@ class MarketDataClient:
 
     async def get_quotes_bulk(self, symbols: List[str]) -> Dict[str, Dict[str, Any]]:
         """
-        Get quotes for multiple symbols.
+        Get quotes for multiple symbols in a single API call.
 
         Args:
             symbols: List of tickers
@@ -376,16 +379,68 @@ class MarketDataClient:
         Returns:
             Dict mapping symbol -> quote data
         """
+        if not symbols:
+            return {}
+        if not self.is_configured:
+            return {}
+
+        try:
+            client = self._get_http_client()
+            if not client:
+                return {}
+
+            symbols_upper = [s.upper().strip() for s in symbols]
+            if self._track_request():
+                return {}
+            response = await client.get(
+                "/stocks/bulkquotes/",
+                params={'symbols': ','.join(symbols_upper)}
+            )
+
+            if response.status_code not in (200, 203):
+                logger.warning(f"Bulk quotes request failed: {response.status_code}")
+                # Fallback to individual calls
+                return await self._get_quotes_bulk_fallback(symbols_upper)
+
+            data = response.json()
+            if data.get('s') != 'ok':
+                logger.warning(f"Bulk quotes API error: {data.get('errmsg', 'Unknown')}")
+                return await self._get_quotes_bulk_fallback(symbols_upper)
+
+            results = {}
+            syms = data.get('symbol', [])
+            for i, sym in enumerate(syms):
+                def at(arr, idx):
+                    return arr[idx] if isinstance(arr, list) and idx < len(arr) else None
+
+                results[sym] = {
+                    'symbol': sym,
+                    'bid': at(data.get('bid', []), i),
+                    'ask': at(data.get('ask', []), i),
+                    'last': at(data.get('last', []), i),
+                    'mid': at(data.get('mid', []), i),
+                    'volume': at(data.get('volume', []), i),
+                    'change': at(data.get('change', []), i),
+                    'change_pct': at(data.get('changepct', []), i),
+                    'updated': at(data.get('updated', []), i),
+                    'source': 'marketdata'
+                }
+            return results
+
+        except Exception as e:
+            logger.warning(f"Bulk quotes request failed: {e}")
+            return await self._get_quotes_bulk_fallback(symbols_upper)
+
+    async def _get_quotes_bulk_fallback(self, symbols: List[str]) -> Dict[str, Dict[str, Any]]:
+        """Fallback: individual quote calls when bulk endpoint fails."""
         results = {}
         tasks = [self.get_quote(symbol) for symbol in symbols]
         quotes = await asyncio.gather(*tasks, return_exceptions=True)
-
         for symbol, quote in zip(symbols, quotes):
             if isinstance(quote, Exception):
                 logger.warning(f"Failed to get quote for {symbol}: {quote}")
             elif quote:
                 results[symbol] = quote
-
         return results
 
     async def get_candles(
@@ -394,7 +449,8 @@ class MarketDataClient:
         resolution: str = 'D',
         days_back: int = 30,
         from_date: Optional[str] = None,
-        to_date: Optional[str] = None
+        to_date: Optional[str] = None,
+        mode: Optional[str] = 'cached',
     ) -> Optional[Dict[str, Any]]:
         """
         Get historical OHLCV candles.
@@ -405,6 +461,7 @@ class MarketDataClient:
             days_back: Number of days of history (if from_date not specified)
             from_date: Start date (YYYY-MM-DD)
             to_date: End date (YYYY-MM-DD)
+            mode: 'cached' for reduced credits (default), None for real-time
 
         Returns:
             Dict with open, high, low, close, volume, timestamps arrays
@@ -420,6 +477,8 @@ class MarketDataClient:
 
             # Build query params
             params = {'resolution': resolution}
+            if mode:
+                params['mode'] = mode
             if from_date:
                 params['from'] = from_date
                 if to_date:
@@ -458,6 +517,76 @@ class MarketDataClient:
         except Exception as e:
             logger.warning(f"Candles request failed for {symbol}: {e}")
             return None
+
+    async def get_bulk_daily_candles(self, symbols: List[str]) -> Dict[str, Dict[str, Any]]:
+        """
+        Get daily candles for multiple symbols in a single API call.
+
+        Uses /stocks/bulkcandles/D/?symbols=... endpoint.
+        Only supports daily resolution.
+
+        Args:
+            symbols: List of tickers
+
+        Returns:
+            Dict mapping symbol -> candle data (same format as get_candles)
+        """
+        if not symbols or not self.is_configured:
+            return {}
+
+        try:
+            client = self._get_http_client()
+            if not client:
+                return {}
+
+            symbols_upper = [s.upper().strip() for s in symbols]
+            if self._track_request():
+                return {}
+            response = await client.get(
+                "/stocks/bulkcandles/D/",
+                params={'symbols': ','.join(symbols_upper)}
+            )
+
+            if response.status_code not in (200, 203):
+                logger.warning(f"Bulk candles request failed: {response.status_code}")
+                return {}
+
+            data = response.json()
+            if data.get('s') != 'ok':
+                logger.warning(f"Bulk candles API error: {data.get('errmsg', 'Unknown')}")
+                return {}
+
+            # Parse bulk response — each row has a symbol field
+            results: Dict[str, Dict] = {}
+            syms = data.get('symbol', [])
+            opens = data.get('o', [])
+            highs = data.get('h', [])
+            lows = data.get('l', [])
+            closes = data.get('c', [])
+            volumes = data.get('v', [])
+            timestamps = data.get('t', [])
+
+            for i, sym in enumerate(syms):
+                if sym not in results:
+                    results[sym] = {
+                        'symbol': sym,
+                        'open': [], 'high': [], 'low': [],
+                        'close': [], 'volume': [], 'timestamps': [],
+                        'source': 'marketdata'
+                    }
+                r = results[sym]
+                if i < len(opens): r['open'].append(opens[i])
+                if i < len(highs): r['high'].append(highs[i])
+                if i < len(lows): r['low'].append(lows[i])
+                if i < len(closes): r['close'].append(closes[i])
+                if i < len(volumes): r['volume'].append(volumes[i])
+                if i < len(timestamps): r['timestamps'].append(timestamps[i])
+
+            return results
+
+        except Exception as e:
+            logger.warning(f"Bulk candles request failed: {e}")
+            return {}
 
     async def calculate_atr(self, symbol: str, period: int = 14) -> Optional[float]:
         """
@@ -509,6 +638,14 @@ class MarketDataClient:
         date: Optional[str] = None,
         from_date: Optional[str] = None,
         to_date: Optional[str] = None,
+        # Server-side filters (Phase 2)
+        delta: Optional[float] = None,
+        strike_limit: Optional[int] = None,
+        range_filter: Optional[str] = None,
+        min_bid: Optional[float] = None,
+        max_bid_ask_spread_pct: Optional[float] = None,
+        min_open_interest: Optional[int] = None,
+        min_volume: Optional[int] = None,
     ) -> Optional[Dict[str, Any]]:
         """
         Get options chain with Greeks and IV.
@@ -522,6 +659,13 @@ class MarketDataClient:
             date: Historical snapshot date (YYYY-MM-DD); returns chain as-of that date
             from_date: Start of historical range (YYYY-MM-DD)
             to_date: End of historical range (YYYY-MM-DD)
+            delta: Server-side delta filter (e.g. 0.30)
+            strike_limit: Max strikes to return per expiration
+            range_filter: 'itm', 'otm', 'all' (API range param)
+            min_bid: Minimum bid price filter
+            max_bid_ask_spread_pct: Maximum bid-ask spread as percentage
+            min_open_interest: Minimum open interest filter
+            min_volume: Minimum volume filter
 
         Returns:
             Dict with options data including Greeks
@@ -532,21 +676,23 @@ class MarketDataClient:
 
         try:
             symbol = symbol.upper().strip()
+            is_historical = bool(date or from_date or to_date)
 
             # Build query params
             params: Dict[str, Any] = {}
+
+            # Use mode=cached for non-historical requests (1 credit vs per-contract)
+            if not is_historical:
+                params['mode'] = 'cached'
+
             if expiration:
                 params['expiration'] = expiration
-            elif date or from_date or to_date:
-                # Historical fetch without explicit expiration: the API defaults
-                # to the nearest *monthly* only, silently dropping weeklies.
-                # Use 'all' so we get every available expiration including weeklies.
+            elif is_historical:
                 params['expiration'] = 'all'
             if side:
                 params['side'] = side
             if strike_range:
                 params['strike'] = f"{strike_range[0]}-{strike_range[1]}"
-            # Historical snapshot or date-range parameters
             if date:
                 params['date'] = date
             if from_date:
@@ -554,14 +700,23 @@ class MarketDataClient:
             if to_date:
                 params['to'] = to_date
 
-            # FIX: The MarketData API defaults to the nearest expiration only.
-            # When a dte_range is requested, pass the target DTE so the API
-            # returns contracts near that expiration.  Without this, ALL
-            # contracts come back with DTE=3 (or whatever the nearest is)
-            # and the client-side filter discards 100% of them.
+            # Server-side filters
+            if delta is not None:
+                params['delta'] = str(delta)
+            if strike_limit is not None:
+                params['strikeLimit'] = str(strike_limit)
+            if range_filter:
+                params['range'] = range_filter
+            if min_bid is not None:
+                params['minBid'] = str(min_bid)
+            if max_bid_ask_spread_pct is not None:
+                params['maxBidAskSpreadPct'] = str(max_bid_ask_spread_pct)
+            if min_open_interest is not None:
+                params['minOpenInterest'] = str(min_open_interest)
+            if min_volume is not None:
+                params['minVolume'] = str(min_volume)
+
             if dte_range and not expiration:
-                # Use midpoint of range as the target; client-side filter
-                # still trims to the exact (min, max) bounds afterward.
                 target_dte = (dte_range[0] + dte_range[1]) // 2
                 params['dte'] = str(target_dte)
 
@@ -579,6 +734,9 @@ class MarketDataClient:
             used_fallback = False
             if response.status_code in (400, 404) and params:
                 fallback_params: Dict[str, Any] = {}
+                # Preserve mode=cached on fallback
+                if 'mode' in params:
+                    fallback_params['mode'] = params['mode']
                 if expiration:
                     fallback_params['expiration'] = expiration
                 if side:
@@ -939,7 +1097,10 @@ class MarketDataClient:
         chain = await self.get_option_chain(
             symbol,
             side=side,
-            dte_range=(min_dte, max_dte)
+            dte_range=(min_dte, max_dte),
+            delta=target_delta,
+            strike_limit=5,
+            min_bid=0.01,
         )
 
         if not chain or not chain.get('contracts'):
@@ -1031,6 +1192,159 @@ class MarketDataClient:
             'iv_current': round(current_iv * 100, 1),  # As percentage
             'iv_rank': None,  # Would need historical IV data
             'source': 'marketdata'
+        }
+
+    async def get_earnings(
+        self,
+        symbol: str,
+        from_date: Optional[str] = None,
+        to_date: Optional[str] = None,
+        countback: Optional[int] = None,
+    ) -> Optional[Dict[str, Any]]:
+        """
+        Get earnings data for a symbol via MDA /stocks/earnings/{symbol}/.
+
+        Returns dict with arrays: symbol, fiscalYear, fiscalQuarter, date,
+        reportDate, reportTime, reportedEPS, estimatedEPS, surpriseEPS, surpriseEPSpct.
+        """
+        params: Dict[str, Any] = {}
+        if from_date:
+            params["from"] = from_date
+        if to_date:
+            params["to"] = to_date
+        if countback is not None:
+            params["countback"] = countback
+
+        resp = await self._get_with_retries(
+            f"/stocks/earnings/{symbol}/",
+            params=params or None,
+            label=f"earnings({symbol})",
+        )
+        if not resp or resp.status_code != 200:
+            return None
+
+        data = resp.json()
+        if data.get("s") != "ok":
+            return None
+
+        # Zip parallel arrays into a list of earnings records
+        n = len(data.get("fiscalYear", []))
+        records = []
+        for i in range(n):
+            records.append({
+                "fiscal_year": data["fiscalYear"][i] if i < len(data.get("fiscalYear", [])) else None,
+                "fiscal_quarter": data["fiscalQuarter"][i] if i < len(data.get("fiscalQuarter", [])) else None,
+                "date": data["date"][i] if i < len(data.get("date", [])) else None,
+                "report_date": data["reportDate"][i] if i < len(data.get("reportDate", [])) else None,
+                "report_time": data["reportTime"][i] if i < len(data.get("reportTime", [])) else None,
+                "reported_eps": data["reportedEPS"][i] if i < len(data.get("reportedEPS", [])) else None,
+                "estimated_eps": data["estimatedEPS"][i] if i < len(data.get("estimatedEPS", [])) else None,
+                "surprise_eps": data["surpriseEPS"][i] if i < len(data.get("surpriseEPS", [])) else None,
+                "surprise_eps_pct": data["surpriseEPSpct"][i] if i < len(data.get("surpriseEPSpct", [])) else None,
+            })
+
+        return {
+            "symbol": symbol,
+            "earnings": records,
+            "count": n,
+            "source": "marketdata",
+        }
+
+    async def get_news(
+        self,
+        symbol: str,
+        from_date: Optional[str] = None,
+        to_date: Optional[str] = None,
+        countback: Optional[int] = None,
+    ) -> Optional[Dict[str, Any]]:
+        """
+        Get news for a symbol via MDA /stocks/news/{symbol}/.
+
+        Returns dict with headlines, content, sources, publication dates.
+        """
+        params: Dict[str, Any] = {}
+        if from_date:
+            params["from"] = from_date
+        if to_date:
+            params["to"] = to_date
+        if countback is not None:
+            params["countback"] = countback
+
+        resp = await self._get_with_retries(
+            f"/stocks/news/{symbol}/",
+            params=params or None,
+            label=f"news({symbol})",
+        )
+        if not resp or resp.status_code != 200:
+            return None
+
+        data = resp.json()
+        if data.get("s") != "ok":
+            return None
+
+        n = len(data.get("headline", []))
+        articles = []
+        for i in range(n):
+            articles.append({
+                "headline": data["headline"][i] if i < len(data.get("headline", [])) else None,
+                "content": data["content"][i] if i < len(data.get("content", [])) else None,
+                "source": data["source"][i] if i < len(data.get("source", [])) else None,
+                "publication_date": data["publicationDate"][i] if i < len(data.get("publicationDate", [])) else None,
+            })
+
+        return {
+            "symbol": symbol,
+            "articles": articles,
+            "count": n,
+            "source": "marketdata",
+        }
+
+    async def get_market_status(
+        self,
+        date: Optional[str] = None,
+        from_date: Optional[str] = None,
+        to_date: Optional[str] = None,
+    ) -> Optional[Dict[str, Any]]:
+        """
+        Get market open/closed status via MDA /markets/status/.
+
+        Args:
+            date: Check a specific date
+            from_date: Start of date range
+            to_date: End of date range
+        """
+        params: Dict[str, Any] = {}
+        if date:
+            params["date"] = date
+        if from_date:
+            params["from"] = from_date
+        if to_date:
+            params["to"] = to_date
+
+        resp = await self._get_with_retries(
+            "/markets/status/",
+            params=params or None,
+            label="market_status",
+        )
+        if not resp or resp.status_code != 200:
+            return None
+
+        data = resp.json()
+        if data.get("s") != "ok":
+            return None
+
+        n = len(data.get("date", []))
+        statuses = []
+        for i in range(n):
+            statuses.append({
+                "date": data["date"][i] if i < len(data.get("date", [])) else None,
+                "status": data["status"][i] if i < len(data.get("status", [])) else None,
+            })
+
+        return {
+            "statuses": statuses,
+            "count": n,
+            "source": "marketdata",
         }
 
 

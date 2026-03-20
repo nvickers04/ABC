@@ -468,92 +468,223 @@ def _get_fill(order_type: str, entry_bar: int, entry_price: float,
         return entry_bar + 1, next_bar["open"]
 
 
+# ═══════════════════════════════════════════════════════════════
+# BLACK-SCHOLES OPTION PRICING
+# ═══════════════════════════════════════════════════════════════
+
+_RISK_FREE_RATE = 0.05  # Approximate; not a sensitive parameter for short-DTE math
+_MIN_VOL = 0.10         # Floor so options never collapse to intrinsic
+
+
+def _norm_cdf(x: float) -> float:
+    """Standard normal CDF via the error function (no scipy needed)."""
+    return 0.5 * (1.0 + math.erf(x / math.sqrt(2.0)))
+
+
+def _bs_call(S: float, K: float, T: float, sigma: float) -> float:
+    """Black-Scholes call price.  T in years, sigma annualised."""
+    if T <= 0 or sigma <= 0:
+        return max(S - K, 0.0)
+    d1 = (math.log(S / K) + (_RISK_FREE_RATE + 0.5 * sigma ** 2) * T) / (sigma * math.sqrt(T))
+    d2 = d1 - sigma * math.sqrt(T)
+    return S * _norm_cdf(d1) - K * math.exp(-_RISK_FREE_RATE * T) * _norm_cdf(d2)
+
+
+def _bs_put(S: float, K: float, T: float, sigma: float) -> float:
+    """Black-Scholes put price via put-call parity."""
+    if T <= 0 or sigma <= 0:
+        return max(K - S, 0.0)
+    d1 = (math.log(S / K) + (_RISK_FREE_RATE + 0.5 * sigma ** 2) * T) / (sigma * math.sqrt(T))
+    d2 = d1 - sigma * math.sqrt(T)
+    return K * math.exp(-_RISK_FREE_RATE * T) * _norm_cdf(-d2) - S * _norm_cdf(-d1)
+
+
+def _bs_price(S: float, K: float, T: float, sigma: float, is_call: bool) -> float:
+    return _bs_call(S, K, T, sigma) if is_call else _bs_put(S, K, T, sigma)
+
+
+def _realised_vol(candles: pd.DataFrame, fill_bar: int) -> float:
+    """Estimate annualised volatility from close-to-close returns preceding fill_bar."""
+    lookback = min(fill_bar, 60)  # Up to 60 bars before entry
+    if lookback < 5:
+        return 0.25  # Fallback
+    closes = candles["close"].iloc[max(0, fill_bar - lookback):fill_bar].values
+    if len(closes) < 5:
+        return 0.25
+    rets = [math.log(closes[i] / closes[i - 1]) for i in range(1, len(closes)) if closes[i - 1] > 0]
+    if not rets:
+        return 0.25
+    std_1m = statistics.stdev(rets)
+    annualised = std_1m * math.sqrt(390 * 252)  # 390 1-min bars/day, 252 days/yr
+    return max(annualised, _MIN_VOL)
+
+
+def _dte_years(legs: dict, bars_held: int) -> tuple[float, float]:
+    """Return (T_entry, T_exit) in years.
+
+    If expiration is parseable, compute real calendar DTE.
+    Otherwise fall back to a conservative 7-day estimate.
+    """
+    try:
+        from datetime import datetime as _dt
+        exp = _dt.strptime(str(legs["expiration"]), "%Y-%m-%d").date()
+        # Assume entry is "today" for backtesting purposes; the important
+        # thing is that exit DTE = entry DTE minus days_held.
+        from datetime import date as _date
+        today = _date.today()
+        dte_entry = max((exp - today).days, 1)
+    except Exception:
+        dte_entry = 7  # Fallback for unparseable dates
+    days_held = bars_held / 390.0
+    T_entry = dte_entry / 365.0
+    T_exit = max((dte_entry - days_held) / 365.0, 0.0001)
+    return T_entry, T_exit
+
+
 def _simulate_options_return(legs: dict, underlying_entry: float, underlying_exit: float,
                               is_long: bool, fill_bar: int, exit_bar: int,
                               candles: pd.DataFrame) -> float:
     """
-    Approximate options P&L using delta/theta estimation.
+    Option P&L via Black-Scholes repricing.
 
-    This is simplified — we estimate P&L as:
-      delta_pnl = delta * (price_change) * 100
-      theta_cost = theta * (bars_held / 390)  # 390 bars = 1 day
-      return_pct = (delta_pnl - theta_cost) / max_risk * 100
+    Uses realised volatility from the candle data as an IV proxy, then prices
+    each leg at entry and exit using the actual underlying prices.  This replaces
+    the previous hardcoded-delta/theta approximation with physics-based math.
 
-    For defined-risk strategies, max_risk = spread width or debit paid.
+    Returns return_pct based on max risk (debit paid or margin requirement).
     """
     strategy = legs.get("strategy", "")
-    price_move = underlying_exit - underlying_entry
     bars_held = exit_bar - fill_bar
-    days_held = bars_held / 390.0
+    sigma = _realised_vol(candles, fill_bar)
 
     if strategy == "vertical_spread":
         long_strike = legs.get("long_strike", underlying_entry)
         short_strike = legs.get("short_strike", underlying_entry)
-        width = abs(short_strike - long_strike)
         right = legs.get("right", "C")
-        is_call = right.upper() == "C"
+        is_call = right.upper() in ("C", "CALL")
+        T_entry, T_exit = _dte_years(legs, bars_held)
 
-        # Estimate debit as ~40% of width for ATM spreads
-        debit = width * 0.4
-        if debit <= 0:
+        long_entry = _bs_price(underlying_entry, long_strike, T_entry, sigma, is_call)
+        short_entry = _bs_price(underlying_entry, short_strike, T_entry, sigma, is_call)
+        long_exit = _bs_price(underlying_exit, long_strike, T_exit, sigma, is_call)
+        short_exit = _bs_price(underlying_exit, short_strike, T_exit, sigma, is_call)
+
+        # Debit spread: pay for long, receive for short
+        debit = long_entry - short_entry
+        exit_value = long_exit - short_exit
+        if abs(debit) < 0.001:
             return 0.0
-
-        # Delta approximation: ~0.3 net delta for vertical
-        net_delta = 0.3 if is_call else -0.3
-        delta_pnl = net_delta * price_move
-        # Theta cost: ~2% of debit per day for near-term spreads
-        theta_cost = debit * 0.02 * days_held
-        pnl = delta_pnl - theta_cost
-        return (pnl / debit) * 100
+        pnl = exit_value - debit
+        return (pnl / abs(debit)) * 100
 
     elif strategy == "iron_condor":
-        # Credit received ~30% of wing width, max loss = wing - credit
         put_long = legs.get("put_long_strike", underlying_entry * 0.95)
         put_short = legs.get("put_short_strike", underlying_entry * 0.97)
         call_short = legs.get("call_short_strike", underlying_entry * 1.03)
         call_long = legs.get("call_long_strike", underlying_entry * 1.05)
-        wing_width = max(abs(put_short - put_long), abs(call_long - call_short), 1.0)
-        credit = wing_width * 0.3
-        max_loss = wing_width - credit
+        T_entry, T_exit = _dte_years(legs, bars_held)
 
-        if put_short <= underlying_exit <= call_short:
-            # Price in range — profit is theta decay
-            pnl = credit * min(days_held * 0.1, 1.0)  # decay toward full credit
-        else:
-            # Breach — loss proportional to how far OTM
-            breach = max(put_short - underlying_exit, underlying_exit - call_short, 0)
-            pnl = -(min(breach, max_loss))
-        return (pnl / max_loss) * 100
+        # Credit from short legs minus debit for long wings
+        credit = (
+            _bs_put(underlying_entry, put_short, T_entry, sigma)
+            - _bs_put(underlying_entry, put_long, T_entry, sigma)
+            + _bs_call(underlying_entry, call_short, T_entry, sigma)
+            - _bs_call(underlying_entry, call_long, T_entry, sigma)
+        )
+        exit_cost = (
+            _bs_put(underlying_exit, put_short, T_exit, sigma)
+            - _bs_put(underlying_exit, put_long, T_exit, sigma)
+            + _bs_call(underlying_exit, call_short, T_exit, sigma)
+            - _bs_call(underlying_exit, call_long, T_exit, sigma)
+        )
+        wing_width = max(abs(put_short - put_long), abs(call_long - call_short), 0.5)
+        max_risk = wing_width - abs(credit)
+        if max_risk <= 0:
+            max_risk = wing_width
+        pnl = credit - exit_cost
+        return (pnl / max_risk) * 100
 
     elif strategy in ("straddle", "strangle"):
-        # Long vol: cost is total premium, profit from large moves
-        premium = abs(underlying_entry) * 0.04  # ~4% premium estimate
-        abs_move = abs(price_move)
-        delta_pnl = abs_move * 0.8  # combined delta ~0.8 at-move
-        theta_cost = premium * 0.03 * days_held
-        pnl = delta_pnl - theta_cost - premium * 0.1  # subtract ~10% of premium as IV crush
-        return (pnl / premium) * 100
+        if strategy == "straddle":
+            strike_c = strike_p = legs.get("strike", underlying_entry)
+        else:
+            strike_c = legs.get("call_strike", underlying_entry * 1.02)
+            strike_p = legs.get("put_strike", underlying_entry * 0.98)
+        T_entry, T_exit = _dte_years(legs, bars_held)
+
+        call_entry = _bs_call(underlying_entry, strike_c, T_entry, sigma)
+        put_entry = _bs_put(underlying_entry, strike_p, T_entry, sigma)
+        call_exit = _bs_call(underlying_exit, strike_c, T_exit, sigma)
+        put_exit = _bs_put(underlying_exit, strike_p, T_exit, sigma)
+
+        debit = call_entry + put_entry
+        exit_value = call_exit + put_exit
+        if debit < 0.001:
+            return 0.0
+        pnl = exit_value - debit
+        return (pnl / debit) * 100
 
     elif strategy in ("calendar_spread", "diagonal_spread"):
-        # Calendar: profits from theta differential
-        debit = abs(underlying_entry) * 0.02  # ~2% of underlying
-        theta_income = debit * 0.05 * days_held  # front leg decays faster
-        delta_risk = abs(price_move) * 0.1  # low delta exposure
-        pnl = theta_income - delta_risk
-        return (pnl / debit) * 100
+        right = legs.get("right", "C")
+        is_call = right.upper() in ("C", "CALL")
+        if strategy == "calendar_spread":
+            near_strike = far_strike = legs.get("strike", underlying_entry)
+        else:
+            near_strike = legs.get("near_strike", underlying_entry)
+            far_strike = legs.get("far_strike", underlying_entry)
+
+        # Parse both expirations
+        try:
+            from datetime import datetime as _dt, date as _date
+            near_exp = _dt.strptime(str(legs["near_expiration"]), "%Y-%m-%d").date()
+            far_exp = _dt.strptime(str(legs["far_expiration"]), "%Y-%m-%d").date()
+            today = _date.today()
+            near_dte = max((near_exp - today).days, 1)
+            far_dte = max((far_exp - today).days, 1)
+        except Exception:
+            near_dte, far_dte = 7, 21
+
+        days_held_cal = bars_held / 390.0
+        T_near_entry = near_dte / 365.0
+        T_far_entry = far_dte / 365.0
+        T_near_exit = max((near_dte - days_held_cal) / 365.0, 0.0001)
+        T_far_exit = max((far_dte - days_held_cal) / 365.0, 0.0001)
+
+        # Sell near-term, buy far-term
+        near_entry = _bs_price(underlying_entry, near_strike, T_near_entry, sigma, is_call)
+        far_entry = _bs_price(underlying_entry, far_strike, T_far_entry, sigma, is_call)
+        near_exit = _bs_price(underlying_exit, near_strike, T_near_exit, sigma, is_call)
+        far_exit = _bs_price(underlying_exit, far_strike, T_far_exit, sigma, is_call)
+
+        debit = far_entry - near_entry  # Pay for far, receive for near
+        exit_value = far_exit - near_exit
+        if abs(debit) < 0.001:
+            return 0.0
+        pnl = exit_value - debit
+        return (pnl / abs(debit)) * 100
 
     elif strategy == "butterfly":
         low = legs.get("low_strike", underlying_entry - 5)
         mid = legs.get("mid_strike", underlying_entry)
         high = legs.get("high_strike", underlying_entry + 5)
-        width = max(abs(high - low) / 2, 0.5)
-        debit = width * 0.2
-        dist_from_center = abs(underlying_exit - mid)
-        if dist_from_center <= width * 0.3:
-            pnl = (width - debit) * (1 - dist_from_center / (width * 0.3)) * 0.5
-        else:
-            pnl = -debit * 0.8
-        return (pnl / max(debit, 0.01)) * 100
+        right = legs.get("right", "C")
+        is_call = right.upper() in ("C", "CALL")
+        T_entry, T_exit = _dte_years(legs, bars_held)
+
+        # Buy 1 low + 1 high, sell 2 mid
+        low_entry = _bs_price(underlying_entry, low, T_entry, sigma, is_call)
+        mid_entry = _bs_price(underlying_entry, mid, T_entry, sigma, is_call)
+        high_entry = _bs_price(underlying_entry, high, T_entry, sigma, is_call)
+        low_exit = _bs_price(underlying_exit, low, T_exit, sigma, is_call)
+        mid_exit = _bs_price(underlying_exit, mid, T_exit, sigma, is_call)
+        high_exit = _bs_price(underlying_exit, high, T_exit, sigma, is_call)
+
+        debit = low_entry + high_entry - 2 * mid_entry
+        exit_value = low_exit + high_exit - 2 * mid_exit
+        if abs(debit) < 0.001:
+            return 0.0
+        pnl = exit_value - debit
+        return (pnl / abs(debit)) * 100
 
     return 0.0
 

@@ -264,13 +264,18 @@ You may use long calls, long puts, short puts, short calls, or any combination.
 
 RULES:
 1. Output the COMPLETE new strategy.py file. Not a diff, not a snippet — the full file.
-2. The file must define: scan(candles: pd.DataFrame, symbol: str) -> list[dict]
+2. The file must define: scan(candles: pd.DataFrame, symbol: str, env: dict = None) -> list[dict]
+   - 'env' is an optional dict with regime data (see keys below). Old 2-arg signatures also work.
 3. candles has columns: ts, open, high, low, close, volume (1-min bars, one trading day)
-4. Each returned signal must follow this schema:
+4. env keys (all optional): volatility_regime ("low"/"normal"/"high"),
+   trend_regime ("down"/"flat"/"up"), breadth_regime ("bearish"/"neutral"/"bullish"),
+   momentum_regime, volume_regime, dispersion, strategy_fit (dict).
+   Use env to adapt thresholds per regime instead of hardcoding.
+5. Each returned signal must follow this schema:
 {signal_schema}
-5. You may only import: pandas, numpy, math, statistics. No other imports.
-6. No file I/O, no network calls, no os/sys/subprocess.
-7. For options strategies, set order_type to the strategy name and include legs_json.
+6. You may only import: pandas, numpy, math, statistics. No other imports.
+7. No file I/O, no network calls, no os/sys/subprocess.
+8. For options strategies, set order_type to the strategy name and include legs_json.
 
 ENVIRONMENT-AWARE STRATEGY GUIDELINES:
 - Study the CURRENT MARKET ENVIRONMENT section above carefully.

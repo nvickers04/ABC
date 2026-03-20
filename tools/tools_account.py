@@ -134,6 +134,15 @@ async def handle_get_position(executor, params: dict) -> Any:
     return {"positions": matches, "count": len(matches)}
 
 
+async def handle_refresh_state(executor, params: dict) -> Any:
+    """Return full broker state snapshot (account, positions, orders, session)."""
+    builder = getattr(executor, '_state_builder', None)
+    if builder is None:
+        return {"error": "state builder not available"}
+    state_text = await builder()
+    return {"state": state_text}
+
+
 HANDLERS = {
     "cancel_order": handle_cancel_order,
     "cancel_stops": handle_cancel_stops,
@@ -142,4 +151,5 @@ HANDLERS = {
     "account": handle_account,
     "open_orders": handle_open_orders,
     "get_position": handle_get_position,
+    "refresh_state": handle_refresh_state,
 }

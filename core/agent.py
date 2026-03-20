@@ -46,6 +46,43 @@ from tools.tools_executor import ToolExecutor
 logger = logging.getLogger(__name__)
 
 
+# ── Research Cache Entry ────────────────────────────────────────
+
+_TICKER_SYMBOLS: set[str] = set()
+
+def _get_ticker_symbols() -> set[str]:
+    """Lazily load RESEARCH_UNIVERSE symbols for topic categorization."""
+    global _TICKER_SYMBOLS
+    if not _TICKER_SYMBOLS:
+        try:
+            from research.config import RESEARCH_UNIVERSE
+            _TICKER_SYMBOLS = {s.upper() for s in RESEARCH_UNIVERSE}
+        except Exception:
+            pass
+    return _TICKER_SYMBOLS
+
+
+def _categorize_query(query: str) -> tuple[str, int]:
+    """Categorize a research query and return (category, ttl_seconds).
+
+    Categories:
+      macro  — market-wide events, Fed, economic → TTL=session boundary
+      sector — industry, sector rotation           → TTL=4h
+      ticker — specific symbol mentions             → TTL=30min
+    """
+    q = query.upper()
+    tickers = _get_ticker_symbols()
+    # Check if query mentions a known ticker
+    for sym in tickers:
+        if sym in q.split():
+            return "ticker", 1800  # 30 min
+    # Sector keywords
+    sector_kw = {"SECTOR", "INDUSTRY", "ROTATION", "CYCLICAL", "DEFENSIVE", "GROWTH", "VALUE"}
+    if any(kw in q for kw in sector_kw):
+        return "sector", 14400  # 4 hours
+    return "macro", 0  # 0 means "until session change"
+
+
 # ── JSON Parsing Helpers ────────────────────────────────────────
 
 def _try_repair_json(raw: str) -> list[dict[str, Any]]:
@@ -148,19 +185,6 @@ def _now_et() -> datetime:
         return datetime.now(timezone(timedelta(hours=-5)))
 
 
-# ── Order types the agent can use (for tracking in aggressive mode) ──
-
-ALL_ORDER_TYPES = {
-    "market_order", "limit_order", "stop_order", "stop_limit",
-    "trailing_stop", "bracket_order", "oca_order",
-    "adaptive_order", "midprice_order", "vwap_order", "twap_order",
-    "relative_order", "snap_mid_order",
-    "vertical_spread", "iron_condor", "straddle", "strangle",
-    "calendar_spread", "diagonal_spread", "butterfly", "collar",
-    "buy_option",
-}
-
-
 # ── The Agent ───────────────────────────────────────────────────
 
 class TradingAgent:
@@ -189,8 +213,8 @@ class TradingAgent:
         self._halted = False
         self._start_of_day_cash: Optional[float] = None
         self._market_snapshots: list[str] = []  # Rolling 5-cycle summaries
-        self._research_results: dict[str, tuple[str, str]] = {}  # query -> (result_summary, timestamp)
-        self._used_order_types: set[str] = set()  # Track which order types used this session
+        self._research_results: dict[str, dict] = {}  # query -> {summary, ts, session, category, ttl, created}
+        self._current_session: str = "unknown"
 
         logger.info("TradingAgent initialized (minimal ReAct mode)")
 
@@ -199,6 +223,26 @@ class TradingAgent:
         self._market_snapshots.append(f"[{datetime.now().strftime('%H:%M')}] {summary}")
         if len(self._market_snapshots) > 5:
             self._market_snapshots = self._market_snapshots[-5:]
+
+    def _prune_research_cache(self, current_session: str):
+        """Remove expired research entries by TTL and session boundary."""
+        import time
+        now = time.time()
+        to_delete = []
+        for query, entry in self._research_results.items():
+            ttl = entry.get("ttl", 0)
+            created = entry.get("created", 0)
+            entry_session = entry.get("session", "unknown")
+            # TTL-based expiry (ticker=30m, sector=4h)
+            if ttl > 0 and (now - created) > ttl:
+                to_delete.append(query)
+            # Session boundary expiry (macro entries expire on session change)
+            elif ttl == 0 and entry_session != current_session and entry_session != "unknown":
+                to_delete.append(query)
+        for q in to_delete:
+            del self._research_results[q]
+        if to_delete:
+            logger.debug(f"Pruned {len(to_delete)} stale research entries")
 
     async def _get_cash(self) -> float:
         """Get current cash balance from broker (TotalCashValue ONLY, never AvailableFunds)."""
@@ -652,15 +696,6 @@ class TradingAgent:
         except Exception as e:
             lines.append(f"Order error: {e}")
 
-        # ── Research briefing ───────────────────────────────────
-        try:
-            briefing = self._get_research_briefing()
-            if briefing:
-                lines.append("")
-                lines.append(briefing)
-        except Exception as e:
-            logger.debug(f"Research briefing unavailable: {e}")
-
         return "\n".join(lines)
 
     async def run_cycle(self) -> int:
@@ -671,6 +706,15 @@ class TradingAgent:
         """
         self._cycle_failures = 0
         self._cycle_id += 1
+
+        # Detect current market session and prune stale research
+        try:
+            _mh = get_market_hours_provider()
+            _info = _mh.get_session_info()
+            self._current_session = _info.get("session", "unknown")
+        except Exception:
+            pass
+        self._prune_research_cache(self._current_session)
 
         # Build state context from broker
         state_text = await self._build_state_context()
@@ -701,50 +745,12 @@ class TradingAgent:
             continuity = f"\nLAST CYCLE: {self._last_cycle_summary}\n"
         if self._market_snapshots:
             continuity += "RECENT SNAPSHOTS:\n" + "\n".join(self._market_snapshots[-5:]) + "\n"
-        if self._research_results:
-            continuity += "\n═══ PRIOR RESEARCH (already paid for — reuse before re-researching) ═══\n"
-            for query, (summary, ts) in self._research_results.items():
-                continuity += f"[{ts}] Q: {query}\n{summary[:800]}\n\n"
-
-        aggressive_nudge = ""
-        if PAPER_AGGRESSIVE:
-            # Get session to make nudge context-appropriate
-            _session = "regular"
-            try:
-                _mh = get_market_hours_provider()
-                _info = _mh.get_session_info()
-                _session = _info.get("session", "regular")
-            except Exception:
-                pass
-
-            # Build order-type diversity hint
-            untested = sorted(ALL_ORDER_TYPES - self._used_order_types)
-            tested_str = ", ".join(sorted(self._used_order_types)) if self._used_order_types else "none yet"
-            untested_str = ", ".join(untested[:10]) if untested else "all tested!"
-
-            if _session == "regular":
-                aggressive_nudge = (
-                    f"\nAGGRESSIVE TEST: Trade aggressively. Try order types you haven't used yet."
-                    f"\n  Used so far: {tested_str}"
-                    f"\n  Untested: {untested_str}"
-                    f"\n  Pick an untested type when the setup fits."
-                )
-            elif _session in ("premarket", "postmarket"):
-                aggressive_nudge = (
-                    "\nAGGRESSIVE TEST: Research movers, queue limit_order entries for open. "
-                    "Don't churn on queued orders \u2014 they fill at 9:30. "
-                    "Options and bracket_order won't fill until regular hours."
-                )
-            else:  # closed
-                aggressive_nudge = (
-                    "\nAGGRESSIVE TEST: Market closed. Research and plan for next session."
-                )
 
         context = f"""{state_text}
 {cost_line}
 Time: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
-{continuity}{aggressive_nudge}
-Account state above. What is your next action?"""
+{continuity}
+Account state above. Start by calling briefing() to assess research status."""
 
         # ── Build xAI SDK chat instance ─────────────────────────
         chat = self.grok.client.chat.create(
@@ -838,13 +844,21 @@ Account state above. What is your next action?"""
                         if action == 'research' and last_result.success:
                             data = last_result.data if hasattr(last_result, 'data') else last_result
                             if isinstance(data, dict) and 'result' in data:
+                                import time as _time
                                 query = action_data.get('query', '')
-                                # Keep first 2000 chars of result as summary
                                 summary_text = str(data['result'])[:2000]
                                 ts = datetime.now().strftime('%H:%M')
-                                self._research_results[query] = (summary_text, ts)
-                                # Evict oldest if > 10 cached queries
-                                if len(self._research_results) > 10:
+                                cat, ttl = _categorize_query(query)
+                                self._research_results[query] = {
+                                    "summary": summary_text,
+                                    "ts": ts,
+                                    "session": self._current_session,
+                                    "category": cat,
+                                    "ttl": ttl,
+                                    "created": _time.time(),
+                                }
+                                # Evict oldest if > 15 cached queries
+                                if len(self._research_results) > 15:
                                     oldest_key = next(iter(self._research_results))
                                     del self._research_results[oldest_key]
 
@@ -884,17 +898,11 @@ Account state above. What is your next action?"""
                         logger.warning(f"Circuit breaker: {self._cycle_failures} failures this cycle")
                         return 60
 
-                    # Track order types used (for aggressive mode diversity)
-                    if action in ALL_ORDER_TYPES:
-                        self._used_order_types.add(action)
-
-                    # Refresh state from broker
-                    state_text = await self._build_state_context()
-
                     chat.append(response)
+                    # State is provided once at cycle start; agent calls
+                    # refresh_state tool when it needs an updated snapshot.
                     chat.append(sdk_user(
-                        f"TOOL RESULT:\n{last_result}\n\n"
-                        f"{state_text}\n\nWhat's your next action?"
+                        f"TOOL RESULT:\n{last_result}\n\nWhat's your next action?"
                     ))
 
             except Exception as e:
@@ -935,6 +943,9 @@ async def run_agent():
         cost_tracker=get_cost_tracker(),
     )
     agent = TradingAgent(gateway, tools)
+    # Let the refresh_state tool call back into the agent
+    tools._state_builder = agent._build_state_context
+    tools._agent = agent
 
     logger.info("Agent started (paper mode recommended)")
     agent._capture_start_of_day_cash()

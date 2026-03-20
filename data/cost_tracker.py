@@ -45,7 +45,8 @@ PROFIT_ALLOCATION_PCT = 0.50  # 50% of profits go to LLM credits
 
 # Cost per 1M tokens (approximate, update as pricing changes)
 MODEL_COSTS = {
-    # xAI Grok 4.20 Beta (short context 0-200K)
+    # xAI Grok 4.20 (0309 Reasoning)
+    "grok-4.20-0309-reasoning": {"input": 2.00, "output": 6.00},
     "grok-4.20-experimental-beta-0304-reasoning": {"input": 2.00, "output": 6.00},
     "grok-4.20-experimental-beta-0304-non-reasoning": {"input": 2.00, "output": 6.00},
     "grok-4.20-multi-agent-experimental-beta-0304": {"input": 2.00, "output": 6.00},

@@ -621,6 +621,27 @@ async def handle_option_chain(executor, params: dict) -> Any:
             return {"error": f"Invalid 'date' format '{hist_date}'. Use YYYY-MM-DD."}
     
     limit = params.get("limit", 20)
+
+    # --- Server-side filters (passed through to API) ---
+    delta = params.get("delta")
+    if delta is not None:
+        delta = float(delta)
+    strike_limit = params.get("strike_limit")
+    if strike_limit is not None:
+        strike_limit = int(strike_limit)
+    range_filter = params.get("range")  # 'itm', 'otm', 'all'
+    min_bid = params.get("min_bid")
+    if min_bid is not None:
+        min_bid = float(min_bid)
+    max_bid_ask_spread_pct = params.get("max_bid_ask_spread_pct")
+    if max_bid_ask_spread_pct is not None:
+        max_bid_ask_spread_pct = float(max_bid_ask_spread_pct)
+    min_open_interest = params.get("min_open_interest")
+    if min_open_interest is not None:
+        min_open_interest = int(min_open_interest)
+    min_volume = params.get("min_volume")
+    if min_volume is not None:
+        min_volume = int(min_volume)
     
     # --- Fetch from MarketData ---
     chain = executor.data_provider.get_option_chain(
@@ -630,6 +651,13 @@ async def handle_option_chain(executor, params: dict) -> Any:
         strike_range=strike_range,
         dte_range=dte_range,
         date=hist_date,
+        delta=delta,
+        strike_limit=strike_limit,
+        range_filter=range_filter,
+        min_bid=min_bid,
+        max_bid_ask_spread_pct=max_bid_ask_spread_pct,
+        min_open_interest=min_open_interest,
+        min_volume=min_volume,
     )
     
     # --- No data: return what was requested + what to try ---
@@ -667,9 +695,10 @@ async def handle_option_chain(executor, params: dict) -> Any:
         }
     
     # --- Format output ---
+    include_greeks = str(params.get("include_greeks", "false")).lower() in ("true", "1", "yes")
     contracts_out = []
     for c in chain.contracts[:limit]:
-        contracts_out.append({
+        entry = {
             "symbol": c.option_symbol,
             "strike": c.strike,
             "side": c.side,
@@ -677,15 +706,17 @@ async def handle_option_chain(executor, params: dict) -> Any:
             "dte": c.dte,
             "bid": c.bid,
             "ask": c.ask,
-            "last": c.last,
             "volume": c.volume,
-            "open_interest": c.open_interest,
+            "oi": c.open_interest,
             "delta": c.delta,
-            "gamma": c.gamma,
-            "theta": c.theta,
-            "vega": c.vega,
-            "iv": c.iv
-        })
+            "iv": c.iv,
+        }
+        if include_greeks:
+            entry["last"] = c.last
+            entry["gamma"] = c.gamma
+            entry["theta"] = c.theta
+            entry["vega"] = c.vega
+        contracts_out.append(entry)
     
     return {
         "symbol": symbol,

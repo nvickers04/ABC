@@ -1,86 +1,116 @@
 """
-Slot 09 — VWAP Momentum Short (Downtrend Aligned)
+Slot 09 — Mean Reversion Long (Choppy regime)
 
-Current regime: high vol (ATR 5.51%), strong downtrend (68% down days),
-neutral breadth, accelerating momentum (+0.61). Uses highest-fit
-momentum_breakout (1.00) and vwap (0.80). Shorts only on top momentum
-candidates when price is below both SMA20 and VWAP with clearly negative
-5-bar momentum. ATR-based risk (stop 1.4×ATR, target 2.8×ATR) calibrated
-for 5.5% ATR regime. Bracket order for clean execution. MIN_BAR=75 and
-25-bar spacing avoids opening noise while producing evaluable signal count.
-No options — eliminates gamma gaps for better live execution tolerance.
-Builds on #771 by widening target:stop, shifting entry later, tightening
-symbol list to current top momentum names, and increasing max hold slightly.
+Mandate: choppy / long / stock_mean_reversion
+Allowed order_types: limit, midprice, moc
 
-Focus: simple, interpretable trend-following shorts that respect the
-actual down-trending + accelerating regime.
+Oversold bounce entries at support levels with limit orders.
+Buys when RSI dips below oversold threshold near lower Bollinger Band
+in range-bound (choppy) markets.
+
+Core logic:
+- RSI(14) below 30 (oversold)
+- Price touches or dips below lower Bollinger Band (2 std)
+- Price above SMA100 (not in a major downtrend — just choppy)
+- Volume spike on washout bar (>1.3x avg)
+- Close in upper 40% of bar range (buyers absorbing selling)
+- Limit order at close (buying the oversold dip)
+- Tight risk: 0.7 ATR stop, 1.4 ATR target (2:1 R:R)
+- Entry window: bars 40–250 (mean reversion can work all day)
 """
 
 import pandas as pd
 import numpy as np
 
+MAX_HOLD_BARS = 30
+MIN_BAR = 40
+MAX_ENTRY_BAR = 250
+RSI_PERIOD = 14
+RSI_OVERSOLD = 30.0
+BB_PERIOD = 20
+BB_STD = 2.0
+SMA_LONG = 100
 ATR_PERIOD = 14
-SMA_PERIOD = 20
-MOM_PERIOD = 5
-MIN_BAR = 75
-MAX_HOLD_BARS = 160
-ATR_STOP_MULT = 1.40
-ATR_TARGET_MULT = 2.80
-SIGNAL_INTERVAL = 25
+VOL_MULT = 1.3
+STOP_ATR_MULT = 0.70
+TARGET_ATR_MULT = 1.40
+BAR_CLOSE_MIN_PCT = 0.40
 
-ALLOWED_SYMBOLS = {"MARA", "CAVA", "DUOL", "PLTR", "NET"}
+
+def _atr(candles: pd.DataFrame, period: int) -> pd.Series:
+    hl = candles["high"] - candles["low"]
+    hc = np.abs(candles["high"] - candles["close"].shift(1))
+    lc = np.abs(candles["low"] - candles["close"].shift(1))
+    tr = pd.concat([hl, hc, lc], axis=1).max(axis=1)
+    return tr.rolling(window=period).mean()
+
+
+def _rsi(series: pd.Series, period: int) -> pd.Series:
+    delta = series.diff()
+    gain = delta.where(delta > 0, 0.0).rolling(period).mean()
+    loss = -delta.where(delta < 0, 0.0).rolling(period).mean()
+    rs = gain / loss.replace(0, np.nan)
+    return 100 - (100 / (1 + rs))
 
 
 def scan(candles: pd.DataFrame, symbol: str) -> list[dict]:
-    if symbol not in ALLOWED_SYMBOLS:
-        return []
-    if len(candles) < ATR_PERIOD + SMA_PERIOD + 60:
+    if len(candles) < SMA_LONG + 20:
         return []
 
     signals = []
     close = candles["close"]
-    high = candles["high"]
-    low = candles["low"]
-    volume = candles["volume"]
+    rsi = _rsi(close, RSI_PERIOD)
+    sma100 = close.rolling(SMA_LONG).mean()
+    sma_bb = close.rolling(BB_PERIOD).mean()
+    std_bb = close.rolling(BB_PERIOD).std()
+    lower_band = sma_bb - BB_STD * std_bb
+    atr = _atr(candles, ATR_PERIOD)
+    vol_avg = candles["volume"].rolling(20).mean()
 
-    sma = close.rolling(SMA_PERIOD).mean()
-    tp = (high + low + close) / 3.0
-    vwap = (tp * volume).cumsum() / volume.cumsum()
-
-    prev_close = close.shift(1)
-    tr = pd.concat([
-        high - low,
-        (high - prev_close).abs(),
-        (low - prev_close).abs()
-    ], axis=1).max(axis=1)
-    atr = tr.rolling(ATR_PERIOD).mean()
-
-    mom = close - close.shift(MOM_PERIOD)
-
-    for i in range(MIN_BAR, len(candles) - 20, SIGNAL_INTERVAL):
-        if (pd.isna(sma.iloc[i]) or pd.isna(vwap.iloc[i]) or
-            pd.isna(atr.iloc[i]) or pd.isna(mom.iloc[i])):
-            continue
-        if atr.iloc[i] <= 0:
+    for i in range(MIN_BAR, min(len(candles), MAX_ENTRY_BAR + 1)):
+        if (pd.isna(rsi.iloc[i]) or pd.isna(sma100.iloc[i]) or
+            pd.isna(lower_band.iloc[i]) or pd.isna(atr.iloc[i]) or
+            atr.iloc[i] <= 0 or pd.isna(vol_avg.iloc[i])):
             continue
 
-        if (close.iloc[i] >= sma.iloc[i] or
-            close.iloc[i] >= vwap.iloc[i] or
-            mom.iloc[i] >= 0):
+        price = close.iloc[i]
+        lo = candles["low"].iloc[i]
+        hi = candles["high"].iloc[i]
+        bar_range = hi - lo
+        if bar_range <= 0:
             continue
 
-        entry = float(close.iloc[i])
-        atr_val = float(atr.iloc[i])
+        # Oversold
+        if rsi.iloc[i] >= RSI_OVERSOLD:
+            continue
+        # Touching lower Bollinger Band
+        if lo > lower_band.iloc[i]:
+            continue
+        # Not in major downtrend (above SMA100)
+        if price < sma100.iloc[i]:
+            continue
+        # Volume washout
+        if candles["volume"].iloc[i] < vol_avg.iloc[i] * VOL_MULT:
+            continue
+        # Bar close shows buyers (upper portion)
+        if (price - lo) / bar_range < BAR_CLOSE_MIN_PCT:
+            continue
+
+        a = atr.iloc[i]
+        stop = round(price - STOP_ATR_MULT * a, 2)
+        target = round(price + TARGET_ATR_MULT * a, 2)
+        if stop >= price or target <= price:
+            continue
 
         signals.append({
             "entry_bar": i,
-            "direction": "short",
-            "order_type": "bracket",
-            "entry_price": entry,
-            "target_price": entry - atr_val * ATR_TARGET_MULT,
-            "stop_price": entry + atr_val * ATR_STOP_MULT,
+            "direction": "long",
+            "order_type": "limit",
+            "entry_price": round(price, 2),
+            "target_price": target,
+            "stop_price": stop,
             "max_hold_bars": MAX_HOLD_BARS,
-            "setup_type": "vwap_momentum_short",
+            "setup_type": "oversold_bounce_long",
             "legs_json": None,
         })
 

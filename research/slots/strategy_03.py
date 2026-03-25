@@ -1,138 +1,114 @@
 """
-Slot 03 — Short Momentum Breakdown with VWAP + EMA Filter (Regime-Aligned)
-(High-Vol Downtrend + Steady Momentum + Contracting Volume)
+Slot 03 — Bear Put Debit Spread (Bearish regime)
 
-Evolved for current regime: high volatility (ATR 5.55%), trend=down (68%),
-momentum=steady (+0.12), volume=contracting (0.80x), breadth=bullish (+0.52).
-Aligns with momentum_breakout (0.85) and vwap (0.80) environment fit.
+Mandate: bearish / short / options_directional
+Allowed order_types: vertical_spread, diagonal_spread
+
+Defined-risk bear put vertical spread on breakdown below support.
+Buys ATM put, sells lower-strike put for defined risk/reward.
 
 Core logic:
-- Short-only momentum breakdown: close breaks below 20-bar low on elevated
-  volume (2.0×) while below EMA20, EMA50, and VWAP
-- Close must finish in bottom 25% of its bar (avoids wick-only breaks)
-- EMA50 downslope filter for downtrend alignment
-- Negative 5-bar momentum (simple close delta < 0)
-- ATR(14) scaled stops/targets widened for high-vol regime:
-  STOP_ATR_MULT=1.1 (~6.1%), TARGET_ATR_MULT=2.0 (~11.1%) to survive
-  noise while keeping realistic R:R inside 5.22% intraday range
-- Max hold reduced to 10 bars to avoid late-day chop and timeout noise
-- Morning-only window (before bar 210 ≈ 13:00 ET)
-- Added intraday VWAP filter to enforce symbol-level down-bias and
-  reduce false breakdowns on bullish tape days
-- No hard symbol filter; logic naturally selects weak momentum names
-  (MARA, CAVA, DUOL, PLTR, NET) via breakdown + trend + VWAP conditions
-- Order type: stop_entry for realistic breakdown trigger
+- Price below both EMA20 and EMA50 (bearish structure)
+- Breakdown below 20-bar low with volume confirmation (1.5x avg)
+- Negative 5-bar momentum and EMA50 sloping down
+- Bar closes in lower 35% of range (decisive selling)
+- Bear put vertical: long ATM put, short put 5 points lower
+- ATR-based underlying targets for spread management
+- Morning entries only (before bar 150)
 """
 
 import pandas as pd
 import numpy as np
 
-MAX_HOLD_BARS = 10
+MAX_HOLD_BARS = 30
 MIN_BAR = 60
-VOL_MULT = 2.0
-EMA_SPAN = 20
+VOL_MULT = 1.5
+EMA_SHORT_SPAN = 20
 EMA_LONG_SPAN = 50
 ATR_PERIOD = 14
-STOP_ATR_MULT = 1.1
-TARGET_ATR_MULT = 2.0
-MAX_ENTRY_BAR = 210
 LOOKBACK_BREAK = 20
 MOM_BARS = 5
+STOP_ATR_MULT = 0.8
+TARGET_ATR_MULT = 1.8
+MAX_ENTRY_BAR = 150
+SPREAD_WIDTH = 5.0
 
 
-def calculate_atr(candles: pd.DataFrame, period: int) -> pd.Series:
-    high_low = candles["high"] - candles["low"]
-    high_close = np.abs(candles["high"] - candles["close"].shift(1))
-    low_close = np.abs(candles["low"] - candles["close"].shift(1))
-    tr = pd.concat([high_low, high_close, low_close], axis=1).max(axis=1)
-    atr = tr.rolling(window=period).mean()
-    return atr
-
-
-def calculate_vwap(candles: pd.DataFrame) -> pd.Series:
-    typical_price = (candles["high"] + candles["low"] + candles["close"]) / 3.0
-    cum_tp_vol = (typical_price * candles["volume"]).cumsum()
-    cum_vol = candles["volume"].cumsum()
-    vwap = cum_tp_vol / cum_vol
-    return vwap
+def _atr(candles: pd.DataFrame, period: int) -> pd.Series:
+    hl = candles["high"] - candles["low"]
+    hc = np.abs(candles["high"] - candles["close"].shift(1))
+    lc = np.abs(candles["low"] - candles["close"].shift(1))
+    tr = pd.concat([hl, hc, lc], axis=1).max(axis=1)
+    return tr.rolling(window=period).mean()
 
 
 def scan(candles: pd.DataFrame, symbol: str) -> list[dict]:
-    if len(candles) < 100:
+    if len(candles) < MIN_BAR + 30:
         return []
 
     signals = []
-
-    # EMAs for trend filter
-    ema_short = candles["close"].ewm(span=EMA_SPAN, adjust=False).mean()
-    ema_long = candles["close"].ewm(span=EMA_LONG_SPAN, adjust=False).mean()
-
-    # Volume average
+    ema20 = candles["close"].ewm(span=EMA_SHORT_SPAN, adjust=False).mean()
+    ema50 = candles["close"].ewm(span=EMA_LONG_SPAN, adjust=False).mean()
     vol_avg = candles["volume"].rolling(20).mean()
-
-    # ATR
-    atr = calculate_atr(candles, ATR_PERIOD)
-
-    # VWAP for down-bias filter
-    vwap_series = calculate_vwap(candles)
+    atr = _atr(candles, ATR_PERIOD)
+    rolling_low = candles["low"].rolling(LOOKBACK_BREAK).min()
 
     for i in range(MIN_BAR, len(candles) - 1):
         if i > MAX_ENTRY_BAR:
             continue
-
-        if (pd.isna(ema_short.iloc[i]) or pd.isna(ema_long.iloc[i]) or
-            pd.isna(vol_avg.iloc[i]) or pd.isna(atr.iloc[i]) or
-            pd.isna(vwap_series.iloc[i]) or
-            atr.iloc[i] <= 0 or vol_avg.iloc[i] <= 0):
+        if (pd.isna(ema20.iloc[i]) or pd.isna(ema50.iloc[i]) or
+            pd.isna(atr.iloc[i]) or atr.iloc[i] <= 0 or
+            pd.isna(vol_avg.iloc[i]) or pd.isna(rolling_low.iloc[i - 1])):
             continue
-
-        # Need history for breakdown level and momentum
         if i < LOOKBACK_BREAK + MOM_BARS + 5:
             continue
 
-        price = candles.iloc[i]["close"]
-        e_short = ema_short.iloc[i]
-        e_long = ema_long.iloc[i]
-        vwap_i = vwap_series.iloc[i]
+        price = candles["close"].iloc[i]
         a = atr.iloc[i]
-        vol = candles.iloc[i]["volume"]
-        vol_threshold = vol_avg.iloc[i] * VOL_MULT
 
-        # Breakdown level from prior bars (not including current bar)
-        prior_low = candles["low"].iloc[i - LOOKBACK_BREAK:i].min()
+        # Bearish structure: below both EMAs
+        if price >= ema20.iloc[i] or price >= ema50.iloc[i]:
+            continue
+        # EMA50 sloping down
+        if ema50.iloc[i] >= ema50.iloc[i - 3]:
+            continue
+        # Breakdown below prior 20-bar low
+        if price >= rolling_low.iloc[i - 1]:
+            continue
+        # Volume confirmation
+        if candles["volume"].iloc[i] < vol_avg.iloc[i] * VOL_MULT:
+            continue
+        # Negative momentum
+        if price >= candles["close"].iloc[i - MOM_BARS]:
+            continue
+        # Decisive selling — close in lower 35% of bar
+        bar_range = candles["high"].iloc[i] - candles["low"].iloc[i]
+        if bar_range <= 0:
+            continue
+        if (price - candles["low"].iloc[i]) / bar_range > 0.35:
+            continue
 
-        # EMA50 downslope filter (regime alignment)
-        ema50_slope_down = ema_long.iloc[i] < ema_long.iloc[i - 3]
+        entry = price
+        # Bear put vertical: long ATM put, short lower put
+        long_strike = round(entry)
+        short_strike = long_strike - SPREAD_WIDTH
 
-        # Momentum (simple negative)
-        mom_now = price - candles.iloc[i - MOM_BARS]["close"]
-
-        current_bar = candles.iloc[i]
-        bar_range = current_bar["high"] - current_bar["low"]
-        close_in_lower_quarter = (bar_range > 0 and
-                                  price <= current_bar["low"] + 0.25 * bar_range)
-
-        # Short momentum breakdown setup with improved filters
-        if (current_bar["close"] < prior_low and
-            close_in_lower_quarter and
-            vol > vol_threshold and
-            price < e_short and
-            price < e_long and
-            price < vwap_i and
-            ema50_slope_down and
-            mom_now < 0):
-            
-            entry_price = prior_low  # trigger level for stop_entry
-            signals.append({
-                "entry_bar": i,
-                "direction": "short",
-                "order_type": "stop_entry",
-                "entry_price": entry_price,
-                "target_price": entry_price - TARGET_ATR_MULT * a,
-                "stop_price": entry_price + STOP_ATR_MULT * a,
-                "max_hold_bars": MAX_HOLD_BARS,
-                "setup_type": "momentum_breakdown_short_vwap",
-                "legs_json": None,
-            })
+        signals.append({
+            "entry_bar": i,
+            "direction": "short",
+            "order_type": "vertical_spread",
+            "entry_price": entry,
+            "target_price": entry - TARGET_ATR_MULT * a,
+            "stop_price": entry + STOP_ATR_MULT * a,
+            "max_hold_bars": MAX_HOLD_BARS,
+            "setup_type": "bear_put_vertical_breakdown",
+            "legs_json": {
+                "strategy": "vertical_spread",
+                "expiration": "nearest_weekly",
+                "long_strike": float(long_strike),
+                "short_strike": float(short_strike),
+                "right": "P",
+            },
+        })
 
     return signals

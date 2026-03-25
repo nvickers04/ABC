@@ -1,35 +1,33 @@
 """
-Slot 08 — Bullish-Skew Iron Condor (Bullish regime)
+Slot 08 — Regime-Adaptive Bullish-Skew Iron Condor
 
 Mandate: bullish / neutral / options_premium
-Allowed order_types: iron_condor, butterfly, strangle, straddle
+Allowed order_types: iron_condor, butterfly, straddle, strangle
 
-Premium collection via iron condor with upside skew in bullish regime.
-Wider call wing, tighter put wing to lean bullish while collecting theta.
-
-Core logic:
-- Price above SMA50 (bullish backdrop)
-- Low directional momentum (abs 5-bar ROC < 1.5%) — range-bound intraday
-- Bollinger bandwidth compression (squeeze condition)
-- Iron condor: sell OTM put & call, buy further OTM wings
-  Put spread narrower (5pt), call spread wider (10pt) for bullish skew
-- Entry after opening volatility settles (bar 60+)
-- Long max_hold — premium strategies need time to decay
-- 30-bar signal spacing
+Bullish-leaning premium collection via iron condor with upside skew.
+Wider call wing (more room on upside) while keeping tighter put wing.
+Fully adapted to current high-vol, down-trend, bearish-breadth regime:
+- Uses env dict to detect volatility_regime and trend_regime
+- Shorter SMA20 for local structure instead of SMA50
+- Mild bullish filter: relaxed to allow price modestly below SMA in down regime
+- ROC threshold scaled by volatility regime (more tolerance in high vol)
+- Bandwidth squeeze only enforced in normal/low vol regimes
+- ATR-scaled strike distances with consistent upside skew
+- Wider stops/targets in high-vol regime
+- Earlier entry (bar 45+), moderate signal spacing, long hold for theta
+- Correct legs_json key names per schema
 """
 
 import pandas as pd
 import numpy as np
 
 ATR_PERIOD = 14
-SMA_PERIOD = 50
 BB_PERIOD = 20
 BB_STD = 2.0
 ROC_BARS = 5
-MIN_BAR = 60
-MAX_HOLD_BARS = 200
-MAX_ROC_ABS = 0.015
-SIGNAL_INTERVAL = 30
+MIN_BAR_BASE = 45
+MAX_HOLD_BARS = 180
+SIGNAL_INTERVAL = 15
 
 
 def _atr(candles: pd.DataFrame, period: int) -> pd.Series:
@@ -40,67 +38,87 @@ def _atr(candles: pd.DataFrame, period: int) -> pd.Series:
     return tr.rolling(window=period).mean()
 
 
-def scan(candles: pd.DataFrame, symbol: str) -> list[dict]:
-    if len(candles) < MIN_BAR + SMA_PERIOD + BB_PERIOD + 10:
+def scan(candles: pd.DataFrame, symbol: str, env: dict = None) -> list[dict]:
+    if len(candles) < 120:
         return []
 
     signals = []
     close = candles["close"]
-    sma50 = close.rolling(SMA_PERIOD).mean()
+    
+    # Regime awareness
+    vol_regime = env.get("volatility_regime", "normal") if env and isinstance(env, dict) else "normal"
+    trend_regime = env.get("trend_regime", "flat") if env and isinstance(env, dict) else "flat"
+    is_high_vol = vol_regime == "high"
+    is_down_trend = trend_regime == "down"
+    
+    sma_period = 20
+    sma = close.rolling(sma_period).mean()
     atr = _atr(candles, ATR_PERIOD)
     roc = close.pct_change(ROC_BARS)
-
-    # Bollinger bandwidth for squeeze detection
+    
+    # Bollinger bandwidth for optional squeeze detection
     sma_bb = close.rolling(BB_PERIOD).mean()
-    std_bb = close.rolling(BB_PERIOD).std()
+    std_bb = close.rolling(BB_PERIOD).std(ddof=0)
     bandwidth = (std_bb * BB_STD * 2) / sma_bb
-    bw_q50 = bandwidth.rolling(60, min_periods=30).quantile(0.50)
-
-    for i in range(MIN_BAR, len(candles) - 20, SIGNAL_INTERVAL):
-        if (pd.isna(sma50.iloc[i]) or pd.isna(atr.iloc[i]) or
-            pd.isna(roc.iloc[i]) or pd.isna(bandwidth.iloc[i]) or
-            pd.isna(bw_q50.iloc[i]) or atr.iloc[i] <= 0):
+    bw_q50 = bandwidth.rolling(50, min_periods=25).quantile(0.50)
+    
+    min_bar = 30 if is_high_vol else MIN_BAR_BASE
+    max_roc_abs = 0.035 if is_high_vol else 0.018
+    max_hold = 160 if is_high_vol else MAX_HOLD_BARS
+    wing_scale = 7.5 if is_high_vol else 5.0
+    
+    for i in range(min_bar, len(candles) - 25, SIGNAL_INTERVAL):
+        if any(pd.isna(x) for x in (
+            sma.iloc[i], atr.iloc[i], roc.iloc[i], 
+            bandwidth.iloc[i], bw_q50.iloc[i]
+        )) or atr.iloc[i] <= 0:
             continue
 
-        price = close.iloc[i]
-
-        # Bullish context
-        if price <= sma50.iloc[i]:
-            continue
-        # Range-bound — no strong directional move
-        if abs(roc.iloc[i]) > MAX_ROC_ABS:
-            continue
-        # Bandwidth compression (squeeze-ish)
-        if bandwidth.iloc[i] > bw_q50.iloc[i]:
-            continue
-
-        entry = float(price)
+        price = float(close.iloc[i])
+        sma_val = float(sma.iloc[i])
         a = float(atr.iloc[i])
+        
+        # Mild bullish-leaning filter, relaxed in downtrend regime
+        if is_down_trend:
+            if price < sma_val * 0.965:  # allow modest drawdown in bearish regime
+                continue
+        else:
+            if price < sma_val * 0.992:
+                continue
+        
+        # Range-bound filter with volatility-adjusted tolerance
+        if abs(roc.iloc[i]) > max_roc_abs:
+            continue
+        
+        # Bandwidth compression only required outside high-vol regime
+        if not is_high_vol and bandwidth.iloc[i] > bw_q50.iloc[i] * 1.15:
+            continue
 
-        # Iron condor strikes — bullish skew (tighter put side)
-        base = round(entry / 5.0) * 5.0
-        short_put = base - 5.0
-        long_put = short_put - 5.0        # 5-pt put wing (tighter)
-        short_call = base + 10.0
-        long_call = short_call + 10.0      # 10-pt call wing (wider)
+        # Base strike rounded to nearest 5
+        base = round(price / 5.0) * 5.0
+        
+        # Upside skew: tighter put wing, wider call wing (bullish-leaning)
+        short_put = base - wing_scale
+        long_put = short_put - wing_scale
+        short_call = base + int(wing_scale * 1.8)
+        long_call = short_call + int(wing_scale * 1.6)
 
         signals.append({
             "entry_bar": i,
             "direction": "neutral",
             "order_type": "iron_condor",
-            "entry_price": entry,
-            "target_price": entry + 0.5 * a,
-            "stop_price": entry - 1.5 * a,
-            "max_hold_bars": MAX_HOLD_BARS,
-            "setup_type": "bullish_skew_iron_condor",
+            "entry_price": price,
+            "target_price": price + 0.4 * a,
+            "stop_price": price - 2.2 * a,
+            "max_hold_bars": max_hold,
+            "setup_type": "regime_adapted_bullish_skew_ic",
             "legs_json": {
                 "strategy": "iron_condor",
                 "expiration": "nearest_weekly",
-                "long_put": float(long_put),
-                "short_put": float(short_put),
-                "short_call": float(short_call),
-                "long_call": float(long_call),
-                "right": "both",
+                "put_long_strike": float(long_put),
+                "put_short_strike": float(short_put),
+                "call_short_strike": float(short_call),
+                "call_long_strike": float(long_call)
             },
         })
 

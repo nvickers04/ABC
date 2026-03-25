@@ -1,90 +1,109 @@
 """
-Slot 06 — Momentum Breakout Call Debit Spread
+Slot 06 — Long Stock Momentum Breakout (Bullish regime)
 
-Bullish vertical call spread on break above 20-bar high in strong_up regime.
-Requires volume confirmation (>1.8x avg), price above SMA(50), SMA(20)>SMA(50)
-for trend alignment, and short-term positive momentum (close > close[5]).
-Uses realistic intraday ATR multiples (target 1.0 ATR, stop 0.6 ATR) given
-extreme volatility and ~30-minute typical hold window. Focused on morning
-momentum in high-fit momentum_breakout + long_options environment.
-Strikes rounded to nearest 5 for realistic option chaining.
+Mandate: bullish / long / stock_momentum
+Allowed order_types: market, vwap, stop_entry, moo
+
+Momentum breakout long entries on trend-following triggers using VWAP
+order type. Mirror of Slot 01 (bearish VWAP rejection) but for longs.
+
+Core logic:
+- VWAP cross-up reclaim on high volume (>=1.8x 20-bar avg)
+- Price above both EMA20 and EMA50 (bullish structure)
+- Positive 5-bar ROC (confirms momentum)
+- Decisive reclaim: close at least 0.10 ATR above VWAP
+- Bar closes in upper 60% of range (buying pressure)
+- ATR-based stops/targets (0.5 ATR stop, 1.6 ATR target)
+- Morning entries (before bar 180)
 """
 
 import pandas as pd
 import numpy as np
 
-LOOKBACK = 20
+MAX_HOLD_BARS = 15
+MIN_BAR = 50
+VOL_MULT = 1.8
+EMA_SHORT_SPAN = 20
+EMA_LONG_SPAN = 50
 ATR_PERIOD = 14
-VOLUME_MULT = 1.8
-MIN_BAR = 30
-MAX_HOLD_BARS = 25
-TREND_PERIOD = 50
-FAST_MA = 20
-TARGET_ATR_MULT = 1.0
-STOP_ATR_MULT = 0.6
+ROC_BARS = 5
+STOP_ATR_MULT = 0.50
+TARGET_ATR_MULT = 1.60
+MAX_ENTRY_BAR = 180
+MIN_CROSS_DEPTH_ATR = 0.10
+BAR_CLOSE_MIN_PCT = 0.60
+
+
+def _atr(candles: pd.DataFrame, period: int) -> pd.Series:
+    hl = candles["high"] - candles["low"]
+    hc = np.abs(candles["high"] - candles["close"].shift(1))
+    lc = np.abs(candles["low"] - candles["close"].shift(1))
+    tr = pd.concat([hl, hc, lc], axis=1).max(axis=1)
+    return tr.rolling(window=period).mean()
 
 
 def scan(candles: pd.DataFrame, symbol: str) -> list[dict]:
-    min_bars = max(LOOKBACK, ATR_PERIOD, TREND_PERIOD, FAST_MA, MIN_BAR) + 10
-    if len(candles) < min_bars + 1:
+    if len(candles) < MIN_BAR + 30:
         return []
 
     signals = []
-    rolling_high = candles["high"].rolling(LOOKBACK).max()
-    vol_avg = candles["volume"].rolling(LOOKBACK).mean().shift(1)
-    sma = candles["close"].rolling(TREND_PERIOD).mean()
-    sma_fast = candles["close"].rolling(FAST_MA).mean()
+    cum_vol = candles["volume"].cumsum()
+    cum_pv = (candles["close"] * candles["volume"]).cumsum()
+    vwap = cum_pv / cum_vol.replace(0, np.nan)
 
-    prev_close = candles["close"].shift(1)
-    tr = np.maximum(
-        candles["high"] - candles["low"],
-        np.maximum(np.abs(candles["high"] - prev_close), np.abs(candles["low"] - prev_close)),
-    )
-    atr = tr.rolling(ATR_PERIOD).mean()
+    ema20 = candles["close"].ewm(span=EMA_SHORT_SPAN, adjust=False).mean()
+    ema50 = candles["close"].ewm(span=EMA_LONG_SPAN, adjust=False).mean()
+    vol_avg = candles["volume"].rolling(20).mean()
+    atr = _atr(candles, ATR_PERIOD)
+    roc = candles["close"].pct_change(ROC_BARS)
 
-    start = max(LOOKBACK, ATR_PERIOD, TREND_PERIOD, FAST_MA, MIN_BAR) + 5
-    for i in range(start, len(candles) - 1):
-        row = candles.iloc[i]
-        if (pd.isna(rolling_high.iloc[i - 1]) or pd.isna(vol_avg.iloc[i]) or
-            pd.isna(sma.iloc[i]) or pd.isna(sma_fast.iloc[i]) or pd.isna(atr.iloc[i])):
+    for i in range(MIN_BAR, len(candles) - 1):
+        if i > MAX_ENTRY_BAR:
+            continue
+        if (pd.isna(vwap.iloc[i]) or pd.isna(ema20.iloc[i]) or
+            pd.isna(ema50.iloc[i]) or pd.isna(vol_avg.iloc[i]) or
+            pd.isna(atr.iloc[i]) or pd.isna(roc.iloc[i]) or atr.iloc[i] <= 0):
             continue
 
-        # Momentum breakout conditions aligned with strong_up environment
-        if row["close"] <= rolling_high.iloc[i - 1]:
+        price = candles["close"].iloc[i]
+        prev_price = candles["close"].iloc[i - 1]
+        v = vwap.iloc[i]
+        a = atr.iloc[i]
+
+        # VWAP cross-up reclaim
+        if not (prev_price < v and price > v):
             continue
-        if row["volume"] <= vol_avg.iloc[i] * VOLUME_MULT:
+        # Decisive displacement above VWAP
+        if (price - v) < (MIN_CROSS_DEPTH_ATR * a):
             continue
-        if row["close"] <= sma.iloc[i]:
+        # Bullish structure: above both EMAs
+        if price < ema20.iloc[i] or price < ema50.iloc[i]:
             continue
-        if sma_fast.iloc[i] <= sma.iloc[i]:
+        # Positive momentum
+        if roc.iloc[i] <= 0:
             continue
-        # Short-term momentum filter (rising into the breakout)
-        if i < 5 or row["close"] <= candles["close"].iloc[i - 5]:
+        # Volume confirmation
+        if candles["volume"].iloc[i] < vol_avg.iloc[i] * VOL_MULT:
+            continue
+        # Strong bar close
+        bar_range = candles["high"].iloc[i] - candles["low"].iloc[i]
+        if bar_range <= 0:
+            continue
+        close_pct = (price - candles["low"].iloc[i]) / bar_range
+        if close_pct < BAR_CLOSE_MIN_PCT:
             continue
 
-        entry = row["close"]
-        cur_atr = atr.iloc[i]
-
-        # ATM-ish strikes rounded to nearest 5 for realistic option liquidity
-        base_strike = round(entry / 5.0) * 5.0
-        long_strike = base_strike
-        short_strike = base_strike + 5.0
-
+        entry = price
         signals.append({
             "entry_bar": i,
             "direction": "long",
-            "order_type": "vertical_spread",
+            "order_type": "vwap",
             "entry_price": entry,
-            "target_price": entry + cur_atr * TARGET_ATR_MULT,
-            "stop_price": entry - cur_atr * STOP_ATR_MULT,
+            "target_price": entry + TARGET_ATR_MULT * a,
+            "stop_price": entry - STOP_ATR_MULT * a,
             "max_hold_bars": MAX_HOLD_BARS,
-            "setup_type": "momentum_breakout_call_spread",
-            "legs_json": {
-                "strategy": "vertical_spread",
-                "expiration": "nearest_weekly",
-                "long_strike": float(long_strike),
-                "short_strike": float(short_strike),
-                "right": "C",
-            },
+            "setup_type": "vwap_reclaim_momentum_long",
+            "legs_json": None,
         })
+
     return signals

@@ -1,109 +1,107 @@
 """
-Slot 10 — Short-Only VWAP Rejection (Tight ATR Risk, Dual-EMA + Momentum Filter)
+Slot 11 — Neutral Iron Condor (Choppy regime)
 
-Evolved for current regime: high volatility (ATR 5.28%), downtrend (68% trending down),
-accelerating momentum (+0.78), bullish breadth (+0.28), normal volume (0.86x).
-Prioritizes momentum_breakout (1.00) and vwap (0.80). Strict short bias only.
+Mandate: choppy / neutral / options_premium
+Allowed order_types: iron_condor, butterfly, straddle, strangle
+
+Centred premium collection via symmetric iron condor for range-bound
+markets. No directional skew — pure theta decay play.
 
 Core logic:
-- VWAP cross-down rejections on high volume (>=2.0x 20-bar avg)
-- Strong trend filter: shorts ONLY when below BOTH EMA20 and EMA50
-- Momentum filter: 5-bar ROC must be negative (aligns with accelerating downtrend)
-- Decisive rejection: must close at least 0.12 * ATR below VWAP (avoids wick noise)
-- Tight ATR(14) stops/targets for high-vol regime (0.45 stop / 1.65 target)
-  — addresses prior issue of never hitting wide stops and bleeding on small moves
-- Morning-only entries (before bar 180 ≈ 12:00 ET) to capture highest-edge window
-- Reduced max hold (12 bars) to minimize timeout drag in chop
-- Completely removed all long logic given dominant downtrend regime
-- Naturally surfaces on momentum leaders (MARA, CAVA, DUOL, PLTR, NET)
+- Price near SMA50 (within 1 ATR — centered, not trending)
+- Low directional momentum (abs 5-bar ROC < 1.0%)
+- Bollinger bandwidth below median (compressed = range-bound ideal)
+- Symmetric iron condor: equal-width wings on both sides
+- Entry after opening settles (bar 60+)
+- Long hold (rest of session) for theta decay
+- 35-bar signal spacing
 """
 
 import pandas as pd
 import numpy as np
 
-MAX_HOLD_BARS = 12
-MIN_BAR = 50
-VOL_MULT = 2.0
-EMA_SHORT_SPAN = 20
-EMA_LONG_SPAN = 50
 ATR_PERIOD = 14
-STOP_ATR_MULT = 0.45
-TARGET_ATR_MULT = 1.65
-MAX_ENTRY_BAR = 180
-MIN_CROSS_DEPTH_ATR = 0.12
+SMA_PERIOD = 50
+BB_PERIOD = 20
+BB_STD = 2.0
+ROC_BARS = 5
+MIN_BAR = 60
+MAX_HOLD_BARS = 220
+MAX_ROC_ABS = 0.010
+SIGNAL_INTERVAL = 35
+SMA_PROXIMITY_ATR = 1.0
+WING_WIDTH = 7.5
 
 
-def calculate_atr(candles: pd.DataFrame, period: int) -> pd.Series:
-    high_low = candles["high"] - candles["low"]
-    high_close = np.abs(candles["high"] - candles["close"].shift(1))
-    low_close = np.abs(candles["low"] - candles["close"].shift(1))
-    tr = pd.concat([high_low, high_close, low_close], axis=1).max(axis=1)
-    atr = tr.rolling(window=period).mean()
-    return atr
+def _atr(candles: pd.DataFrame, period: int) -> pd.Series:
+    hl = candles["high"] - candles["low"]
+    hc = np.abs(candles["high"] - candles["close"].shift(1))
+    lc = np.abs(candles["low"] - candles["close"].shift(1))
+    tr = pd.concat([hl, hc, lc], axis=1).max(axis=1)
+    return tr.rolling(window=period).mean()
 
 
 def scan(candles: pd.DataFrame, symbol: str) -> list[dict]:
-    if len(candles) < MIN_BAR + 30:
+    if len(candles) < MIN_BAR + SMA_PERIOD + BB_PERIOD + 10:
         return []
 
     signals = []
+    close = candles["close"]
+    sma50 = close.rolling(SMA_PERIOD).mean()
+    atr = _atr(candles, ATR_PERIOD)
+    roc = close.pct_change(ROC_BARS)
 
-    # VWAP
-    cum_vol = candles["volume"].cumsum()
-    cum_pv = (candles["close"] * candles["volume"]).cumsum()
-    vwap = cum_pv / cum_vol.replace(0, np.nan)
+    sma_bb = close.rolling(BB_PERIOD).mean()
+    std_bb = close.rolling(BB_PERIOD).std()
+    bandwidth = (std_bb * BB_STD * 2) / sma_bb
+    bw_median = bandwidth.rolling(60, min_periods=30).quantile(0.50)
 
-    # EMAs for trend filter
-    ema20 = candles["close"].ewm(span=EMA_SHORT_SPAN, adjust=False).mean()
-    ema50 = candles["close"].ewm(span=EMA_LONG_SPAN, adjust=False).mean()
-
-    # Volume average
-    vol_avg = candles["volume"].rolling(20).mean()
-
-    # ATR
-    atr = calculate_atr(candles, ATR_PERIOD)
-
-    # Momentum (5-bar ROC, negative = down momentum)
-    roc5 = candles["close"].pct_change(5)
-
-    for i in range(MIN_BAR, len(candles) - 1):
-        if i > MAX_ENTRY_BAR:
+    for i in range(MIN_BAR, len(candles) - 20, SIGNAL_INTERVAL):
+        if (pd.isna(sma50.iloc[i]) or pd.isna(atr.iloc[i]) or
+            pd.isna(roc.iloc[i]) or pd.isna(bandwidth.iloc[i]) or
+            pd.isna(bw_median.iloc[i]) or atr.iloc[i] <= 0):
             continue
 
-        if (pd.isna(vwap.iloc[i]) or pd.isna(ema20.iloc[i]) or pd.isna(ema50.iloc[i]) or
-            pd.isna(vol_avg.iloc[i]) or pd.isna(atr.iloc[i]) or pd.isna(roc5.iloc[i]) or
-            atr.iloc[i] <= 0):
-            continue
-
-        price = candles.iloc[i]["close"]
-        prev_price = candles.iloc[i - 1]["close"]
-        v = vwap.iloc[i]
-        e20 = ema20.iloc[i]
-        e50 = ema50.iloc[i]
+        price = close.iloc[i]
         a = atr.iloc[i]
-        vol = candles.iloc[i]["volume"]
-        vol_threshold = vol_avg.iloc[i] * VOL_MULT
-        momentum = roc5.iloc[i]
 
-        # Short rejection: cross below VWAP on high volume, below both EMAs,
-        # negative momentum, and decisive displacement below VWAP
-        if (prev_price > v and price < v and
-            vol > vol_threshold and
-            price < e20 and price < e50 and
-            momentum < 0 and
-            (v - price) > (MIN_CROSS_DEPTH_ATR * a)):
-            
-            entry = price
-            signals.append({
-                "entry_bar": i,
-                "direction": "short",
-                "order_type": "vwap",
-                "entry_price": entry,
-                "target_price": entry - TARGET_ATR_MULT * a,
-                "stop_price": entry + STOP_ATR_MULT * a,
-                "max_hold_bars": MAX_HOLD_BARS,
-                "setup_type": "vwap_rejection_momentum_short",
-                "legs_json": None,
-            })
+        # Centred near SMA50
+        if abs(price - sma50.iloc[i]) > SMA_PROXIMITY_ATR * a:
+            continue
+        # No momentum — range-bound
+        if abs(roc.iloc[i]) > MAX_ROC_ABS:
+            continue
+        # Compressed bandwidth
+        if bandwidth.iloc[i] > bw_median.iloc[i]:
+            continue
+
+        entry = float(price)
+
+        # Symmetric iron condor
+        base = round(entry / 5.0) * 5.0
+        short_put = base - 5.0
+        long_put = short_put - WING_WIDTH
+        short_call = base + 5.0
+        long_call = short_call + WING_WIDTH
+
+        signals.append({
+            "entry_bar": i,
+            "direction": "neutral",
+            "order_type": "iron_condor",
+            "entry_price": entry,
+            "target_price": entry,
+            "stop_price": entry + 1.5 * a,
+            "max_hold_bars": MAX_HOLD_BARS,
+            "setup_type": "neutral_iron_condor",
+            "legs_json": {
+                "strategy": "iron_condor",
+                "expiration": "nearest_weekly",
+                "long_put": float(long_put),
+                "short_put": float(short_put),
+                "short_call": float(short_call),
+                "long_call": float(long_call),
+                "right": "both",
+            },
+        })
 
     return signals

@@ -1,109 +1,117 @@
 """
-Slot 10 — Short-Only VWAP Rejection (Tight ATR Risk, Dual-EMA + Momentum Filter)
+Slot 10 — Mean Reversion Short (Choppy regime)
 
-Evolved for current regime: high volatility (ATR 5.28%), downtrend (68% trending down),
-accelerating momentum (+0.78), bullish breadth (+0.28), normal volume (0.86x).
-Prioritizes momentum_breakout (1.00) and vwap (0.80). Strict short bias only.
+Mandate: choppy / short / stock_mean_reversion
+Allowed order_types: limit, midprice, moc
+
+Overbought fade entries at resistance levels with limit orders.
+Shorts when RSI spikes above overbought threshold near upper Bollinger
+Band in range-bound (choppy) markets.
 
 Core logic:
-- VWAP cross-down rejections on high volume (>=2.0x 20-bar avg)
-- Strong trend filter: shorts ONLY when below BOTH EMA20 and EMA50
-- Momentum filter: 5-bar ROC must be negative (aligns with accelerating downtrend)
-- Decisive rejection: must close at least 0.12 * ATR below VWAP (avoids wick noise)
-- Tight ATR(14) stops/targets for high-vol regime (0.45 stop / 1.65 target)
-  — addresses prior issue of never hitting wide stops and bleeding on small moves
-- Morning-only entries (before bar 180 ≈ 12:00 ET) to capture highest-edge window
-- Reduced max hold (12 bars) to minimize timeout drag in chop
-- Completely removed all long logic given dominant downtrend regime
-- Naturally surfaces on momentum leaders (MARA, CAVA, DUOL, PLTR, NET)
+- RSI(14) above 70 (overbought)
+- Price touches or exceeds upper Bollinger Band (2 std)
+- Price below SMA100 (not in a major uptrend — choppy/capped)
+- Volume spike on blow-off bar (>1.3x avg)
+- Close in lower 40% of bar range (sellers stepping in)
+- Limit order at close (fading the overbought spike)
+- Tight risk: 0.7 ATR stop, 1.4 ATR target (2:1 R:R)
+- Entry window: bars 40–250
 """
 
 import pandas as pd
 import numpy as np
 
-MAX_HOLD_BARS = 12
-MIN_BAR = 50
-VOL_MULT = 2.0
-EMA_SHORT_SPAN = 20
-EMA_LONG_SPAN = 50
+MAX_HOLD_BARS = 30
+MIN_BAR = 40
+MAX_ENTRY_BAR = 250
+RSI_PERIOD = 14
+RSI_OVERBOUGHT = 70.0
+BB_PERIOD = 20
+BB_STD = 2.0
+SMA_LONG = 100
 ATR_PERIOD = 14
-STOP_ATR_MULT = 0.45
-TARGET_ATR_MULT = 1.65
-MAX_ENTRY_BAR = 180
-MIN_CROSS_DEPTH_ATR = 0.12
+VOL_MULT = 1.3
+STOP_ATR_MULT = 0.70
+TARGET_ATR_MULT = 1.40
+BAR_CLOSE_MAX_PCT = 0.40
 
 
-def calculate_atr(candles: pd.DataFrame, period: int) -> pd.Series:
-    high_low = candles["high"] - candles["low"]
-    high_close = np.abs(candles["high"] - candles["close"].shift(1))
-    low_close = np.abs(candles["low"] - candles["close"].shift(1))
-    tr = pd.concat([high_low, high_close, low_close], axis=1).max(axis=1)
-    atr = tr.rolling(window=period).mean()
-    return atr
+def _atr(candles: pd.DataFrame, period: int) -> pd.Series:
+    hl = candles["high"] - candles["low"]
+    hc = np.abs(candles["high"] - candles["close"].shift(1))
+    lc = np.abs(candles["low"] - candles["close"].shift(1))
+    tr = pd.concat([hl, hc, lc], axis=1).max(axis=1)
+    return tr.rolling(window=period).mean()
+
+
+def _rsi(series: pd.Series, period: int) -> pd.Series:
+    delta = series.diff()
+    gain = delta.where(delta > 0, 0.0).rolling(period).mean()
+    loss = -delta.where(delta < 0, 0.0).rolling(period).mean()
+    rs = gain / loss.replace(0, np.nan)
+    return 100 - (100 / (1 + rs))
 
 
 def scan(candles: pd.DataFrame, symbol: str) -> list[dict]:
-    if len(candles) < MIN_BAR + 30:
+    if len(candles) < SMA_LONG + 20:
         return []
 
     signals = []
-
-    # VWAP
-    cum_vol = candles["volume"].cumsum()
-    cum_pv = (candles["close"] * candles["volume"]).cumsum()
-    vwap = cum_pv / cum_vol.replace(0, np.nan)
-
-    # EMAs for trend filter
-    ema20 = candles["close"].ewm(span=EMA_SHORT_SPAN, adjust=False).mean()
-    ema50 = candles["close"].ewm(span=EMA_LONG_SPAN, adjust=False).mean()
-
-    # Volume average
+    close = candles["close"]
+    rsi = _rsi(close, RSI_PERIOD)
+    sma100 = close.rolling(SMA_LONG).mean()
+    sma_bb = close.rolling(BB_PERIOD).mean()
+    std_bb = close.rolling(BB_PERIOD).std()
+    upper_band = sma_bb + BB_STD * std_bb
+    atr = _atr(candles, ATR_PERIOD)
     vol_avg = candles["volume"].rolling(20).mean()
 
-    # ATR
-    atr = calculate_atr(candles, ATR_PERIOD)
-
-    # Momentum (5-bar ROC, negative = down momentum)
-    roc5 = candles["close"].pct_change(5)
-
-    for i in range(MIN_BAR, len(candles) - 1):
-        if i > MAX_ENTRY_BAR:
+    for i in range(MIN_BAR, min(len(candles), MAX_ENTRY_BAR + 1)):
+        if (pd.isna(rsi.iloc[i]) or pd.isna(sma100.iloc[i]) or
+            pd.isna(upper_band.iloc[i]) or pd.isna(atr.iloc[i]) or
+            atr.iloc[i] <= 0 or pd.isna(vol_avg.iloc[i])):
             continue
 
-        if (pd.isna(vwap.iloc[i]) or pd.isna(ema20.iloc[i]) or pd.isna(ema50.iloc[i]) or
-            pd.isna(vol_avg.iloc[i]) or pd.isna(atr.iloc[i]) or pd.isna(roc5.iloc[i]) or
-            atr.iloc[i] <= 0):
+        price = close.iloc[i]
+        lo = candles["low"].iloc[i]
+        hi = candles["high"].iloc[i]
+        bar_range = hi - lo
+        if bar_range <= 0:
             continue
 
-        price = candles.iloc[i]["close"]
-        prev_price = candles.iloc[i - 1]["close"]
-        v = vwap.iloc[i]
-        e20 = ema20.iloc[i]
-        e50 = ema50.iloc[i]
+        # Overbought
+        if rsi.iloc[i] <= RSI_OVERBOUGHT:
+            continue
+        # Touching upper Bollinger Band
+        if hi < upper_band.iloc[i]:
+            continue
+        # Not in major uptrend (below SMA100 = capped/choppy)
+        if price > sma100.iloc[i]:
+            continue
+        # Volume blow-off
+        if candles["volume"].iloc[i] < vol_avg.iloc[i] * VOL_MULT:
+            continue
+        # Bar close shows sellers (lower portion)
+        if (price - lo) / bar_range > BAR_CLOSE_MAX_PCT:
+            continue
+
         a = atr.iloc[i]
-        vol = candles.iloc[i]["volume"]
-        vol_threshold = vol_avg.iloc[i] * VOL_MULT
-        momentum = roc5.iloc[i]
+        stop = round(price + STOP_ATR_MULT * a, 2)
+        target = round(price - TARGET_ATR_MULT * a, 2)
+        if stop <= price or target >= price:
+            continue
 
-        # Short rejection: cross below VWAP on high volume, below both EMAs,
-        # negative momentum, and decisive displacement below VWAP
-        if (prev_price > v and price < v and
-            vol > vol_threshold and
-            price < e20 and price < e50 and
-            momentum < 0 and
-            (v - price) > (MIN_CROSS_DEPTH_ATR * a)):
-            
-            entry = price
-            signals.append({
-                "entry_bar": i,
-                "direction": "short",
-                "order_type": "vwap",
-                "entry_price": entry,
-                "target_price": entry - TARGET_ATR_MULT * a,
-                "stop_price": entry + STOP_ATR_MULT * a,
-                "max_hold_bars": MAX_HOLD_BARS,
-                "setup_type": "vwap_rejection_momentum_short",
-                "legs_json": None,
-            })
+        signals.append({
+            "entry_bar": i,
+            "direction": "short",
+            "order_type": "limit",
+            "entry_price": round(price, 2),
+            "target_price": target,
+            "stop_price": stop,
+            "max_hold_bars": MAX_HOLD_BARS,
+            "setup_type": "overbought_fade_short",
+            "legs_json": None,
+        })
 
     return signals

@@ -1,26 +1,24 @@
 """
-Slot 04 — Regime-Gated Bearish-Skew Iron Condor (Tighter Upside + Dynamic ROC + More Samples)
+Slot 04 — Regime-Gated Bearish-Skew Iron Condor (Loosened ROC + Signal Spacing + Later Entry + Wider Samples)
 
 Mandate: bearish / neutral / options_premium
 Allowed order_types: butterfly, iron_condor, straddle, strangle
 
-Adapted to CURRENT environment: Volatility=high (ATR 5.02%), Trend=down,
-Breadth=bearish (A/D -0.54), Momentum=decelerating (-2.18), Volume=normal,
-Dispersion=11.02. Short-premium fit 0.65.
+Adapted to CURRENT environment: Volatility=high (ATR 5.15%), Trend=down,
+Breadth=bearish (A/D -0.56), Momentum=decelerating (-2.22), Volume=normal,
+Dispersion=10.95. Short-premium fit 0.65.
 
 Core logic:
 - Hard regime gate for bearish breadth + down trend + high vol only
-- Removed static symbol blacklist; now relies on dynamic ROC <= -0.010
+- Removed dispersion gate to increase sample size across more days
+- Loosened ROC threshold to -0.007 (from -0.010) for more signals while retaining bearish bias
 - Price below SMA50 respects bearish backdrop
-- ROC threshold tightened to -0.010 to filter weak momentum
-- Realized-range vs ATR filter loosened (2.1×) to increase sample size
+- Realized-range vs ATR filter loosened (2.8×) to generate sufficient trade count
 - Dynamic downside-skewed iron condor: tighter call wing (0.009-0.012)
 - Strikes percentage-based then rounded to realistic increments
-- Earlier entry window (bar 25+) + SIGNAL_INTERVAL=5 for more signals
-- Tighter volatility-scaled stop (0.35×) and reduced max hold (25 bars)
-  for high-vol regime to limit gamma risk on upside spikes
-- Dispersion gate (<12.5) and volatility regime gate
-- Target biased mildly lower to align with 67% down-trending symbols
+- Later entry window (bar 35+) + SIGNAL_INTERVAL=5 with minimum 25-bar spacing to prevent clusters
+- Reduced max_hold_bars to 18 and kept tight volatility-scaled stop (0.35×) for high-vol regime
+- Asymmetric target biased lower to align with 68% down-trending symbols
 """
 
 import pandas as pd
@@ -30,8 +28,8 @@ ATR_PERIOD = 14
 SMA_PERIOD = 50
 ROC_BARS = 5
 RANGE_BARS = 25
-MIN_BAR = 25
-MAX_HOLD_BARS = 25
+MIN_BAR = 35
+MAX_HOLD_BARS = 18
 SIGNAL_INTERVAL = 5
 
 
@@ -67,10 +65,7 @@ def scan(candles: pd.DataFrame, symbol: str, env: dict = None) -> list[dict]:
         if volatility_regime != "high":
             return []
         
-        # Avoid high-chaos days
-        dispersion = env.get("dispersion", 11.0)
-        if dispersion > 12.5:
-            return []
+        # Removed dispersion gate to boost sample size (current dispersion 10.95 is acceptable)
 
     signals = []
     close = candles["close"]
@@ -80,7 +75,12 @@ def scan(candles: pd.DataFrame, symbol: str, env: dict = None) -> list[dict]:
     atr = _atr(candles, ATR_PERIOD)
     roc = close.pct_change(ROC_BARS)
 
+    last_signal_bar = -100
+
     for i in range(MIN_BAR, len(candles) - 35, SIGNAL_INTERVAL):
+        if i - last_signal_bar < 25:
+            continue
+
         if (pd.isna(sma50.iloc[i]) or pd.isna(atr.iloc[i]) or 
             pd.isna(roc.iloc[i]) or atr.iloc[i] <= 0):
             continue
@@ -88,18 +88,18 @@ def scan(candles: pd.DataFrame, symbol: str, env: dict = None) -> list[dict]:
         price = float(close.iloc[i])
         a = float(atr.iloc[i])
 
-        # Bearish context
+        # Bearish context filters
         if price >= sma50.iloc[i]:
             continue
 
-        # Dynamic momentum filter for decelerating bearish regime
-        if roc.iloc[i] > -0.010:
+        # Loosened momentum filter for decelerating bearish regime
+        if roc.iloc[i] > -0.007:
             continue
 
-        # Realized range filter — prefer periods not excessively stretched
+        # Realized range filter — loosened to increase sample size
         start = max(0, i - RANGE_BARS)
         recent_range = float(high.iloc[start:i+1].max() - low.iloc[start:i+1].min())
-        expected_range = a * np.sqrt(RANGE_BARS) * 2.1
+        expected_range = a * np.sqrt(RANGE_BARS) * 2.8
         if recent_range > expected_range:
             continue
 
@@ -137,7 +137,7 @@ def scan(candles: pd.DataFrame, symbol: str, env: dict = None) -> list[dict]:
             "target_price": float(target_price),
             "stop_price": float(stop_price),
             "max_hold_bars": MAX_HOLD_BARS,
-            "setup_type": "regime_gated_bearish_skew_iron_condor_v2",
+            "setup_type": "regime_gated_bearish_skew_iron_condor_v3",
             "legs_json": {
                 "strategy": "iron_condor",
                 "expiration": "nearest_weekly",
@@ -147,5 +147,7 @@ def scan(candles: pd.DataFrame, symbol: str, env: dict = None) -> list[dict]:
                 "call_long_strike": float(long_call)
             },
         })
+
+        last_signal_bar = i
 
     return signals

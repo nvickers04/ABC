@@ -1,20 +1,18 @@
 """
-Slot 08 — Bearish-Breadth High-Vol Down-Regime Adjusted-Skew Iron Condor
+Slot 08 — High-Vol Decelerating-Momentum Short Straddle (Premium)
 
 Mandate: bullish / neutral / options_premium
-Allowed order_types: iron_condor, butterfly, straddle, strangle
+Allowed order_types: butterfly, iron_condor, straddle, strangle
 
-Bullish-leaning premium collection via iron condor with moderated upside skew.
-Updated per latest analysis for current high-vol + down-trend + bearish-breadth regime:
-- Strict gate to high-vol + down-trend + bearish breadth ONLY (neutral removed)
-- Restricted to repeatable symbols: HUBS, MARA, APP
-- Removed SMA filter entirely (no longer fighting the down-regime)
-- Tight range-bound filter (|ROC| < 0.015) for decelerating momentum
-- Moderated upside skew (call wing 1.4x, put wing 1.3x)
-- Realistic fixed-percentage exits (0.35% target, 0.25% stop) to match observed tiny moves
-- Later entry (bar 90+), moderate spacing, short 45-bar max hold for theta
-- No bandwidth filter in high-vol regime
-- Focus on bearish-breadth edge, symbol quality, and execution-tolerant parameters
+Pivot to straddle per selector directive (diversify from repeated iron_condor failures).
+Short straddle premium collection during brief decelerating pauses inside the downtrend.
+Adapted to current high-vol (ATR 5.15%), down-trend, bearish-breadth, decelerating momentum:
+- Keep high-vol + down-trend + bearish-breadth regime gate but loosened ROC threshold
+- Expanded universe to momentum/options candidates: AFRM, PLTR, ROKU, APP, DUOL, MARA
+- ATM strike rounded to nearest $5, slight upward bias for bullish mandate
+- ATR-aware exits (wider than 0.35%/0.25% to survive 5.15% ATR noise)
+- Earlier entry window (bar 45+) and shorter hold for intraday theta capture
+- SIGNAL_INTERVAL=15 to generate sufficient signals while avoiding over-sampling
 """
 
 import pandas as pd
@@ -22,11 +20,11 @@ import numpy as np
 
 ATR_PERIOD = 14
 ROC_BARS = 6
-MIN_BAR = 90
-MAX_HOLD_BARS = 45
-SIGNAL_INTERVAL = 20
+MIN_BAR = 45
+MAX_HOLD_BARS = 35
+SIGNAL_INTERVAL = 15
 
-ALLOWED_SYMBOLS = {"HUBS", "MARA", "APP"}
+ALLOWED_SYMBOLS = {"AFRM", "PLTR", "ROKU", "APP", "DUOL", "MARA"}
 
 
 def _atr(candles: pd.DataFrame, period: int) -> pd.Series:
@@ -44,30 +42,31 @@ def scan(candles: pd.DataFrame, symbol: str, env: dict = None) -> list[dict]:
     signals = []
     close = candles["close"]
     
-    # Regime awareness
+    # Regime awareness from env
     if env is None or not isinstance(env, dict):
         vol_regime = "normal"
         trend_regime = "flat"
         breadth_regime = "neutral"
+        mom_regime = "steady"
     else:
         vol_regime = env.get("volatility_regime", "normal")
         trend_regime = env.get("trend_regime", "flat")
         breadth_regime = env.get("breadth_regime", "neutral")
+        mom_regime = env.get("momentum_regime", "steady")
     
     is_high_vol = vol_regime == "high"
     is_down_trend = trend_regime == "down"
     is_bearish_breadth = breadth_regime == "bearish"
+    is_decelerating = mom_regime in ("decel", "decelerating")
     
-    # Hard regime gate: only trade in the currently profitable bucket
+    # Regime gate: only trade in current high-vol down bearish bucket
     if not (is_high_vol and is_down_trend and is_bearish_breadth):
         return []
     
     atr = _atr(candles, ATR_PERIOD)
     roc = close.pct_change(ROC_BARS)
     
-    max_roc_abs = 0.015
-    wing_scale = 8.0
-    max_hold = MAX_HOLD_BARS
+    max_roc_abs = 0.028  # loosened from 0.015 to allow more signals in trending regime
     
     for i in range(MIN_BAR, len(candles) - 30, SIGNAL_INTERVAL):
         if any(pd.isna(x) for x in (
@@ -78,39 +77,30 @@ def scan(candles: pd.DataFrame, symbol: str, env: dict = None) -> list[dict]:
         price = float(close.iloc[i])
         a = float(atr.iloc[i])
         
-        # Tight range-bound filter for decelerating momentum in down regime
+        # Range-bound filter for decelerating momentum (short premium friendly)
         if abs(roc.iloc[i]) > max_roc_abs:
             continue
 
-        # Base strike rounded to nearest 5
-        base = round(price / 5.0) * 5.0
+        # ATM strike with slight upward bias for bullish-leaning mandate
+        base = round(price * 1.008 / 5.0) * 5.0
         
-        # Moderated upside skew: less bullish bias than previous version
-        short_put = base - wing_scale
-        long_put = short_put - (wing_scale * 1.3)
-        short_call = base + int(wing_scale * 1.4)
-        long_call = short_call + int(wing_scale * 1.2)
-
-        # Realistic small-percentage exits that match observed 1-bar move sizes
-        target_price = price * 1.0035
-        stop_price = price * 0.9975
+        # Wider ATR-scaled exits to survive high-vol noise (target ~0.8% / stop ~2.0%)
+        target_price = price * 1.008
+        stop_price = price * 0.980
 
         signals.append({
             "entry_bar": i,
             "direction": "neutral",
-            "order_type": "iron_condor",
+            "order_type": "straddle",
             "entry_price": price,
             "target_price": target_price,
             "stop_price": stop_price,
-            "max_hold_bars": max_hold,
-            "setup_type": "bearish_breadth_highvol_down_adjusted_skew_ic",
+            "max_hold_bars": MAX_HOLD_BARS,
+            "setup_type": "highvol_decel_straddle_premium",
             "legs_json": {
-                "strategy": "iron_condor",
+                "strategy": "straddle",
                 "expiration": "nearest_weekly",
-                "put_long_strike": float(long_put),
-                "put_short_strike": float(short_put),
-                "call_short_strike": float(short_call),
-                "call_long_strike": float(long_call)
+                "strike": float(base)
             },
         })
 

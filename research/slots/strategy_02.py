@@ -11,18 +11,19 @@ down-trend (68% trending down, 77% trend confidence), bearish breadth
 Leans into momentum_breakout (0.85 fit) + vwap (0.80 fit) while 
 staying strictly inside the short-bracket mandate.
 
-Core logic (addressing prior failures: catastrophic R:R, oversized stops 
-in high-vol regime, timeout bleed on decelerating momentum, weak mom 
-filter, swing buffer making stops too wide):
+Core logic (addressing prior failures: too many 1-bar reversals in 
+decelerating momentum, stops too tight for high-vol noise, low hit rate,
+weak mom/volume filters, premature timeouts):
 - Hard regime gate using env (only trade on down + bearish breadth days)
-- Strong bearish structure: below VWAP + EMA50 with declining EMA50 slope
-- Momentum breakdown: red bar + new 10-bar close low + strong negative 5-bar mom (>=0.3 ATR)
-- Volume expansion (1.5× 20-bar avg, tuned for normal-volume regime)
+- Strong bearish structure: below VWAP + EMA21 + EMA50 with steeper 
+  declining EMA50 slope (now 3-bar)
+- Momentum breakdown: red bar + new 8-bar close low + strong negative 
+  5-bar mom (>=0.55 ATR)
+- Stronger volume expansion (1.75× 20-bar avg, tuned for normal-volume regime)
 - RSI(14) < 40 confirms weakness
-- Bracket tuned for high-vol regime: stop 1.15×ATR above entry (tightened), 
-  target 2.0×ATR below (improved R:R for quick scalps that follow through)
-- Removed wide swing-high buffer (primary cause of -0.9% losers)
-- Tighter entry window (bars 40-130) + reduced max hold (12 bars) to kill bleed
+- Bracket tuned for high-vol regime: stop 1.45×ATR above entry (widened 
+  to survive noise), target 1.75×ATR below (balanced R:R for quicker hits)
+- Tighter entry window (bars 40-100) + reduced max hold (8 bars) to kill bleed
 - Setup reflects vwap_momentum_breakdown_short for interpretability
 """
 
@@ -30,20 +31,21 @@ import pandas as pd
 import numpy as np
 
 
-MAX_HOLD_BARS = 12
+MAX_HOLD_BARS = 8
 MIN_BAR = 40
-VOL_MULT = 1.5
+VOL_MULT = 1.75
 EMA_SHORT = 21
 EMA_LONG = 50
 RSI_PERIOD = 14
 ATR_PERIOD = 14
-STOP_ATR_MULT = 1.15
-TARGET_ATR_MULT = 2.0
-MAX_ENTRY_BAR = 130
+STOP_ATR_MULT = 1.45
+TARGET_ATR_MULT = 1.75
+MAX_ENTRY_BAR = 100
 RSI_MAX = 40.0
-LOW_LOOKBACK = 10
+LOW_LOOKBACK = 8
 MOM_PERIOD = 5
-MOM_ATR_THRESHOLD = 0.3
+MOM_ATR_THRESHOLD = 0.55
+SLOPE_BARS = 3
 
 
 def _atr(candles: pd.DataFrame, period: int) -> pd.Series:
@@ -94,15 +96,17 @@ def scan(candles: pd.DataFrame, symbol: str, env: dict = None) -> list[dict]:
         price = candles["close"].iloc[i]
         a = atr.iloc[i]
 
-        # Bearish structure
-        if price >= vwap.iloc[i] or price >= ema50.iloc[i]:
+        # Strong bearish structure: below VWAP, EMA21 and EMA50
+        if (price >= vwap.iloc[i] or 
+            price >= ema21.iloc[i] or 
+            price >= ema50.iloc[i]):
             continue
 
-        # Declining EMA50 slope (bearish regime confirmation)
-        if i > 5 and ema50.iloc[i] >= ema50.iloc[i - 5]:
+        # Steeper declining EMA50 slope (bearish regime confirmation)
+        if i > SLOPE_BARS and ema50.iloc[i] >= ema50.iloc[i - SLOPE_BARS]:
             continue
 
-        # Momentum breakdown: new 10-bar close low
+        # Momentum breakdown: new 8-bar close low
         prev_min_close = candles["close"].iloc[max(0, i - LOW_LOOKBACK):i].min()
         if price >= prev_min_close:
             continue
@@ -121,12 +125,12 @@ def scan(candles: pd.DataFrame, symbol: str, env: dict = None) -> list[dict]:
         if rsi.iloc[i] >= RSI_MAX:
             continue
 
-        # Volume confirmation
+        # Stronger volume confirmation
         if candles["volume"].iloc[i] < vol_avg.iloc[i] * VOL_MULT:
             continue
 
-        # Bracket levels: tighter stop, wider target for better R:R
-        # Removed swing-high buffer that was making stops excessively wide
+        # Bracket levels tuned for high-vol: wider stop to survive noise,
+        # balanced target for improved hit-rate in decelerating regime
         stop = price + STOP_ATR_MULT * a
         target = price - TARGET_ATR_MULT * a
 

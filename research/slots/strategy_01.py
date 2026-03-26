@@ -1,36 +1,36 @@
 """
-Slot 10 — Short-Only VWAP Rejection (Tight ATR Risk, Dual-EMA + Momentum Filter)
+Slot 01 — Short Stock Momentum: Volume Breakdown in Bearish Regime
 
-Evolved for current regime: high volatility (ATR 5.28%), downtrend (68% trending down),
-accelerating momentum (+0.78), bullish breadth (+0.28), normal volume (0.86x).
-Prioritizes momentum_breakout (1.00) and vwap (0.80). Strict short bias only.
+Evolved for current regime: Volatility=high (ATR 5.15%), Trend=down (68% trending down),
+Breadth=bearish (A/D -0.56), Momentum=decelerating (-2.22), Volume=normal (0.97x),
+Trend confidence 77%. Prioritizes momentum_breakout (0.85) over vwap (0.80).
+Strict short bias only. Uses env to gate non-bearish regimes.
 
 Core logic:
-- VWAP cross-down rejections on high volume (>=2.0x 20-bar avg)
-- Strong trend filter: shorts ONLY when below BOTH EMA20 and EMA50
-- Momentum filter: 5-bar ROC must be negative (aligns with accelerating downtrend)
-- Decisive rejection: must close at least 0.12 * ATR below VWAP (avoids wick noise)
-- Tight ATR(14) stops/targets for high-vol regime (0.45 stop / 1.65 target)
-  — addresses prior issue of never hitting wide stops and bleeding on small moves
-- Morning-only entries (before bar 180 ≈ 12:00 ET) to capture highest-edge window
-- Reduced max hold (12 bars) to minimize timeout drag in chop
-- Completely removed all long logic given dominant downtrend regime
-- Naturally surfaces on momentum leaders (MARA, CAVA, DUOL, PLTR, NET)
+- Regime gate: only trade on trend=down AND breadth=bearish (kills up/bullish toxicity)
+- Momentum breakdown: close < low[1] on volume surge (>=1.8x 20-bar avg)
+- Trend filter: price below EMA10 (fast response in high-vol regime)
+- Momentum filter: 5-bar ROC <= -0.005 AND ROC5 < ROC10 (downside pressure)
+- High-vol realistic risk: 0.75 ATR stop / 1.2 ATR target (~1.6:1 R:R, matches realized 0.2-0.4% moves)
+- Morning through early afternoon entries (before bar 210 ≈ 13:00 ET)
+- Max hold 20 bars to allow follow-through without excessive timeout
+- Addresses prior failures: small-sample down-regime noise, fictional large ATR targets,
+  1-bar noise losses, weak volume confirmation, and counter-trend triggers.
+- Surfaces on momentum leaders (AFRM, PLTR, ROKU, APP, DUOL, MARA)
 """
 
 import pandas as pd
 import numpy as np
 
-MAX_HOLD_BARS = 12
-MIN_BAR = 50
-VOL_MULT = 2.0
-EMA_SHORT_SPAN = 20
-EMA_LONG_SPAN = 50
+MAX_HOLD_BARS = 20
+MIN_BAR = 60
+VOL_MULT = 1.8
+EMA_SPAN = 10
 ATR_PERIOD = 14
-STOP_ATR_MULT = 0.45
-TARGET_ATR_MULT = 1.65
-MAX_ENTRY_BAR = 180
-MIN_CROSS_DEPTH_ATR = 0.12
+STOP_ATR_MULT = 0.75
+TARGET_ATR_MULT = 1.2
+MAX_ENTRY_BAR = 210
+MIN_ROC = -0.005
 
 
 def calculate_atr(candles: pd.DataFrame, period: int) -> pd.Series:
@@ -42,67 +42,59 @@ def calculate_atr(candles: pd.DataFrame, period: int) -> pd.Series:
     return atr
 
 
-def scan(candles: pd.DataFrame, symbol: str) -> list[dict]:
+def scan(candles: pd.DataFrame, symbol: str, env: dict = None) -> list[dict]:
     if len(candles) < MIN_BAR + 30:
         return []
 
+    # Regime gate - only trade in intended bearish environment
+    if env is not None:
+        trend = env.get("trend_regime")
+        breadth = env.get("breadth_regime")
+        if trend != "down" or breadth != "bearish":
+            return []
+
     signals = []
 
-    # VWAP
-    cum_vol = candles["volume"].cumsum()
-    cum_pv = (candles["close"] * candles["volume"]).cumsum()
-    vwap = cum_pv / cum_vol.replace(0, np.nan)
-
-    # EMAs for trend filter
-    ema20 = candles["close"].ewm(span=EMA_SHORT_SPAN, adjust=False).mean()
-    ema50 = candles["close"].ewm(span=EMA_LONG_SPAN, adjust=False).mean()
-
-    # Volume average
+    # Indicators
     vol_avg = candles["volume"].rolling(20).mean()
-
-    # ATR
+    ema10 = candles["close"].ewm(span=EMA_SPAN, adjust=False).mean()
     atr = calculate_atr(candles, ATR_PERIOD)
-
-    # Momentum (5-bar ROC, negative = down momentum)
     roc5 = candles["close"].pct_change(5)
+    roc10 = candles["close"].pct_change(10)
 
     for i in range(MIN_BAR, len(candles) - 1):
         if i > MAX_ENTRY_BAR:
             continue
 
-        if (pd.isna(vwap.iloc[i]) or pd.isna(ema20.iloc[i]) or pd.isna(ema50.iloc[i]) or
-            pd.isna(vol_avg.iloc[i]) or pd.isna(atr.iloc[i]) or pd.isna(roc5.iloc[i]) or
-            atr.iloc[i] <= 0):
+        if (pd.isna(vol_avg.iloc[i]) or pd.isna(ema10.iloc[i]) or pd.isna(atr.iloc[i]) or
+            pd.isna(roc5.iloc[i]) or pd.isna(roc10.iloc[i]) or atr.iloc[i] <= 0):
             continue
 
         price = candles.iloc[i]["close"]
-        prev_price = candles.iloc[i - 1]["close"]
-        v = vwap.iloc[i]
-        e20 = ema20.iloc[i]
-        e50 = ema50.iloc[i]
-        a = atr.iloc[i]
+        prev_low = candles.iloc[i - 1]["low"]
         vol = candles.iloc[i]["volume"]
+        a = atr.iloc[i]
+        momentum5 = roc5.iloc[i]
+        momentum10 = roc10.iloc[i]
         vol_threshold = vol_avg.iloc[i] * VOL_MULT
-        momentum = roc5.iloc[i]
 
-        # Short rejection: cross below VWAP on high volume, below both EMAs,
-        # negative momentum, and decisive displacement below VWAP
-        if (prev_price > v and price < v and
+        # Short momentum breakdown
+        if (price < ema10.iloc[i] and
+            candles.iloc[i]["close"] < prev_low and
             vol > vol_threshold and
-            price < e20 and price < e50 and
-            momentum < 0 and
-            (v - price) > (MIN_CROSS_DEPTH_ATR * a)):
+            momentum5 <= MIN_ROC and
+            momentum5 < momentum10):
             
             entry = price
             signals.append({
                 "entry_bar": i,
                 "direction": "short",
-                "order_type": "vwap",
+                "order_type": "market",
                 "entry_price": entry,
                 "target_price": entry - TARGET_ATR_MULT * a,
                 "stop_price": entry + STOP_ATR_MULT * a,
                 "max_hold_bars": MAX_HOLD_BARS,
-                "setup_type": "vwap_rejection_momentum_short",
+                "setup_type": "momentum_breakdown_volume_short",
                 "legs_json": None,
             })
 

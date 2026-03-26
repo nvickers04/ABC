@@ -1,23 +1,24 @@
 """
-Slot 04 — Regime-Adaptive Bearish-Skew Iron Condor (High-Vol Downtrend)
+Slot 04 — Regime-Gated Bearish-Skew Iron Condor (High-Vol Downtrend)
 
 Mandate: bearish / neutral / options_premium
 Allowed order_types: butterfly, iron_condor, straddle, strangle
 
 Adapted to CURRENT environment: Volatility=high (ATR 5.15%), Trend=down,
 Breadth=bearish (A/D -0.56), Momentum=decelerating (-2.22), Volume=normal.
-Short-premium fit 0.65. Uses env to adapt skew, ROC cap, and risk based on
-breadth_regime (tighter upside in bearish breadth to avoid neutral-chop failures).
+Short-premium fit 0.65. Hard-gates on bearish breadth + down trend,
+requires mild negative ROC, dynamic high-vol skew, tightened stops/hold.
 
 Core logic:
+- Hard regime gate for bearish breadth + down trend (removes mismatched-regime noise)
 - Price below SMA50 respects bearish backdrop
-- Adaptive one-sided momentum filter (stricter upside cap when breadth=bearish)
-- Realized-range vs ATR filter (stricter 1.5× multiplier for premium safety)
-- Downside-skewed iron condor: tighter call wing + wider put wing when bearish
-- Strikes are percentage-based then rounded to realistic increments
-- Earlier entry window (bar 30+) + moderate spacing for sufficient signal count
-- Tighter risk: reduced max hold, smaller vol-scaled stop (addresses loose-stop losers)
-- Target has mild downward bias consistent with bearish mandate and current regime
+- Momentum filter requires mild bearish drift (roc < -0.005) + upside cap
+- Realized-range vs ATR filter (loosened multiplier for signal count in high vol)
+- Dynamic downside-skewed iron condor: tighter call wing / wider put wing in high ATR
+- Strikes percentage-based then rounded to realistic increments
+- Moderate entry window (bar 30+) + SIGNAL_INTERVAL=10 for sufficient signals
+- Tighter volatility-scaled exits (stop 0.75×, target 0.55×) for high-vol regime
+- Reduced max hold (60 bars) to capture theta faster and limit large losers
 """
 
 import pandas as pd
@@ -28,9 +29,9 @@ SMA_PERIOD = 50
 ROC_BARS = 5
 RANGE_BARS = 25
 MIN_BAR = 30
-MAX_HOLD_BARS = 120
+MAX_HOLD_BARS = 60
 MAX_ROC_UP_BASE = 0.025
-SIGNAL_INTERVAL = 15
+SIGNAL_INTERVAL = 10
 
 
 def _atr(candles: pd.DataFrame, period: int) -> pd.Series:
@@ -55,6 +56,13 @@ def scan(candles: pd.DataFrame, symbol: str, env: dict = None) -> list[dict]:
     if len(candles) < MIN_BAR + ATR_PERIOD + SMA_PERIOD + 30:
         return []
 
+    # Hard regime gate - only trade in the proven high-expectancy bucket
+    if env is not None:
+        breadth_regime = env.get("breadth_regime", "")
+        trend_regime = env.get("trend_regime", "")
+        if breadth_regime != "bearish" or trend_regime != "down":
+            return []
+
     signals = []
     close = candles["close"]
     high = candles["high"]
@@ -63,12 +71,9 @@ def scan(candles: pd.DataFrame, symbol: str, env: dict = None) -> list[dict]:
     atr = _atr(candles, ATR_PERIOD)
     roc = close.pct_change(ROC_BARS)
 
-    # Regime adaptation from env (fallback to current bearish context)
     breadth_regime = env.get("breadth_regime", "bearish") if env is not None else "bearish"
     is_bearish_breadth = breadth_regime == "bearish"
     max_roc_up = 0.015 if is_bearish_breadth else MAX_ROC_UP_BASE
-    call_mult = 0.018 if is_bearish_breadth else 0.027
-    put_mult = 0.052 if is_bearish_breadth else 0.040
 
     for i in range(MIN_BAR, len(candles) - 35, SIGNAL_INTERVAL):
         if (pd.isna(sma50.iloc[i]) or pd.isna(atr.iloc[i]) or 
@@ -82,35 +87,37 @@ def scan(candles: pd.DataFrame, symbol: str, env: dict = None) -> list[dict]:
         if price >= sma50.iloc[i]:
             continue
 
-        # Adaptive momentum filter: block strong upside (stricter when bearish)
-        if roc.iloc[i] > max_roc_up:
+        # Momentum filter: require mild bearish drift (per analysis) + upside cap
+        if roc.iloc[i] > max_roc_up or roc.iloc[i] > -0.005:
             continue
 
-        # Realized range filter — prefer periods not excessively stretched
+        # Realized range filter — prefer periods not excessively stretched (slightly loosened)
         start = max(0, i - RANGE_BARS)
         recent_range = float(high.iloc[start:i+1].max() - low.iloc[start:i+1].min())
-        expected_range = a * np.sqrt(RANGE_BARS) * 1.5
+        expected_range = a * np.sqrt(RANGE_BARS) * 1.8
         if recent_range > expected_range:
             continue
 
-        # Percentage-based strikes with adaptive downside skew
-        call_short_dist = call_mult * price
-        put_short_dist = put_mult * price
+        # Dynamic skew based on realized volatility (tighter call wing in high vol)
+        vol_pct = a / price if price > 0 else 0
+        call_mult = 0.015 if vol_pct > 0.04 else 0.018
+        put_mult = 0.058 if vol_pct > 0.04 else 0.052
         wing_width = 0.019 * price
 
-        short_call = _round_strike(price + call_short_dist)
+        short_call = _round_strike(price + call_mult * price)
         long_call = _round_strike(short_call + wing_width)
-        short_put = _round_strike(price - put_short_dist)
+        short_put = _round_strike(price - put_mult * price)
         long_put = _round_strike(short_put - wing_width)
 
         # Avoid degenerate strikes
-        if short_call <= price or short_put >= price or long_call <= short_call or long_put >= short_put:
+        if (short_call <= price or short_put >= price or 
+            long_call <= short_call or long_put >= short_put):
             continue
 
-        # Tighter volatility-scaled exits (addresses previous loose-stop problem)
+        # Tighter volatility-scaled exits for high-ATR regime (addresses loose-stop losers)
         vol_move = 1.0 * a * np.sqrt(20)
-        target_price = price - 0.4 * vol_move
-        stop_price = price + 1.15 * vol_move
+        target_price = price - 0.55 * vol_move
+        stop_price = price + 0.75 * vol_move
 
         signals.append({
             "entry_bar": i,
@@ -120,7 +127,7 @@ def scan(candles: pd.DataFrame, symbol: str, env: dict = None) -> list[dict]:
             "target_price": float(target_price),
             "stop_price": float(stop_price),
             "max_hold_bars": MAX_HOLD_BARS,
-            "setup_type": "regime_adaptive_bearish_skew_iron_condor",
+            "setup_type": "regime_gated_bearish_skew_iron_condor",
             "legs_json": {
                 "strategy": "iron_condor",
                 "expiration": "nearest_weekly",

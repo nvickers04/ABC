@@ -127,8 +127,8 @@ def _cost_quote(executor, params, qty_key="quantity"):
             qty = params.get(qty_key)
             if q and q.ask and qty:
                 return float(q.ask) * int(qty)
-        except Exception:
-            pass
+        except Exception as e:
+            logger.debug(f"Cost quote failed: {e}")
         return None
     return _est
 
@@ -157,7 +157,8 @@ def _infer_bracket_entry_price(executor, params) -> Optional[float]:
 
     try:
         quote = executor.data_provider.get_quote(symbol)
-    except Exception:
+    except Exception as e:
+        logger.debug(f"Quote lookup failed for {symbol}: {e}")
         quote = None
 
     if not quote:

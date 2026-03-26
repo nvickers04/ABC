@@ -271,6 +271,7 @@ def _symbol_features(days: dict[str, pd.DataFrame]) -> dict[str, Any]:
         "last_close": round(closes[-1], 2),
         "avg_daily_volume": round(daily["volume"].mean(), 0),
         "num_days": len(daily),
+        "daily_returns": returns.tolist(),  # for cross-asset correlation
     }
 
 
@@ -335,10 +336,39 @@ def compute_environment(
     else:
         trend_regime = "flat"
 
-    # ── Breadth ─────────────────────────────────────────────────
-    positive_returns = sum(1 for r in cum_returns if r > 0)
-    negative_returns = sum(1 for r in cum_returns if r < 0)
-    advance_decline = (positive_returns - negative_returns) / n if n > 0 else 0
+    # Regime confidence: distance from the 0.45 decision boundary, 0→1.
+    if trend_regime == "down":
+        trend_confidence = min(1.0, (pct_down - 0.45) / 0.30)
+    elif trend_regime == "up":
+        trend_confidence = min(1.0, (pct_up - 0.45) / 0.30)
+    else:
+        trend_confidence = min(1.0, (0.45 - max(pct_up, pct_down)) / 0.20)
+    trend_confidence = max(0.0, trend_confidence)
+
+    # ── Cross-asset correlation ─────────────────────────────────
+    # High = macro/systematic regime; low = idiosyncratic/stock-picking.
+    cross_corr = 0.5  # fallback
+    if len(cum_returns) > 3:
+        all_daily: list[list[float]] = []
+        for f in sym_features.values():
+            dr = f.get("daily_returns")
+            if dr is not None and len(dr) > 2:
+                all_daily.append(dr)
+        if len(all_daily) >= 3:
+            min_len = min(len(d) for d in all_daily)
+            if min_len >= 3:
+                mat = np.array([d[:min_len] for d in all_daily])
+                corr_matrix = np.corrcoef(mat)
+                n_sym = corr_matrix.shape[0]
+                off_diag = []
+                for ci in range(n_sym):
+                    for cj in range(ci + 1, n_sym):
+                        v = corr_matrix[ci, cj]
+                        if np.isfinite(v):
+                            off_diag.append(v)
+                if off_diag:
+                    cross_corr = float(np.mean(off_diag))
+    advance_decline = (up_trending - down_trending) / n if n > 0 else 0
 
     # 3-level breadth (bearish / neutral / bullish)
     if advance_decline > 0.2:
@@ -430,6 +460,10 @@ def compute_environment(
         "pct_trending_up": round(pct_up, 2),
         "pct_trending_down": round(pct_down, 2),
 
+        # Regime confidence & correlation
+        "trend_confidence": round(trend_confidence, 4),
+        "cross_asset_correlation": round(cross_corr, 4),
+
         # Strategy-environment fit scores (0-1)
         "strategy_fit": strategy_fit,
 
@@ -443,9 +477,9 @@ def compute_environment(
     }
 
     logger.info(
-        f"Environment: vol={vol_regime} trend={trend_regime} breadth={breadth_regime} "
-        f"momentum={momentum_regime} volume={volume_regime} "
-        f"dispersion={dispersion:.2f}"
+        f"Environment: vol={vol_regime} trend={trend_regime}({trend_confidence:.0%}) "
+        f"breadth={breadth_regime} momentum={momentum_regime} volume={volume_regime} "
+        f"dispersion={dispersion:.2f} cross_corr={cross_corr:.2f}"
     )
 
     return snapshot
@@ -591,6 +625,11 @@ def format_environment_for_prompt(snapshot: dict) -> str:
     rev_candidates = snapshot.get("reversion_candidates", [])
     opt_candidates = snapshot.get("options_candidates", [])
 
+    # Regime confidence & correlation (may not be present in older snapshots)
+    trend_conf = snapshot.get("trend_confidence", 0.0)
+    cross_corr = snapshot.get("cross_asset_correlation", 0.5)
+    corr_label = "macro/systematic" if cross_corr > 0.6 else "idiosyncratic" if cross_corr < 0.3 else "mixed"
+
     return f"""CURRENT MARKET ENVIRONMENT (computed from {snapshot['symbols_analyzed']} symbols, last {snapshot.get('num_days', '?')} trading days):
 
   CONTINUOUS METRICS (use these for nuanced strategy design, not just the labels):
@@ -603,6 +642,8 @@ def format_environment_for_prompt(snapshot: dict) -> str:
     % trending up:   {snapshot['pct_trending_up']:.0%}
     % trending down: {snapshot['pct_trending_down']:.0%}
     Dispersion:      {snapshot['dispersion']:.2f}
+    Trend confidence:{trend_conf:.0%}  [0%=borderline | 100%=decisive regime]
+    Cross-asset corr:{cross_corr:.2f}  [{corr_label}: <0.3=stock-picking | >0.6=macro-driven]
 
   REGIME LABELS (summary of the above):
     Volatility={snapshot['volatility_regime']}  Trend={snapshot['trend_regime']}  Breadth={snapshot['breadth_regime']}

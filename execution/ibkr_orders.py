@@ -20,6 +20,9 @@ from typing import Dict, Any, Optional, Tuple
 from ib_insync import Order, TagValue
 from ib_insync.contract import Stock
 
+# Memory integration for autoresearch snapshots
+from memory import insert_execution_snapshot, _pending_order_context
+
 logger = logging.getLogger(__name__)
 
 
@@ -137,6 +140,43 @@ class IBKROrdersMixin:
             rejection = await self._check_order_rejection(trade, name, symbol)
             if rejection:
                 return rejection
+
+            # ── Execution snapshot capture (autoresearch) ───────
+            snapshot_id = None
+            try:
+                # Get real-time bid/ask from MarketData.app
+                _snap_bid, _snap_ask, _snap_mid, _snap_spread, _snap_vol = None, None, None, None, None
+                _snap_atr, _snap_atr_pct = None, None
+                try:
+                    from data.data_provider import get_data_provider
+                    _mq = get_data_provider().get_quote(symbol)
+                    if _mq:
+                        _snap_bid = _mq.bid if _mq.bid and _mq.bid > 0 else None
+                        _snap_ask = _mq.ask if _mq.ask and _mq.ask > 0 else None
+                        _snap_vol = _mq.volume if _mq.volume else None
+                except Exception:
+                    pass
+                if _snap_bid and _snap_ask and _snap_bid > 0 and _snap_ask > 0:
+                        _snap_mid = round((_snap_bid + _snap_ask) / 2, 4)
+                        _snap_spread = round(_snap_ask - _snap_bid, 4)
+                # Determine intent from extra_result or order context
+                _snap_intent = (extra_result or {}).get('intent', 'unknown')
+                _snap_atr_pct_val = (extra_result or {}).get('_atr_pct')
+                # Derive canonical order type using all available context
+                _snap_algo = order_attrs.get('algoStrategy')
+                snapshot_id = insert_execution_snapshot(
+                    symbol=symbol, side=action, quantity=quantity,
+                    order_type=order_type, intent=_snap_intent,
+                    algo_strategy=_snap_algo, order_tif=tif,
+                    bid=_snap_bid, ask=_snap_ask, mid=_snap_mid,
+                    spread=_snap_spread, volume=_snap_vol,
+                    atr=None, atr_pct=_snap_atr_pct_val,
+                )
+                if snapshot_id:
+                    with self._snapshot_lock:
+                        self._snapshot_ids[trade.order.orderId] = snapshot_id
+            except Exception as _snap_err:
+                logger.debug(f"Snapshot capture failed: {_snap_err}")
 
             price_info = f" @ ${limit_price:.2f}" if limit_price else ""
             price_info = price_info or (f" @ ${aux_price:.2f}" if aux_price else "")
@@ -269,14 +309,15 @@ class IBKROrdersMixin:
             # ═══════════════════════════════════════════════
             #  HARD RISK GUARD — configurable via RISK_PER_TRADE
             # ═══════════════════════════════════════════════
-            from core.config import RISK_PER_TRADE
+            from core.config import get_effective_risk_per_trade
+            effective_risk = get_effective_risk_per_trade()
             await self._update_account_values()
             risk_per_share = abs(entry_price - stop_price)
             risk_dollars = risk_per_share * quantity
-            max_risk = RISK_PER_TRADE * self.net_liquidation
+            max_risk = effective_risk * self.net_liquidation
             if self.net_liquidation > 0 and risk_dollars > max_risk:
                 msg = (f"RISK GUARD BLOCKED: {symbol} risk ${risk_dollars:,.2f} "
-                       f"> {RISK_PER_TRADE*100}% of equity ${max_risk:,.2f} "
+                       f"> {effective_risk*100:.1f}% of equity ${max_risk:,.2f} "
                        f"(NLV=${self.net_liquidation:,.2f})")
                 logger.error(msg)
                 return {
@@ -287,18 +328,47 @@ class IBKROrdersMixin:
                     'direction': direction
                 }
 
+            # ═══════════════════════════════════════════════
+            #  CONCENTRATION GUARD — max 25% of NLV in one name
+            # ═══════════════════════════════════════════════
+            MAX_CONCENTRATION_PCT = 25.0
+            total_cost = entry_price * quantity
+            if self.net_liquidation > 0:
+                # Include existing position cost for this symbol
+                existing_exposure = 0
+                try:
+                    positions = await self.get_positions()
+                    for p in positions:
+                        if p.get('symbol') == symbol:
+                            existing_exposure += abs(p.get('market_price', 0) * p.get('quantity', 0))
+                except Exception:
+                    pass
+                combined = total_cost + existing_exposure
+                concentration = combined / self.net_liquidation * 100
+                if concentration > MAX_CONCENTRATION_PCT:
+                    msg = (f"CONCENTRATION GUARD BLOCKED: {symbol} would be "
+                           f"{concentration:.1f}% of portfolio "
+                           f"(${combined:,.0f}/${self.net_liquidation:,.0f}, "
+                           f"max {MAX_CONCENTRATION_PCT:.0f}%)")
+                    logger.error(msg)
+                    return {
+                        'success': False,
+                        'filled': False,
+                        'reason': msg,
+                        'symbol': symbol,
+                        'direction': direction
+                    }
+
             # PDT CHECK: Account under $25k has restrictions
             # Note: PDT only applies to intraday trades (same-day round trips)
             # short_swing and swing trades (hold overnight) are NOT affected
             if self.net_liquidation < 25000:
-                print(f"\n[!] PDT Account (${self.net_liquidation:,.0f} < $25k)")
-                print(f"   Day trades remaining: {self.day_trades_remaining}")
-                print(f"   Time bucket: {time_bucket}")
+                logger.warning(f"PDT Account (${self.net_liquidation:,.0f} < $25k) - day trades remaining: {self.day_trades_remaining}, time_bucket={time_bucket}")
 
                 if time_bucket == 'intraday' and self.day_trades_remaining <= 0:
                     logger.error(f"PDT BLOCKED: No day trades remaining for intraday {symbol}")
-                    print("   [BLOCKED] Cannot execute intraday trade with 0 day trades")
-                    print("   TIP: Use short_swing or swing trades (hold overnight)")
+                    logger.warning("   [BLOCKED] Cannot execute intraday trade with 0 day trades")
+                    logger.info("   TIP: Use short_swing or swing trades (hold overnight)")
                     return {
                         'success': False,
                         'filled': False,
@@ -307,7 +377,7 @@ class IBKROrdersMixin:
                         'direction': direction
                     }
                 elif time_bucket in ('short_swing', 'swing'):
-                    print(f"   [OK] {time_bucket} trade OK - will hold overnight (not a day trade)")
+                    logger.info(f"   [OK] {time_bucket} trade OK - will hold overnight (not a day trade)")
 
             # HARD CASH GUARD — prevent margin buying in cash-only account
             # AvailableFunds on IBKR paper includes margin; use TotalCashValue
@@ -335,12 +405,47 @@ class IBKROrdersMixin:
             entry_order.transmit = True
 
             # Log order details
-            print(f"\n[ORDER] {entry_action} {quantity} {symbol} @ ${limit_price:.2f}")
+            logger.info(f"[ORDER] {entry_action} {quantity} {symbol} @ ${limit_price:.2f}")
 
             logger.info(f"Placing LIMIT {entry_action} {quantity} {symbol} @ ${limit_price:.2f}")
 
+            # ── Execution snapshot capture (bracket entry, autoresearch) ──
+            _bracket_snap_id = None
+            try:
+                _snap_bid, _snap_ask, _snap_mid, _snap_spread, _snap_vol = None, None, None, None, None
+                try:
+                    from data.data_provider import get_data_provider
+                    _mq = get_data_provider().get_quote(symbol)
+                    if _mq:
+                        _snap_bid = _mq.bid if _mq.bid and _mq.bid > 0 else None
+                        _snap_ask = _mq.ask if _mq.ask and _mq.ask > 0 else None
+                        _snap_vol = _mq.volume if _mq.volume else None
+                        if _snap_bid and _snap_ask:
+                            _snap_mid = round((_snap_bid + _snap_ask) / 2, 4)
+                            _snap_spread = round(_snap_ask - _snap_bid, 4)
+                except Exception:
+                    pass
+                # Consume pending order context for atr_pct (set by _plan_order)
+                _bracket_atr_pct = None
+                _bctx = _pending_order_context.get(symbol, {})
+                _bracket_atr_pct = _bctx.get('atr_pct')
+                _bracket_snap_id = insert_execution_snapshot(
+                    symbol=symbol, side=entry_action, quantity=quantity,
+                    order_type='bracket', intent='entry',
+                    bid=_snap_bid, ask=_snap_ask, mid=_snap_mid,
+                    spread=_snap_spread, volume=_snap_vol,
+                    atr=None, atr_pct=_bracket_atr_pct,
+                )
+            except Exception as _snap_err:
+                logger.debug(f"Bracket snapshot capture failed: {_snap_err}")
+
             entry_trade = self.ib.placeOrder(contract, entry_order)
             entry_id = entry_trade.order.orderId
+
+            # Link snapshot to order for fill update
+            if _bracket_snap_id:
+                with self._snapshot_lock:
+                    self._snapshot_ids[entry_id] = _bracket_snap_id
 
             # Wait for entry fill confirmation
             fill_result = await self._wait_for_fill(entry_trade, timeout=30.0)
@@ -353,20 +458,19 @@ class IBKROrdersMixin:
                         self._cancel_order_with_tracking(entry_trade.order, source="bracket_entry_timeout")
                     else:
                         self.ib.cancelOrder(entry_trade.order)
-                except Exception:
-                    pass  # Order may already be cancelled
+                except Exception as _cancel_err:
+                    logger.debug(f"Cancel unfilled entry failed (may already be cancelled): {_cancel_err}")
 
-                # Fetch current bid/ask so agent can make informed retry decision
+                # Fetch current bid/ask from MDA so agent can make informed retry decision
                 current_bid, current_ask = None, None
                 try:
-                    ticker = self.ib.reqMktData(contract, '', snapshot=True, regulatorySnapshot=False)
-                    await asyncio.sleep(0.5)
-                    await asyncio.sleep(0)
-                    current_bid = ticker.bid if ticker.bid and ticker.bid > 0 else None
-                    current_ask = ticker.ask if ticker.ask and ticker.ask > 0 else None
-                    self.ib.cancelMktData(contract)
-                except Exception:
-                    pass
+                    from data.data_provider import get_data_provider
+                    _q = get_data_provider().get_quote(symbol)
+                    if _q:
+                        current_bid = _q.bid if _q.bid and _q.bid > 0 else None
+                        current_ask = _q.ask if _q.ask and _q.ask > 0 else None
+                except Exception as _mkt_err:
+                    logger.debug(f"MDA quote fetch failed for {symbol}: {_mkt_err}")
 
                 result = {
                     'success': False,
@@ -415,36 +519,68 @@ class IBKROrdersMixin:
             # Create unique OCA group to link stop and target
             oca_group = f"OCA_{symbol}_{entry_id}_{int(datetime.now().timestamp())}"
 
-            # Stop loss order (GTC, OCA-linked)
-            stop_order = Order()
-            stop_order.action = exit_action
-            stop_order.totalQuantity = filled_qty
-            stop_order.orderType = IBKROrderType.STOP.value
-            stop_order.auxPrice = adjusted_stop
-            stop_order.tif = 'GTC'
-            stop_order.ocaGroup = oca_group
-            stop_order.ocaType = 1  # Cancel on fill
-            stop_order.transmit = True
+            # Stop loss order (GTC, OCA-linked) — retry up to 3x on failure
+            stop_trade = None
+            stop_id = None
+            for _stop_attempt in range(3):
+                stop_order = Order()
+                stop_order.action = exit_action
+                stop_order.totalQuantity = filled_qty
+                stop_order.orderType = IBKROrderType.STOP.value
+                stop_order.auxPrice = adjusted_stop
+                stop_order.tif = 'GTC'
+                stop_order.ocaGroup = oca_group
+                stop_order.ocaType = 1  # Cancel on fill
+                stop_order.transmit = True
 
-            stop_trade = self.ib.placeOrder(contract, stop_order)
-            stop_id = stop_trade.order.orderId
+                stop_trade = self.ib.placeOrder(contract, stop_order)
+                stop_id = stop_trade.order.orderId
 
-            # Brief wait to ensure stop order is accepted before placing target
-            await asyncio.sleep(0.1)
+                # Wait for broker to accept/reject
+                await asyncio.sleep(0.5)
+                await asyncio.sleep(0)  # flush callbacks
 
-            # Check if stop order was rejected before placing target
+                if stop_trade.orderStatus.status not in ('ApiCancelled', 'Cancelled', 'Error'):
+                    break  # Stop accepted
+                logger.warning(
+                    f"Stop order attempt {_stop_attempt + 1}/3 failed for {symbol}: "
+                    f"{stop_trade.orderStatus.status}"
+                )
+                if _stop_attempt < 2:
+                    await asyncio.sleep(1.0 * (_stop_attempt + 1))
+
+            # After retries, check if stop is still rejected
             if stop_trade.orderStatus.status in ('ApiCancelled', 'Cancelled', 'Error'):
-                logger.error(f"Stop order failed for bracket {symbol}: {stop_trade.orderStatus.status}")
-                # Entry already filled - log critical warning
-                logger.critical(f"POSITION AT RISK: Entry filled but stop failed for {symbol}!")
+                logger.critical(
+                    f"POSITION AT RISK: Entry filled but stop failed after 3 attempts for {symbol}! "
+                    f"Placing emergency market exit."
+                )
+                # Emergency: close the position with a market order
+                try:
+                    emergency_order = Order()
+                    emergency_order.action = exit_action
+                    emergency_order.totalQuantity = filled_qty
+                    emergency_order.orderType = 'MKT'
+                    emergency_order.tif = 'GTC'
+                    emergency_order.transmit = True
+                    emergency_trade = self.ib.placeOrder(contract, emergency_order)
+                    await asyncio.sleep(2.0)
+                    logger.critical(
+                        f"Emergency market exit placed for {symbol}: "
+                        f"order_id={emergency_trade.order.orderId}, "
+                        f"status={emergency_trade.orderStatus.status}"
+                    )
+                except Exception as emerg_err:
+                    logger.critical(f"EMERGENCY EXIT ALSO FAILED for {symbol}: {emerg_err}")
+
                 return {
                     'success': False,
                     'filled': True,  # Entry DID fill
                     'entry_price': actual_fill_price,
                     'quantity': filled_qty,
-                    'error': f"Stop order failed: {stop_trade.orderStatus.status}",
+                    'error': f"Stop order failed after 3 retries: {stop_trade.orderStatus.status}",
                     'symbol': symbol,
-                    'warning': 'Position is unprotected - manual stop required!'
+                    'warning': 'Emergency market exit attempted — verify position manually!'
                 }
 
             # Take profit order (GTC, OCA-linked)
@@ -508,7 +644,7 @@ class IBKROrdersMixin:
             }
 
         except Exception as e:
-            logger.error(f"Bracket order failed for {symbol}: {e}")
+            logger.error(f"Bracket order failed for {symbol}: {e}", exc_info=True)
             return {'error': str(e), 'symbol': symbol}
 
     # ========== OCA PROTECTIVE ORDERS ==========
@@ -716,28 +852,22 @@ class IBKROrdersMixin:
         wait_for_fill: bool = True, timeout: float = 10.0
     ) -> Dict[str, Any]:
         """Place a market order with optional fill waiting."""
-        contract = await self._prepare_contract(symbol)
-        if contract is None:
-            return {'error': 'Not connected'}
+        result = await self._place_order(
+            symbol, action, quantity, 'MKT',
+            order_name='MARKET',
+        )
+        if not result.get('success'):
+            return result
 
-        try:
-            order = Order()
-            order.action = action
-            order.totalQuantity = quantity
-            order.orderType = 'MKT'
-            order.tif = 'DAY'
-            order.transmit = True
-
-            logger.info(f"Placing MARKET {action} {quantity} {symbol}")
-            trade = self.ib.placeOrder(contract, order)
-
-            result = {
-                'success': True, 'order_id': trade.order.orderId, 'symbol': symbol,
-                'action': action, 'quantity': quantity, 'order_type': 'MKT',
-                'timestamp': datetime.now(timezone.utc).isoformat()
-            }
-
-            if wait_for_fill:
+        if wait_for_fill:
+            order_id = result.get('order_id')
+            trade = None
+            if order_id:
+                for t in self.ib.openTrades():
+                    if t.order.orderId == order_id:
+                        trade = t
+                        break
+            if trade:
                 fill_result = await self._wait_for_fill(trade, timeout=timeout)
                 result.update({
                     'filled': fill_result['filled'], 'fill_status': fill_result['status'],
@@ -747,11 +877,7 @@ class IBKROrdersMixin:
                 if fill_result['filled']:
                     logger.info(f"Market order FILLED: {action} {fill_result['filled_quantity']} {symbol} @ ${fill_result['avg_fill_price']:.2f}")
 
-            return result
-
-        except Exception as e:
-            logger.error(f"Market order failed for {symbol}: {e}")
-            return {'error': str(e), 'symbol': symbol}
+        return result
 
     # ========== MODIFY ORDER ==========
 

@@ -30,8 +30,10 @@ Usage:
 """
 
 import logging
+import sqlite3
 from dataclasses import dataclass, asdict
 from datetime import datetime, date
+from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 logger = logging.getLogger(__name__)
@@ -184,12 +186,51 @@ class CostTracker:
         self._load()
 
     # =========================================================================
-    # PERSISTENCE
+    # PERSISTENCE — SQLite-backed daily summaries
     # =========================================================================
-    
+
+    _DB_PATH = Path(__file__).parent.parent / "memory" / "abc.db"
+
+    def _get_db(self) -> sqlite3.Connection:
+        """Get or create a connection to the shared DB."""
+        if not hasattr(self, "_db") or self._db is None:
+            self._DB_PATH.parent.mkdir(parents=True, exist_ok=True)
+            self._db = sqlite3.connect(str(self._DB_PATH), check_same_thread=False)
+            self._db.row_factory = sqlite3.Row
+            self._db.execute("PRAGMA journal_mode=WAL")
+            self._db.execute("PRAGMA busy_timeout=5000")
+            self._db.execute("""
+                CREATE TABLE IF NOT EXISTS cost_daily_summaries (
+                    date TEXT PRIMARY KEY,
+                    llm_calls INTEGER DEFAULT 0,
+                    llm_cost_usd REAL DEFAULT 0.0,
+                    trades_closed INTEGER DEFAULT 0,
+                    realized_pnl_usd REAL DEFAULT 0.0,
+                    research_budget_usd REAL DEFAULT 0.0
+                )
+            """)
+            self._db.commit()
+        return self._db
+
     def _load(self):
-        """Initialize empty state (in-memory only, no persistence)."""
-        self._init_empty()
+        """Load daily summaries from SQLite."""
+        self.llm_calls = []
+        self.trade_pnls = []
+        self.daily_summaries = {}
+        try:
+            db = self._get_db()
+            for row in db.execute("SELECT * FROM cost_daily_summaries").fetchall():
+                self.daily_summaries[row["date"]] = DailySummary(
+                    date=row["date"],
+                    llm_calls=row["llm_calls"],
+                    llm_cost_usd=row["llm_cost_usd"],
+                    trades_closed=row["trades_closed"],
+                    realized_pnl_usd=row["realized_pnl_usd"],
+                    research_budget_usd=row["research_budget_usd"],
+                )
+        except Exception as e:
+            logger.warning(f"Cost tracker load failed (starting fresh): {e}")
+            self.daily_summaries = {}
     
     def _init_empty(self):
         """Initialize empty state."""
@@ -198,8 +239,28 @@ class CostTracker:
         self.daily_summaries = {}
     
     def _save(self):
-        """No-op — in-memory only, no persistence."""
-        pass
+        """Persist daily summaries to SQLite."""
+        try:
+            db = self._get_db()
+            for day_key, summary in self.daily_summaries.items():
+                db.execute(
+                    """INSERT INTO cost_daily_summaries
+                       (date, llm_calls, llm_cost_usd, trades_closed,
+                        realized_pnl_usd, research_budget_usd)
+                       VALUES (?, ?, ?, ?, ?, ?)
+                       ON CONFLICT(date) DO UPDATE SET
+                           llm_calls = excluded.llm_calls,
+                           llm_cost_usd = excluded.llm_cost_usd,
+                           trades_closed = excluded.trades_closed,
+                           realized_pnl_usd = excluded.realized_pnl_usd,
+                           research_budget_usd = excluded.research_budget_usd""",
+                    (day_key, summary.llm_calls, summary.llm_cost_usd,
+                     summary.trades_closed, summary.realized_pnl_usd,
+                     summary.research_budget_usd),
+                )
+            db.commit()
+        except Exception as e:
+            logger.warning(f"Cost tracker save failed: {e}")
     
     # =========================================================================
     # COST CALCULATION

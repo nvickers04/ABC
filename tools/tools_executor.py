@@ -124,9 +124,15 @@ import logging
 import os
 import re
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
 from typing import Any
 
 from core.config import TRADING_MODE, PAPER_AGGRESSIVE
+from memory import (
+    get_graduated_params, _time_bucket, _atr_bucket,
+    _pending_graduated_params, _pending_order_context,
+    get_execution_cost,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -375,7 +381,7 @@ class ToolExecutor:
         try:
             await self.gateway.refresh_positions()
         except Exception as e:
-            logger.debug(f"State refresh failed: {e}")
+            logger.warning(f"State refresh failed: {e}")
 
     async def _close_position(self, symbol: str, quantity: int | None = None, reason: str = "") -> dict:
         """Close a single position: cancel its stops then market-close.
@@ -516,8 +522,8 @@ class ToolExecutor:
                         cash = float(av.value)
                         self.gateway.cash_value = cash
                         break
-            except Exception:
-                pass
+            except Exception as e:
+                logger.debug(f"Cash value refresh failed: {e}")
         if cash <= 0:
             return {
                 "error": f"CASH-ONLY: insufficient cash. "
@@ -636,6 +642,18 @@ class ToolExecutor:
         minutes_to_open = session_info.get("minutes_to_open")
         minutes_to_close = session_info.get("minutes_to_close")
 
+        # ── Graduated param overrides (from execution autoresearch) ──
+        # Loaded here, applied after the decision tree sets `recommended`.
+        graduated_override = None
+        graduated_param_id = None
+        _graduated_params_list = []
+        try:
+            _gp_tb = _time_bucket(datetime.now(timezone.utc).isoformat())
+            _gp_ab = _atr_bucket(atr_pct)
+            _graduated_params_list = get_graduated_params(active_only=True)
+        except Exception as e:
+            logger.debug(f"Graduated params load failed: {e}")
+
         # --- Order type override or auto decision tree ---
         if order_type and intent != "stop":
             # Agent explicitly chose the order type
@@ -665,6 +683,53 @@ class ToolExecutor:
                 atr_pct, limit_price=limit_price
             )
 
+        # Match graduated params now that `recommended` is known
+        if _graduated_params_list and not order_type:
+            # Decision tree returns "market_order", "adaptive_order", etc.
+            # Param key uses canonical: "market", "adaptive", etc.
+            _match_ot = recommended.removesuffix("_order") if isinstance(recommended, str) else recommended
+            best_specificity = -1
+            for p in _graduated_params_list:
+                pk = p["param_key"]
+                parts = pk.split(".")
+                if len(parts) != 4:
+                    continue
+                pk_ot, pk_intent, pk_tb, pk_ab = parts
+                # All 4 components must match (exact or 'all' wildcard)
+                if not (pk_ot == _match_ot or pk_ot == "all"):
+                    continue
+                if not (pk_intent == intent or pk_intent == "all"):
+                    continue
+                if not (pk_tb == _gp_tb or pk_tb == "all"):
+                    continue
+                if not (pk_ab == _gp_ab or pk_ab == "all"):
+                    continue
+                # Prefer more specific params (fewer 'all' wildcards)
+                specificity = sum(1 for v in (pk_ot, pk_intent, pk_tb, pk_ab) if v != "all")
+                if specificity > best_specificity:
+                    best_specificity = specificity
+                    graduated_override = p["param_value"]
+                    graduated_param_id = p["id"]
+
+        # Apply graduated param override (only if agent didn't explicitly choose)
+        if graduated_override and not order_type:
+            reasons.append(f"Graduated override: {graduated_override} (from execution research)")
+            # Append _order suffix to stay consistent with decision tree naming
+            recommended = f"{graduated_override}_order"
+
+        # Store graduated_param_id for snapshot linkage when order is placed
+        if graduated_param_id is not None:
+            try:
+                _pending_graduated_params[symbol] = graduated_param_id
+            except Exception as e:
+                logger.warning(f"Failed to store pending graduated param for {symbol}: {e}")
+
+        # Store order context (intent, atr_pct) for snapshot capture
+        try:
+            _pending_order_context[symbol] = {"intent": intent, "atr_pct": atr_pct}
+        except Exception as e:
+            logger.warning(f"Failed to store pending order context for {symbol}: {e}")
+
         # --- Stop recommendation: agent override or auto ---
         stop_rec = None
         if intent not in ("stop", "exit") and price:
@@ -685,6 +750,15 @@ class ToolExecutor:
                 else:
                     stop_rec = self._recommend_stop_short(price, atr_value, atr_pct, days_to_earnings)
 
+        # Per-symbol execution cost history
+        exec_cost = None
+        try:
+            ec = get_execution_cost(symbol=symbol)
+            if ec and ec.get("trades", 0) >= 3:
+                exec_cost = {"avg_gap_pct": ec["avg_gap_pct"], "trades_observed": ec["trades"]}
+        except Exception as e:
+            logger.debug(f"Execution cost lookup failed for {symbol}: {e}")
+
         data_snapshot = {
             "price": price,
             "bid": bid,
@@ -700,6 +774,7 @@ class ToolExecutor:
             "minutes_to_open": minutes_to_open,
             "minutes_to_close": minutes_to_close,
             "volume": volume,
+            "execution_cost": exec_cost,
         }
 
         return {
@@ -713,6 +788,7 @@ class ToolExecutor:
             "suggested_params": suggested_params,
             "stop_recommendation": stop_rec,
             "data_snapshot": data_snapshot,
+            "graduated_param_id": graduated_param_id,
             "agent_overrides": {
                 "order_type": order_type,
                 "stop_type": stop_type,
@@ -1038,20 +1114,20 @@ class ToolExecutor:
             iv_info = self.data_provider.get_iv_info(
                 symbol, dte_min=dte_min, dte_max=dte_max
             )
-        except Exception:
-            pass
+        except Exception as e:
+            logger.debug(f"IV info lookup failed for {symbol}: {e}")
 
         atr_result = None
         try:
             atr_result = self.data_provider.get_atr(symbol)
-        except Exception:
-            pass
+        except Exception as e:
+            logger.debug(f"ATR lookup failed for {symbol}: {e}")
 
         earnings = None
         try:
             earnings = self.data_provider.get_earnings_info(symbol)
-        except Exception:
-            pass
+        except Exception as e:
+            logger.debug(f"Earnings lookup failed for {symbol}: {e}")
         days_to_earnings = earnings.days_until_earnings if earnings else None
 
         earnings_warning = None
@@ -1667,6 +1743,27 @@ class ToolExecutor:
                 if val is not None:
                     params[key] = val
             action = "plan_order"
+
+        # ── Universe gate ───────────────────────────────────────
+        # Only allow symbol-based tools on RESEARCH_UNIVERSE symbols.
+        # Exempt: position-management actions (need to close/modify any held position),
+        # account tools, meta tools, and anything without a symbol param.
+        _UNIVERSE_EXEMPT = {
+            "close_option", "roll_option", "close_position", "cancel_order",
+            "cancel_stops", "flatten_limits", "modify_stop", "trailing_stop",
+            "stop_order", "stop_limit",  # protective exits on existing positions
+        }
+        _sym_check = (params.get("symbol") or "").upper()
+        if _sym_check and action not in _UNIVERSE_EXEMPT:
+            from research.config import RESEARCH_UNIVERSE
+            _allowed = {s.upper() for s in RESEARCH_UNIVERSE}
+            if _sym_check not in _allowed:
+                return {
+                    "success": False,
+                    "error": f"{_sym_check} is outside the research universe. Only trade researched symbols: {', '.join(sorted(_allowed))}",
+                    "is_realtime": False,
+                    "data_warning": None,
+                }
 
         # Normalize side: BUY_TO_OPEN/BUY_TO_CLOSE → BUY, SELL_TO_OPEN/SELL_TO_CLOSE → SELL
         _side_raw = params.get("side", "")

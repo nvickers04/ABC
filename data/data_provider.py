@@ -20,6 +20,7 @@ from typing import Any, Dict, List, Optional, Protocol, runtime_checkable
 from concurrent.futures import ThreadPoolExecutor
 
 import numpy as np
+import yfinance as yf
 
 logger = logging.getLogger(__name__)
 
@@ -476,7 +477,7 @@ class DataProvider:
             value, timestamp = self._cache[key]
             data_type = key.split(':')[0] if ':' in key else key
             ttl = self._ttl_map.get(data_type, self._default_ttl)
-            if (datetime.now() - timestamp).seconds < ttl:
+            if (datetime.now() - timestamp).total_seconds() < ttl:
                 return value
             del self._cache[key]
         return _CACHE_MISS
@@ -613,6 +614,55 @@ class DataProvider:
             else:
                 logger.debug(f"No candle data available for {symbol}")
                 # Negative-cache to avoid re-requesting the same failure
+                self._set_cached(cache_key, None)
+
+        except Exception as e:
+            logger.warning(f"Failed to get candles for {symbol}: {e}")
+            self._set_cached(cache_key, None)
+
+        return None
+
+    # ==================== Async candles (for callers already in an event loop) ====
+
+    async def get_candles_async(
+        self,
+        symbol: str,
+        resolution: str = 'D',
+        days_back: int = 30,
+        from_date: Optional[str] = None,
+        to_date: Optional[str] = None,
+    ) -> Optional[Candles]:
+        """Async version of get_candles — avoids nest_asyncio issues.
+
+        Use this from async callers (e.g. research agent) that share the
+        main event loop.  Directly awaits the marketdata_client coroutine.
+        """
+        cache_key = f"candles:{symbol}:{resolution}:{from_date or days_back}:{to_date}"
+        cached = self._get_cached(cache_key)
+        if cached is not _CACHE_MISS:
+            return cached
+
+        try:
+            raw = await self._mda_client.get_candles(
+                symbol, resolution, days_back,
+                from_date=from_date, to_date=to_date,
+            )
+
+            if raw and raw.get('close'):
+                candles = Candles(
+                    symbol=symbol,
+                    open=raw.get('open', []),
+                    high=raw.get('high', []),
+                    low=raw.get('low', []),
+                    close=raw.get('close', []),
+                    volume=[int(v) for v in raw.get('volume', [])],
+                    timestamps=raw.get('timestamps', []),
+                    source=raw.get('source', 'unknown')
+                )
+                self._set_cached(cache_key, candles)
+                return candles
+            else:
+                logger.debug(f"No candle data available for {symbol}")
                 self._set_cached(cache_key, None)
 
         except Exception as e:
@@ -882,6 +932,14 @@ class DataProvider:
             logger.warning(f"Failed to get option strikes for {symbol}: {e}")
             return None
 
+    def get_option_lookup(self, symbol: str) -> Optional[list[str]]:
+        """Look up OCC-format option symbols for an underlying."""
+        try:
+            return self._run_async(self._mda_client.get_option_lookup(symbol))
+        except Exception as e:
+            logger.warning(f"Failed option lookup for {symbol}: {e}")
+            return None
+
     def find_option_by_delta(
         self,
         symbol: str,
@@ -1004,8 +1062,6 @@ class DataProvider:
             return cached
 
         try:
-            import yfinance as yf
-
             ticker = yf.Ticker(symbol)
             info = ticker.info
 
@@ -1163,7 +1219,6 @@ class DataProvider:
             return cached
 
         try:
-            import yfinance as yf
             ticker = yf.Ticker(symbol)
             info = ticker.info
             if not isinstance(info, dict):
@@ -1208,7 +1263,6 @@ class DataProvider:
             return cached
 
         try:
-            import yfinance as yf
             ticker = yf.Ticker(symbol)
             info = ticker.info
             if not isinstance(info, dict):
@@ -1263,7 +1317,6 @@ class DataProvider:
             return cached
 
         try:
-            import yfinance as yf
             ticker = yf.Ticker(symbol)
 
             insider_pct = None
@@ -1316,7 +1369,6 @@ class DataProvider:
             return cached
 
         try:
-            import yfinance as yf
             ticker = yf.Ticker(symbol)
 
             buys = 0

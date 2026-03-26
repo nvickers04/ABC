@@ -30,6 +30,7 @@ API_BASE = "https://api.marketdata.app/v1"
 _OPTIONS_RETRY_STATUSES = {429, 500, 502, 503, 504}
 _OPTIONS_MAX_CONCURRENCY = 3
 _OPTIONS_RETRY_ATTEMPTS = 3
+_MDA_MAX_CONCURRENT = 45  # MDA hard limit is 50; keep 5 headroom
 
 
 class MarketDataClient:
@@ -59,6 +60,13 @@ class MarketDataClient:
         self._loop_id: Optional[int] = None  # Track which event loop the client belongs to
         self._options_semaphore: Optional[asyncio.Semaphore] = None
         self._options_semaphore_loop_id: Optional[int] = None
+        self._global_semaphore: Optional[asyncio.Semaphore] = None
+        self._global_semaphore_loop_id: Optional[int] = None
+        # Credit tracking from MDA response headers
+        self._credits_remaining: Optional[int] = None
+        self._credits_limit: Optional[int] = None
+        self._credits_reset: Optional[int] = None  # UTC epoch seconds
+        self._low_credit_warned: bool = False
 
         if not self.api_key:
             logger.warning("No Market Data App API key configured")
@@ -75,8 +83,12 @@ class MarketDataClient:
         # Create new client if none exists or if we're in a different event loop
         if self._http_client is None or (current_loop_id and self._loop_id != current_loop_id):
             if self._http_client is not None:
-                # Old client exists but is bound to different loop - abandon it
-                # (can't close it from here as that's async)
+                # Old client bound to different loop — close it synchronously
+                # httpx.AsyncClient._transport uses httpcore which supports sync close
+                try:
+                    self._http_client._transport.close()
+                except Exception:
+                    pass
                 self._http_client = None
             
             if self.api_key:
@@ -85,14 +97,26 @@ class MarketDataClient:
                     headers={"Authorization": f"Bearer {self.api_key}"},
                     timeout=30.0,
                     limits=httpx.Limits(
-                        max_connections=20,
-                        max_keepalive_connections=10,
+                        max_connections=_MDA_MAX_CONCURRENT,
+                        max_keepalive_connections=25,
                         keepalive_expiry=30,
                     ),
                 )
                 self._loop_id = current_loop_id
         
         return self._http_client
+
+    def _get_global_semaphore(self) -> asyncio.Semaphore:
+        """Global semaphore enforcing MDA's 50 concurrent request limit."""
+        try:
+            current_loop_id = id(asyncio.get_running_loop())
+        except RuntimeError:
+            current_loop_id = None
+
+        if self._global_semaphore is None or self._global_semaphore_loop_id != current_loop_id:
+            self._global_semaphore = asyncio.Semaphore(_MDA_MAX_CONCURRENT)
+            self._global_semaphore_loop_id = current_loop_id
+        return self._global_semaphore
 
     def _get_options_semaphore(self) -> asyncio.Semaphore:
         """Get a per-event-loop semaphore for high-volume option endpoints."""
@@ -124,7 +148,9 @@ class MarketDataClient:
                 try:
                     if self._track_request():
                         return None
-                    response = await client.get(path, params=params)
+                    async with self._get_global_semaphore():
+                        response = await client.get(path, params=params)
+                    self._parse_rate_headers(response)
                     if response.status_code not in _OPTIONS_RETRY_STATUSES or attempt == _OPTIONS_RETRY_ATTEMPTS - 1:
                         return response
                     logger.debug(
@@ -159,10 +185,35 @@ class MarketDataClient:
             await self._http_client.aclose()
             self._http_client = None
 
+    def _parse_rate_headers(self, response: httpx.Response) -> None:
+        """Extract MDA rate-limit headers and warn when credits run low."""
+        try:
+            remaining = response.headers.get('X-Api-Ratelimit-Remaining')
+            limit = response.headers.get('X-Api-Ratelimit-Limit')
+            reset = response.headers.get('X-Api-Ratelimit-Reset')
+            if remaining is not None:
+                self._credits_remaining = int(remaining)
+            if limit is not None:
+                self._credits_limit = int(limit)
+            if reset is not None:
+                self._credits_reset = int(reset)
+            # Warn once when credits drop below 10%
+            if self._credits_remaining is not None and self._credits_limit:
+                pct = self._credits_remaining / self._credits_limit
+                if pct < 0.10 and not self._low_credit_warned:
+                    logger.warning(
+                        f"MDA credits low: {self._credits_remaining:,} / {self._credits_limit:,} remaining ({pct:.1%})"
+                    )
+                    self._low_credit_warned = True
+                elif pct >= 0.10:
+                    self._low_credit_warned = False
+        except (ValueError, TypeError):
+            pass
+
     def _track_request(self) -> bool:
         """
-        Track request count for observability. Always returns False (unlimited plan).
-        Resets daily counter at midnight UTC.
+        Track request count for observability.
+        Resets daily counter at 9:30 AM ET (MDA reset time).
         """
         now = datetime.utcnow()
         
@@ -183,6 +234,9 @@ class MarketDataClient:
             'total_requests': self._request_count,
             'daily_requests': self._daily_count,
             'last_request': self._last_request_time.isoformat() if self._last_request_time else None,
+            'mda_credits_remaining': self._credits_remaining,
+            'mda_credits_limit': self._credits_limit,
+            'mda_credits_reset_epoch': self._credits_reset,
         }
 
     async def get_hybrid_quote(self, symbol: str) -> Optional[Dict[str, Any]]:
@@ -221,7 +275,9 @@ class MarketDataClient:
             if not client:
                 return None
             
-            response = await client.get(f"/stocks/quotes/{symbol}/")
+            async with self._get_global_semaphore():
+                response = await client.get(f"/stocks/quotes/{symbol}/")
+            self._parse_rate_headers(response)
             if response.status_code not in (200, 203):
                 return None
             
@@ -258,16 +314,13 @@ class MarketDataClient:
             return None
 
         try:
-            client = self._get_http_client()
-            if not client:
-                return None
-
-            if self._track_request():
-                return None
-            response = await client.get(
+            response = await self._get_with_retries(
                 f"/stocks/prices/{symbol}/",
-                params={'columns': 'mid,change,changepct,updated'}
+                params={},
+                label=f"price({symbol})",
             )
+            if response is None:
+                return None
 
             if response.status_code not in (200, 203):
                 # VIX endpoints are not supported by MarketData.app in some plans.
@@ -334,7 +387,9 @@ class MarketDataClient:
 
             if self._track_request():
                 return None
-            response = await client.get(f"/stocks/quotes/{symbol}/")
+            async with self._get_global_semaphore():
+                response = await client.get(f"/stocks/quotes/{symbol}/")
+            self._parse_rate_headers(response)
 
             # Accept 200 and 203 (Non-Authoritative - cached/proxy data is still valid)
             if response.status_code not in (200, 203):
@@ -392,10 +447,12 @@ class MarketDataClient:
             symbols_upper = [s.upper().strip() for s in symbols]
             if self._track_request():
                 return {}
-            response = await client.get(
-                "/stocks/bulkquotes/",
-                params={'symbols': ','.join(symbols_upper)}
-            )
+            async with self._get_global_semaphore():
+                response = await client.get(
+                    "/stocks/bulkquotes/",
+                    params={'symbols': ','.join(symbols_upper)}
+                )
+            self._parse_rate_headers(response)
 
             if response.status_code not in (200, 203):
                 logger.warning(f"Bulk quotes request failed: {response.status_code}")
@@ -434,6 +491,8 @@ class MarketDataClient:
     async def _get_quotes_bulk_fallback(self, symbols: List[str]) -> Dict[str, Dict[str, Any]]:
         """Fallback: individual quote calls when bulk endpoint fails."""
         results = {}
+        if not symbols:
+            return results
         tasks = [self.get_quote(symbol) for symbol in symbols]
         quotes = await asyncio.gather(*tasks, return_exceptions=True)
         for symbol, quote in zip(symbols, quotes):
@@ -450,7 +509,6 @@ class MarketDataClient:
         days_back: int = 30,
         from_date: Optional[str] = None,
         to_date: Optional[str] = None,
-        mode: Optional[str] = 'cached',
     ) -> Optional[Dict[str, Any]]:
         """
         Get historical OHLCV candles.
@@ -461,7 +519,6 @@ class MarketDataClient:
             days_back: Number of days of history (if from_date not specified)
             from_date: Start date (YYYY-MM-DD)
             to_date: End date (YYYY-MM-DD)
-            mode: 'cached' for reduced credits (default), None for real-time
 
         Returns:
             Dict with open, high, low, close, volume, timestamps arrays
@@ -471,14 +528,8 @@ class MarketDataClient:
             return None
 
         try:
-            client = self._get_http_client()
-            if not client:
-                return None
-
-            # Build query params
-            params = {'resolution': resolution}
-            if mode:
-                params['mode'] = mode
+            # Build query params (resolution is already in the URL path)
+            params = {}
             if from_date:
                 params['from'] = from_date
                 if to_date:
@@ -486,9 +537,13 @@ class MarketDataClient:
             else:
                 params['countback'] = days_back
 
-            if self._track_request():
+            response = await self._get_with_retries(
+                f"/stocks/candles/{resolution}/{symbol}/",
+                params=params,
+                label=f"candles({symbol})",
+            )
+            if response is None:
                 return None
-            response = await client.get(f"/stocks/candles/{resolution}/{symbol}/", params=params)
 
             if response.status_code not in (200, 203):
                 # 404 is expected outside market hours or for symbols with no intraday data
@@ -542,10 +597,12 @@ class MarketDataClient:
             symbols_upper = [s.upper().strip() for s in symbols]
             if self._track_request():
                 return {}
-            response = await client.get(
-                "/stocks/bulkcandles/D/",
-                params={'symbols': ','.join(symbols_upper)}
-            )
+            async with self._get_global_semaphore():
+                response = await client.get(
+                    "/stocks/bulkcandles/D/",
+                    params={'symbols': ','.join(symbols_upper)}
+                )
+            self._parse_rate_headers(response)
 
             if response.status_code not in (200, 203):
                 logger.warning(f"Bulk candles request failed: {response.status_code}")
@@ -681,10 +738,6 @@ class MarketDataClient:
             # Build query params
             params: Dict[str, Any] = {}
 
-            # Use mode=cached for non-historical requests (1 credit vs per-contract)
-            if not is_historical:
-                params['mode'] = 'cached'
-
             if expiration:
                 params['expiration'] = expiration
             elif is_historical:
@@ -734,9 +787,6 @@ class MarketDataClient:
             used_fallback = False
             if response.status_code in (400, 404) and params:
                 fallback_params: Dict[str, Any] = {}
-                # Preserve mode=cached on fallback
-                if 'mode' in params:
-                    fallback_params['mode'] = params['mode']
                 if expiration:
                     fallback_params['expiration'] = expiration
                 if side:
@@ -911,6 +961,39 @@ class MarketDataClient:
             return None
         except Exception as e:
             logger.warning(f"Strikes request failed for {symbol}: {e}")
+            return None
+
+    async def get_option_lookup(self, symbol: str) -> Optional[List[str]]:
+        """
+        Look up OCC-format option symbols for an underlying via MDA /options/lookup/.
+
+        Args:
+            symbol: Underlying ticker (e.g. 'AAPL')
+
+        Returns:
+            List of OCC option symbols, or None on failure.
+        """
+        if not self.is_configured:
+            return None
+
+        try:
+            client = self._get_http_client()
+            if not client:
+                return None
+
+            if self._track_request():
+                return None
+            response = await client.get(f"/options/lookup/{symbol}/")
+
+            if response.status_code not in (200, 203):
+                return None
+
+            data = response.json()
+            if data.get('s') == 'ok':
+                return data.get('optionSymbol', [])
+            return None
+        except Exception as e:
+            logger.warning(f"Option lookup failed for {symbol}: {e}")
             return None
 
     async def get_option_quote(

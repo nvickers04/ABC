@@ -11,6 +11,7 @@ No LLM involved — pure math.
 import logging
 import math
 import statistics
+from datetime import datetime, date, timezone
 from typing import Any
 
 import pandas as pd
@@ -150,6 +151,42 @@ def _condition_metrics(results: list[dict]) -> dict[str, Any]:
         "condition_metrics": rows,
     }
 
+# ── Calibrated slippage from live execution data ─────────────────
+# Cached with a version check — invalidated when memory.upsert_calibrated_slippage bumps the counter.
+_calibrated_cache: dict[tuple[str, str, str], float] | None = None
+_calibrated_version: int = -1
+
+
+def _load_calibrated() -> dict[tuple[str, str, str], float]:
+    global _calibrated_cache, _calibrated_version
+    try:
+        from memory import get_calibrated_slippage, get_calibration_version
+        current_ver = get_calibration_version()
+        if _calibrated_cache is None or current_ver != _calibrated_version:
+            _calibrated_cache = get_calibrated_slippage()
+            _calibrated_version = current_ver
+    except Exception:
+        logger.warning("Calibrated slippage load failed — falling back to defaults")
+        if _calibrated_cache is None:
+            _calibrated_cache = {}
+    return _calibrated_cache
+
+
+def _minute_to_time_bucket(bar_minute: int | None) -> str:
+    """Map a minute-of-day (ET) to the same bucket labels used by execution snapshots."""
+    if bar_minute is None:
+        return "unknown"
+    if 570 <= bar_minute < 585:
+        return "open"
+    elif 585 <= bar_minute < 720:
+        return "morning"
+    elif 720 <= bar_minute < 945:
+        return "midday"
+    elif 945 <= bar_minute < 960:
+        return "close"
+    return "extended"
+
+
 # ── Slippage presets ─────────────────────────────────────────────
 # Each preset maps order_type to (entry_slippage_bps, exit_slippage_bps).
 # 'fast' is used for the inner research loop (throughput-optimised).
@@ -163,9 +200,15 @@ _SLIPPAGE_PRESETS: dict[str, dict[str, tuple[float, float]]] = {
         "trailing_stop_exit":   (SLIPPAGE_BPS, SLIPPAGE_BPS),
         "oca_exit":             (SLIPPAGE_BPS, SLIPPAGE_BPS),
         "midprice":             (SLIPPAGE_BPS * 0.5, SLIPPAGE_BPS * 0.5),
+        "adaptive":             (SLIPPAGE_BPS * 0.7, SLIPPAGE_BPS * 0.7),
         "vwap":                 (SLIPPAGE_BPS * 0.5, SLIPPAGE_BPS * 0.5),
+        "twap":                 (SLIPPAGE_BPS * 0.5, SLIPPAGE_BPS * 0.5),
+        "relative":             (SLIPPAGE_BPS * 0.5, SLIPPAGE_BPS * 0.5),
+        "snap_mid":             (SLIPPAGE_BPS * 0.5, SLIPPAGE_BPS * 0.5),
         "moc":                  (SLIPPAGE_BPS, SLIPPAGE_BPS * 2),
         "moo":                  (SLIPPAGE_BPS * 2, SLIPPAGE_BPS),
+        "loc":                  (0, SLIPPAGE_BPS * 2),
+        "loo":                  (0, SLIPPAGE_BPS),
         "_options":             (0, 0),   # options: handled by separate pricers
     },
     "strict": {
@@ -176,9 +219,15 @@ _SLIPPAGE_PRESETS: dict[str, dict[str, tuple[float, float]]] = {
         "trailing_stop_exit":   (SLIPPAGE_BPS * 3, SLIPPAGE_BPS * 3),
         "oca_exit":             (SLIPPAGE_BPS * 3, SLIPPAGE_BPS * 3),
         "midprice":             (SLIPPAGE_BPS * 2, SLIPPAGE_BPS * 2),
+        "adaptive":             (SLIPPAGE_BPS * 2, SLIPPAGE_BPS * 2),
         "vwap":                 (SLIPPAGE_BPS * 2, SLIPPAGE_BPS * 2),
+        "twap":                 (SLIPPAGE_BPS * 2, SLIPPAGE_BPS * 2),
+        "relative":             (SLIPPAGE_BPS * 2, SLIPPAGE_BPS * 2),
+        "snap_mid":             (SLIPPAGE_BPS * 2, SLIPPAGE_BPS * 2),
         "moc":                  (SLIPPAGE_BPS * 2, SLIPPAGE_BPS * 4),
         "moo":                  (SLIPPAGE_BPS * 4, SLIPPAGE_BPS * 2),
+        "loc":                  (0, SLIPPAGE_BPS * 4),
+        "loo":                  (0, SLIPPAGE_BPS * 2),
         "_options":             (0, 0),
     },
 }
@@ -365,8 +414,25 @@ def _simulate_one(sig: dict, candles: pd.DataFrame, slippage_preset: str = "fast
     slip_key = "_options" if is_options else order_type
     entry_slip_bps, exit_slip_bps = preset.get(slip_key, (SLIPPAGE_BPS, SLIPPAGE_BPS))
     fill_bar_minute = _minute_of_day(candles.iloc[fill_bar]["ts"]) if fill_bar < len(candles) else None
-    entry_mult = _tod_multiplier(fill_bar_minute)
     exit_bar_minute = _minute_of_day(candles.iloc[exit_bar]["ts"]) if exit_bar < len(candles) else None
+
+    # Use calibrated entry slippage from live execution data when available (strict only).
+    # Calibrated values already incorporate time-of-day effects, so skip tod_multiplier.
+    calibrated_entry = False
+    if slippage_preset == "strict" and not is_options:
+        cal = _load_calibrated()
+        if cal:
+            tb = _minute_to_time_bucket(fill_bar_minute)
+            # Prefer: time-specific (order_type, time_bucket, "all") if it exists
+            # Fallback: broad (order_type, "all", "all") — most data, most stable
+            broad_key = (order_type, "all", "all")
+            time_key = (order_type, tb, "all")
+            cal_key = time_key if time_key in cal else broad_key
+            if cal_key in cal:
+                entry_slip_bps = cal[cal_key]
+                calibrated_entry = True
+
+    entry_mult = 1.0 if calibrated_entry else _tod_multiplier(fill_bar_minute)
     exit_mult = _tod_multiplier(exit_bar_minute)
     total_slip = (entry_slip_bps * entry_mult + exit_slip_bps * exit_mult) / 100
     if not is_options:
@@ -407,13 +473,33 @@ def _get_fill(order_type: str, entry_bar: int, entry_price: float,
 
     elif order_type == "limit":
         # Scan forward for a bar where price reaches limit
+        # Fill probability: depends on how far price penetrates through the limit.
+        # If limit is just touched (wicked), fill probability < 100%.
+        import random
         is_buy = direction == "long"
         for i in range(entry_bar + 1, min(entry_bar + 11, len(candles))):
             bar = candles.iloc[i]
             if is_buy and bar["low"] <= entry_price:
-                return i, entry_price
+                # How deep did price go through the limit?
+                bar_range = bar["high"] - bar["low"]
+                if bar_range > 0:
+                    penetration = (entry_price - bar["low"]) / bar_range
+                else:
+                    penetration = 1.0
+                # Fill probability: 50% at touch, 100% at full penetration
+                fill_prob = min(1.0, 0.5 + 0.5 * penetration)
+                if random.random() < fill_prob:
+                    return i, entry_price
+                # Not filled this bar — keep scanning
             elif not is_buy and bar["high"] >= entry_price:
-                return i, entry_price
+                bar_range = bar["high"] - bar["low"]
+                if bar_range > 0:
+                    penetration = (bar["high"] - entry_price) / bar_range
+                else:
+                    penetration = 1.0
+                fill_prob = min(1.0, 0.5 + 0.5 * penetration)
+                if random.random() < fill_prob:
+                    return i, entry_price
         return None, None  # limit not reached within 10 bars
 
     elif order_type == "stop_entry":
@@ -483,8 +569,11 @@ def _norm_cdf(x: float) -> float:
 
 def _bs_call(S: float, K: float, T: float, sigma: float) -> float:
     """Black-Scholes call price.  T in years, sigma annualised."""
-    if T <= 0 or sigma <= 0:
-        return max(S - K, 0.0)
+    try:
+        if not (math.isfinite(S) and math.isfinite(K) and S > 0 and K > 0 and T > 0 and sigma > 0):
+            return 0.0
+    except (TypeError, ValueError):
+        return 0.0
     d1 = (math.log(S / K) + (_RISK_FREE_RATE + 0.5 * sigma ** 2) * T) / (sigma * math.sqrt(T))
     d2 = d1 - sigma * math.sqrt(T)
     return S * _norm_cdf(d1) - K * math.exp(-_RISK_FREE_RATE * T) * _norm_cdf(d2)
@@ -492,8 +581,11 @@ def _bs_call(S: float, K: float, T: float, sigma: float) -> float:
 
 def _bs_put(S: float, K: float, T: float, sigma: float) -> float:
     """Black-Scholes put price via put-call parity."""
-    if T <= 0 or sigma <= 0:
-        return max(K - S, 0.0)
+    try:
+        if not (math.isfinite(S) and math.isfinite(K) and S > 0 and K > 0 and T > 0 and sigma > 0):
+            return 0.0
+    except (TypeError, ValueError):
+        return 0.0
     d1 = (math.log(S / K) + (_RISK_FREE_RATE + 0.5 * sigma ** 2) * T) / (sigma * math.sqrt(T))
     d2 = d1 - sigma * math.sqrt(T)
     return K * math.exp(-_RISK_FREE_RATE * T) * _norm_cdf(-d2) - S * _norm_cdf(-d1)
@@ -511,7 +603,7 @@ def _realised_vol(candles: pd.DataFrame, fill_bar: int) -> float:
     closes = candles["close"].iloc[max(0, fill_bar - lookback):fill_bar].values
     if len(closes) < 5:
         return 0.25
-    rets = [math.log(closes[i] / closes[i - 1]) for i in range(1, len(closes)) if closes[i - 1] > 0]
+    rets = [math.log(closes[i] / closes[i - 1]) for i in range(1, len(closes)) if closes[i - 1] > 0 and closes[i] > 0]
     if not rets:
         return 0.25
     std_1m = statistics.stdev(rets)
@@ -519,20 +611,33 @@ def _realised_vol(candles: pd.DataFrame, fill_bar: int) -> float:
     return max(annualised, _MIN_VOL)
 
 
-def _dte_years(legs: dict, bars_held: int) -> tuple[float, float]:
+def _skew_adjusted_vol(base_sigma: float, S: float, K: float, is_call: bool) -> float:
+    """Apply IV skew based on moneyness.
+
+    OTM puts get higher implied vol (the "skew smile"), OTM calls slightly lower.
+    Uses a simple quadratic smile: vol = base * (1 + skew_coeff * (moneyness - 1)^2 + tilt)
+    """
+    if S <= 0 or K <= 0:
+        return base_sigma
+    moneyness = K / S
+    # Quadratic smile: vol increases for strikes far from ATM
+    smile = 0.8 * (moneyness - 1.0) ** 2
+    # Negative tilt: puts (low moneyness) get extra vol, calls (high moneyness) get less
+    tilt = -0.15 * (moneyness - 1.0)
+    adjusted = base_sigma * (1.0 + smile + tilt)
+    return max(adjusted, _MIN_VOL)
+
+
+def _dte_years(legs: dict, bars_held: int, entry_date: date | None = None) -> tuple[float, float]:
     """Return (T_entry, T_exit) in years.
 
-    If expiration is parseable, compute real calendar DTE.
+    If expiration is parseable, compute real calendar DTE from entry_date.
     Otherwise fall back to a conservative 7-day estimate.
     """
     try:
-        from datetime import datetime as _dt
-        exp = _dt.strptime(str(legs["expiration"]), "%Y-%m-%d").date()
-        # Assume entry is "today" for backtesting purposes; the important
-        # thing is that exit DTE = entry DTE minus days_held.
-        from datetime import date as _date
-        today = _date.today()
-        dte_entry = max((exp - today).days, 1)
+        exp = datetime.strptime(str(legs["expiration"]), "%Y-%m-%d").date()
+        ref = entry_date or date.today()
+        dte_entry = max((exp - ref).days, 1)
     except Exception:
         dte_entry = 7  # Fallback for unparseable dates
     days_held = bars_held / 390.0
@@ -556,18 +661,25 @@ def _simulate_options_return(legs: dict, underlying_entry: float, underlying_exi
     strategy = legs.get("strategy", "")
     bars_held = exit_bar - fill_bar
     sigma = _realised_vol(candles, fill_bar)
+    entry_date = _entry_date_from_candle(candles, fill_bar)
+
+    if not (math.isfinite(underlying_entry) and math.isfinite(underlying_exit)
+            and underlying_entry > 0 and underlying_exit > 0):
+        return 0.0
 
     if strategy == "vertical_spread":
         long_strike = legs.get("long_strike", underlying_entry)
         short_strike = legs.get("short_strike", underlying_entry)
         right = legs.get("right", "C")
         is_call = right.upper() in ("C", "CALL")
-        T_entry, T_exit = _dte_years(legs, bars_held)
+        T_entry, T_exit = _dte_years(legs, bars_held, entry_date)
 
-        long_entry = _bs_price(underlying_entry, long_strike, T_entry, sigma, is_call)
-        short_entry = _bs_price(underlying_entry, short_strike, T_entry, sigma, is_call)
-        long_exit = _bs_price(underlying_exit, long_strike, T_exit, sigma, is_call)
-        short_exit = _bs_price(underlying_exit, short_strike, T_exit, sigma, is_call)
+        sigma_long = _skew_adjusted_vol(sigma, underlying_entry, long_strike, is_call)
+        sigma_short = _skew_adjusted_vol(sigma, underlying_entry, short_strike, is_call)
+        long_entry = _bs_price(underlying_entry, long_strike, T_entry, sigma_long, is_call)
+        short_entry = _bs_price(underlying_entry, short_strike, T_entry, sigma_short, is_call)
+        long_exit = _bs_price(underlying_exit, long_strike, T_exit, sigma_long, is_call)
+        short_exit = _bs_price(underlying_exit, short_strike, T_exit, sigma_short, is_call)
 
         # Debit spread: pay for long, receive for short
         debit = long_entry - short_entry
@@ -582,20 +694,24 @@ def _simulate_options_return(legs: dict, underlying_entry: float, underlying_exi
         put_short = legs.get("put_short_strike", underlying_entry * 0.97)
         call_short = legs.get("call_short_strike", underlying_entry * 1.03)
         call_long = legs.get("call_long_strike", underlying_entry * 1.05)
-        T_entry, T_exit = _dte_years(legs, bars_held)
+        T_entry, T_exit = _dte_years(legs, bars_held, entry_date)
 
-        # Credit from short legs minus debit for long wings
+        # Credit from short legs minus debit for long wings (skew-adjusted per strike)
+        sig_pl = _skew_adjusted_vol(sigma, underlying_entry, put_long, False)
+        sig_ps = _skew_adjusted_vol(sigma, underlying_entry, put_short, False)
+        sig_cs = _skew_adjusted_vol(sigma, underlying_entry, call_short, True)
+        sig_cl = _skew_adjusted_vol(sigma, underlying_entry, call_long, True)
         credit = (
-            _bs_put(underlying_entry, put_short, T_entry, sigma)
-            - _bs_put(underlying_entry, put_long, T_entry, sigma)
-            + _bs_call(underlying_entry, call_short, T_entry, sigma)
-            - _bs_call(underlying_entry, call_long, T_entry, sigma)
+            _bs_put(underlying_entry, put_short, T_entry, sig_ps)
+            - _bs_put(underlying_entry, put_long, T_entry, sig_pl)
+            + _bs_call(underlying_entry, call_short, T_entry, sig_cs)
+            - _bs_call(underlying_entry, call_long, T_entry, sig_cl)
         )
         exit_cost = (
-            _bs_put(underlying_exit, put_short, T_exit, sigma)
-            - _bs_put(underlying_exit, put_long, T_exit, sigma)
-            + _bs_call(underlying_exit, call_short, T_exit, sigma)
-            - _bs_call(underlying_exit, call_long, T_exit, sigma)
+            _bs_put(underlying_exit, put_short, T_exit, sig_ps)
+            - _bs_put(underlying_exit, put_long, T_exit, sig_pl)
+            + _bs_call(underlying_exit, call_short, T_exit, sig_cs)
+            - _bs_call(underlying_exit, call_long, T_exit, sig_cl)
         )
         wing_width = max(abs(put_short - put_long), abs(call_long - call_short), 0.5)
         max_risk = wing_width - abs(credit)
@@ -610,12 +726,14 @@ def _simulate_options_return(legs: dict, underlying_entry: float, underlying_exi
         else:
             strike_c = legs.get("call_strike", underlying_entry * 1.02)
             strike_p = legs.get("put_strike", underlying_entry * 0.98)
-        T_entry, T_exit = _dte_years(legs, bars_held)
+        T_entry, T_exit = _dte_years(legs, bars_held, entry_date)
 
-        call_entry = _bs_call(underlying_entry, strike_c, T_entry, sigma)
-        put_entry = _bs_put(underlying_entry, strike_p, T_entry, sigma)
-        call_exit = _bs_call(underlying_exit, strike_c, T_exit, sigma)
-        put_exit = _bs_put(underlying_exit, strike_p, T_exit, sigma)
+        sig_c = _skew_adjusted_vol(sigma, underlying_entry, strike_c, True)
+        sig_p = _skew_adjusted_vol(sigma, underlying_entry, strike_p, False)
+        call_entry = _bs_call(underlying_entry, strike_c, T_entry, sig_c)
+        put_entry = _bs_put(underlying_entry, strike_p, T_entry, sig_p)
+        call_exit = _bs_call(underlying_exit, strike_c, T_exit, sig_c)
+        put_exit = _bs_put(underlying_exit, strike_p, T_exit, sig_p)
 
         debit = call_entry + put_entry
         exit_value = call_exit + put_exit
@@ -635,12 +753,11 @@ def _simulate_options_return(legs: dict, underlying_entry: float, underlying_exi
 
         # Parse both expirations
         try:
-            from datetime import datetime as _dt, date as _date
-            near_exp = _dt.strptime(str(legs["near_expiration"]), "%Y-%m-%d").date()
-            far_exp = _dt.strptime(str(legs["far_expiration"]), "%Y-%m-%d").date()
-            today = _date.today()
-            near_dte = max((near_exp - today).days, 1)
-            far_dte = max((far_exp - today).days, 1)
+            near_exp = datetime.strptime(str(legs["near_expiration"]), "%Y-%m-%d").date()
+            far_exp = datetime.strptime(str(legs["far_expiration"]), "%Y-%m-%d").date()
+            ref = entry_date or date.today()
+            near_dte = max((near_exp - ref).days, 1)
+            far_dte = max((far_exp - ref).days, 1)
         except Exception:
             near_dte, far_dte = 7, 21
 
@@ -650,11 +767,13 @@ def _simulate_options_return(legs: dict, underlying_entry: float, underlying_exi
         T_near_exit = max((near_dte - days_held_cal) / 365.0, 0.0001)
         T_far_exit = max((far_dte - days_held_cal) / 365.0, 0.0001)
 
-        # Sell near-term, buy far-term
-        near_entry = _bs_price(underlying_entry, near_strike, T_near_entry, sigma, is_call)
-        far_entry = _bs_price(underlying_entry, far_strike, T_far_entry, sigma, is_call)
-        near_exit = _bs_price(underlying_exit, near_strike, T_near_exit, sigma, is_call)
-        far_exit = _bs_price(underlying_exit, far_strike, T_far_exit, sigma, is_call)
+        # Sell near-term, buy far-term (skew-adjusted per strike)
+        sig_near = _skew_adjusted_vol(sigma, underlying_entry, near_strike, is_call)
+        sig_far = _skew_adjusted_vol(sigma, underlying_entry, far_strike, is_call)
+        near_entry = _bs_price(underlying_entry, near_strike, T_near_entry, sig_near, is_call)
+        far_entry = _bs_price(underlying_entry, far_strike, T_far_entry, sig_far, is_call)
+        near_exit = _bs_price(underlying_exit, near_strike, T_near_exit, sig_near, is_call)
+        far_exit = _bs_price(underlying_exit, far_strike, T_far_exit, sig_far, is_call)
 
         debit = far_entry - near_entry  # Pay for far, receive for near
         exit_value = far_exit - near_exit
@@ -669,15 +788,18 @@ def _simulate_options_return(legs: dict, underlying_entry: float, underlying_exi
         high = legs.get("high_strike", underlying_entry + 5)
         right = legs.get("right", "C")
         is_call = right.upper() in ("C", "CALL")
-        T_entry, T_exit = _dte_years(legs, bars_held)
+        T_entry, T_exit = _dte_years(legs, bars_held, entry_date)
 
-        # Buy 1 low + 1 high, sell 2 mid
-        low_entry = _bs_price(underlying_entry, low, T_entry, sigma, is_call)
-        mid_entry = _bs_price(underlying_entry, mid, T_entry, sigma, is_call)
-        high_entry = _bs_price(underlying_entry, high, T_entry, sigma, is_call)
-        low_exit = _bs_price(underlying_exit, low, T_exit, sigma, is_call)
-        mid_exit = _bs_price(underlying_exit, mid, T_exit, sigma, is_call)
-        high_exit = _bs_price(underlying_exit, high, T_exit, sigma, is_call)
+        # Buy 1 low + 1 high, sell 2 mid (skew-adjusted per strike)
+        sig_low = _skew_adjusted_vol(sigma, underlying_entry, low, is_call)
+        sig_mid = _skew_adjusted_vol(sigma, underlying_entry, mid, is_call)
+        sig_high = _skew_adjusted_vol(sigma, underlying_entry, high, is_call)
+        low_entry = _bs_price(underlying_entry, low, T_entry, sig_low, is_call)
+        mid_entry = _bs_price(underlying_entry, mid, T_entry, sig_mid, is_call)
+        high_entry = _bs_price(underlying_entry, high, T_entry, sig_high, is_call)
+        low_exit = _bs_price(underlying_exit, low, T_exit, sig_low, is_call)
+        mid_exit = _bs_price(underlying_exit, mid, T_exit, sig_mid, is_call)
+        high_exit = _bs_price(underlying_exit, high, T_exit, sig_high, is_call)
 
         debit = low_entry + high_entry - 2 * mid_entry
         exit_value = low_exit + high_exit - 2 * mid_exit
@@ -695,15 +817,30 @@ def _minute_of_day(ts: Any) -> int | None:
         from zoneinfo import ZoneInfo
         _et = ZoneInfo("America/New_York")
         if isinstance(ts, (int, float)):
-            from datetime import datetime, timezone
             dt = datetime.fromtimestamp(ts, tz=timezone.utc).astimezone(_et)
             return dt.hour * 60 + dt.minute
         elif isinstance(ts, str):
-            from datetime import datetime
             dt = datetime.fromisoformat(ts.replace("Z", "+00:00")).astimezone(_et)
             return dt.hour * 60 + dt.minute
         elif hasattr(ts, "hour"):
             return ts.hour * 60 + ts.minute
+    except Exception:
+        pass
+    return None
+
+
+def _entry_date_from_candle(candles: pd.DataFrame, fill_bar: int) -> date | None:
+    """Extract the calendar date from a candle's timestamp."""
+    if fill_bar >= len(candles):
+        return None
+    ts = candles.iloc[fill_bar]["ts"]
+    try:
+        if isinstance(ts, (int, float)):
+            return datetime.fromtimestamp(ts, tz=timezone.utc).date()
+        elif isinstance(ts, str):
+            return datetime.fromisoformat(ts.replace("Z", "+00:00")).date()
+        elif hasattr(ts, "date"):
+            return ts.date()
     except Exception:
         pass
     return None
@@ -807,7 +944,7 @@ def compute_expectancy(results: list[dict]) -> dict:
     #   - cross-symbol stability
     sample_penalty = min(1.0, total / 10.0)  # ramp from 0→1 as signals grow 0→10
     drawdown_penalty = max(0.0, 1.0 - max_dd / 20.0)  # dd>20% kills score quickly
-    fitness_profit_factor = profit_factor if math.isfinite(profit_factor) else 5.0
+    fitness_profit_factor = min(3.0, profit_factor if math.isfinite(profit_factor) else 3.0)
     cc = float(condition["condition_confidence"])
     signed_edge_score = (
         expectancy
@@ -828,7 +965,8 @@ def compute_expectancy(results: list[dict]) -> dict:
     )
     signed_edge_score = round(signed_edge_score, 6)
     raw_search_fitness = round(fitness_raw, 6)
-    search_fitness = round(max(fitness_raw, 0.0), 6)
+    # Cap at 5.0 to prevent inflated benchmarks from overfitting artifacts
+    search_fitness = round(min(max(fitness_raw, 0.0), 5.0), 6)
 
     return {
         "hit_rate": round(hit_rate, 2),

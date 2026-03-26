@@ -57,6 +57,113 @@ BATCH_SIZE = 4                  # slots per batch (matches LLM semaphore)
 SELECTOR_EVERY_N_ROUNDS = 3     # run selector agent every N rounds
 MAX_SELECTOR_REPLACEMENTS = 3   # max slots the selector can replace per run
 
+# ── Slot mandates: 3 regime groups × 4 order-type archetypes ───
+# Each slot has a fixed regime assignment and order-type class.
+# The LLM can freely evolve parameters, indicators, and logic within the mandate.
+# It CANNOT change the regime direction or order-type class.
+#
+# regime:     "bearish" | "bullish" | "choppy"
+# direction:  "short" | "long" | "neutral" | "any" (neutral = options premium, any = dual-sided)
+# order_class: broad archetype — enforced at keep gate
+# allowed_order_types: specific order_type values that satisfy this mandate
+#
+SLOT_MANDATES: dict[int, dict] = {
+    # ── BEARISH GROUP (slots 1-4): activated when trend=down ────
+    1:  {
+        "regime": "bearish",
+        "direction": "short",
+        "order_class": "stock_momentum",
+        "allowed_order_types": {"market", "vwap", "stop_entry", "moo"},
+        "description": "Short stock momentum — VWAP rejections or breakdowns on trend-following entries",
+    },
+    2:  {
+        "regime": "bearish",
+        "direction": "short",
+        "order_class": "stock_bracket",
+        "allowed_order_types": {"bracket", "trailing_stop_exit", "oca_exit", "limit"},
+        "description": "Short stock bracket — structured risk with bracket/trailing stop risk management",
+    },
+    3:  {
+        "regime": "bearish",
+        "direction": "short",
+        "order_class": "options_directional",
+        "allowed_order_types": {"vertical_spread", "diagonal_spread"},
+        "description": "Bear options spread — defined-risk put debit or call credit vertical spreads",
+    },
+    4:  {
+        "regime": "bearish",
+        "direction": "neutral",
+        "order_class": "options_premium",
+        "allowed_order_types": {"iron_condor", "butterfly", "strangle", "straddle"},
+        "description": "Bearish-leaning premium — iron condors or butterflies with downside skew",
+    },
+    # ── BULLISH GROUP (slots 5-8): activated when trend=up ──────
+    5:  {
+        "regime": "bullish",
+        "direction": "long",
+        "order_class": "options_directional",
+        "allowed_order_types": {"vertical_spread", "diagonal_spread", "calendar_spread"},
+        "description": "Bull options spread — call debit verticals, diagonals, or calendars",
+    },
+    6:  {
+        "regime": "bullish",
+        "direction": "long",
+        "order_class": "stock_momentum",
+        "allowed_order_types": {"market", "vwap", "stop_entry", "moo"},
+        "description": "Long stock breakout — momentum entries on trend-following triggers",
+    },
+    7:  {
+        "regime": "bullish",
+        "direction": "long",
+        "order_class": "stock_pullback",
+        "allowed_order_types": {"limit", "midprice"},
+        "description": "Long stock pullback — buy dips into support with limit orders",
+    },
+    8:  {
+        "regime": "bullish",
+        "direction": "neutral",
+        "order_class": "options_premium",
+        "allowed_order_types": {"iron_condor", "butterfly", "strangle", "straddle"},
+        "description": "Bullish-leaning premium — iron condors or butterflies with upside skew",
+    },
+    # ── CHOPPY GROUP (slots 9-12): activated when trend=flat ────
+    9:  {
+        "regime": "choppy",
+        "direction": "long",
+        "order_class": "stock_mean_reversion",
+        "allowed_order_types": {"limit", "midprice", "moc"},
+        "description": "Mean reversion long — oversold bounce entries at support levels",
+    },
+    10: {
+        "regime": "choppy",
+        "direction": "short",
+        "order_class": "stock_mean_reversion",
+        "allowed_order_types": {"limit", "midprice", "moc"},
+        "description": "Mean reversion short — overbought fade entries at resistance levels",
+    },
+    11: {
+        "regime": "choppy",
+        "direction": "neutral",
+        "order_class": "options_premium",
+        "allowed_order_types": {"iron_condor", "butterfly", "straddle", "strangle"},
+        "description": "Neutral premium collection — iron condors or butterflies for range-bound markets",
+    },
+    12: {
+        "regime": "choppy",
+        "direction": "any",
+        "order_class": "stock_range",
+        "allowed_order_types": {"bracket", "stop_entry", "oca_exit", "trailing_stop_exit"},
+        "description": "Dual-sided range trade — ORB or range breakout/breakdown with bracket orders",
+    },
+}
+
+# Map trend_regime labels to slot regime groups
+REGIME_TO_SLOTS: dict[str, list[int]] = {
+    "down": [1, 2, 3, 4],     # bearish group
+    "up":   [5, 6, 7, 8],     # bullish group
+    "flat": [9, 10, 11, 12],  # choppy group
+}
+
 # ── Darwinian weighting ─────────────────────────────────────────
 DARWINIAN_WEIGHT_FLOOR = 0.3    # minimum weight (near-silenced)
 DARWINIAN_WEIGHT_CEILING = 2.5  # maximum weight (highly trusted)
@@ -67,6 +174,19 @@ SLOT_CORRELATION_THRESHOLD = 0.7  # r > this flags redundant pair
 # ── Environment regime gates ────────────────────────────────────
 REGIME_GATE_ENABLED = True       # hard gate: suppress mismatched directional strategies
 EXTREME_VOL_FITNESS_BOOST = 1.05 # require 5% higher fitness in extreme vol
+
+# ── Circuit breakers ────────────────────────────────────────────
+# Research: pause evolution if ALL slots fail for this many consecutive rounds
+CIRCUIT_BREAKER_ALL_FAIL_ROUNDS = 5
+# Research: pause cooldown (seconds) when the all-fail breaker trips
+CIRCUIT_BREAKER_COOLDOWN_SECS = 600  # 10 minutes
+# Per-slot: cap consecutive failures before the slot is frozen (skipped)
+# until the selector intervenes or a new round begins
+CIRCUIT_BREAKER_SLOT_MAX_FAILURES = 10
+
+# ── Pacing / economy ───────────────────────────────────────────
+ROUND_DELAY_SECS = 30             # pause between rounds to reduce LLM cost burn
+RESEARCH_DAILY_LLM_BUDGET = 25.0  # USD — stop research when daily LLM spend exceeds this
 
 # ── Available order types (referenced in system prompt for Grok) ─
 STOCK_ORDER_TYPES = [
@@ -250,9 +370,13 @@ HUMAN PROGRAM:
 YOUR JOB: Modify strategy.py to improve its expectancy (expected profit per trade).
 You receive the current strategy code, its evaluation results, and history of past attempts.
 
-You are evolving Slot {slot_id} (one of {num_slots} independent strategy slots).
-Each slot is free to use ANY order type or options structure — whatever produces
-the best risk-adjusted returns.
+You are evolving Slot {slot_id} (one of {num_slots} strategy slots).
+
+SLOT MANDATE (HARD CONSTRAINT — you MUST obey this):
+{slot_mandate}
+You may freely change indicators, thresholds, filters, and parameters. But you MUST NOT
+change the direction or order type class. Proposals that violate the mandate are automatically
+rejected. Work within your mandate to produce the best possible strategy.
 
 {environment_context}
 
@@ -363,6 +487,11 @@ market environment.
 ═══ CURRENT MARKET ENVIRONMENT ═══
 {environment_context}
 
+═══ SLOT MANDATES (HARD CONSTRAINTS) ═══
+Each slot has a fixed regime and order-type mandate. Your directives MUST respect
+these — do NOT ask a slot to pivot to a strategy type outside its allowed set.
+{slot_mandates}
+
 ═══ SLOT PERFORMANCE (ranked by fitness, best first) ═══
 {slot_rankings}
 
@@ -407,7 +536,7 @@ Respond with a JSON object:
       "action": "keep" | "replace" | "mutate",
       "reason": "why this action for this slot",
       "seed_from_slot": <int or null>,
-      "target_strategy_type": "what type the new strategy should be"
+      "target_strategy_type": "what type the new strategy should be (MUST be within the slot's mandate)"
     }}
   ],
   "environment_learning": "Key insight about what works in this regime",
@@ -420,7 +549,9 @@ RULES:
 - Never replace a slot with < 3 iterations unless it has critical issues.
 - Do NOT provide seed_code — the evolution pipeline will generate proper code.
 - If seed_from_slot is set, the donor's code will be cloned as a starting point
-  (only if it evaluates better than the current slot).
+  (only if it evaluates better than the current slot AND both slots share the same regime).
+- Only seed_from_slot within the SAME regime group (bearish→bearish, bullish→bullish, choppy→choppy).
 - Prioritize strategies from recommended_focus that match the environment.
 - Keep at least 2 slots running strategies from different archetypes for diversity.
+- target_strategy_type MUST be compatible with the slot's allowed_order_types in its mandate.
 """

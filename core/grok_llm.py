@@ -25,6 +25,8 @@ from xai_sdk import AsyncClient
 logger = logging.getLogger(__name__)
 
 # ── Model Slugs (beta — may change without notice) ─────────────
+# WARNING: xAI beta slugs are NOT stable. Check https://docs.x.ai/docs
+# for latest model names if API calls start failing with model-not-found.
 REASONING_MODEL = "grok-4.20-0309-reasoning"
 MULTI_AGENT_MODEL = "grok-4.20-multi-agent-experimental-beta-0304"
 

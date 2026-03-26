@@ -33,6 +33,9 @@ from execution.ibkr_utils import is_live_trading
 from execution.ibkr_utils import resolve_ibkr_endpoint
 from execution.order_types import IBKROrderType
 
+# Memory for autoresearch fill updates
+from memory import update_execution_snapshot_fill
+
 logger = logging.getLogger(__name__)
 
 
@@ -208,6 +211,10 @@ class IBKRConnector(IBKROrdersMixin, IBKROptionsMixin, IBKRQueriesMixin):
         self._executions: Dict[str, List[Dict[str, Any]]] = {}
         self._execution_lock = Lock()
 
+        # Execution snapshot tracking: order_id -> snapshot_id (for autoresearch)
+        self._snapshot_ids: Dict[int, int] = {}
+        self._snapshot_lock = Lock()
+
         # Order state tracking
         self._order_states: Dict[int, OrderState] = {}  # order_id -> OrderState
         self._bracket_groups: Dict[str, BracketGroup] = {}  # group_id -> BracketGroup
@@ -373,10 +380,27 @@ class IBKRConnector(IBKROrdersMixin, IBKROptionsMixin, IBKRQueriesMixin):
                     self._executions[symbol] = []
                 self._executions[symbol].append(exec_record)
 
+            # Update execution snapshot with fill data (autoresearch)
+            order_id = execution.orderId
+            snapshot_id = None
+            with self._snapshot_lock:
+                snapshot_id = self._snapshot_ids.pop(order_id, None)
+            if snapshot_id:
+                try:
+                    fill_time = execution.time.isoformat() if execution.time else datetime.now(timezone.utc).isoformat()
+                    update_execution_snapshot_fill(
+                        snapshot_id=snapshot_id,
+                        fill_price=float(execution.price),
+                        fill_time=fill_time,
+                        commission=commission,
+                    )
+                except Exception as snap_err:
+                    logger.debug(f"Snapshot fill update failed: {snap_err}")
+
             logger.info(f"Execution captured: {execution.side} {execution.shares} {symbol} @ ${execution.price:.2f}")
 
         except Exception as e:
-            logger.error(f"Failed to process execution event: {e}")
+            logger.error(f"Failed to process execution event: {e}", exc_info=True)
 
     def _on_order_status(self, trade: Trade) -> None:
         """Handle order status changes."""
@@ -692,9 +716,13 @@ class IBKRConnector(IBKROrdersMixin, IBKROptionsMixin, IBKRQueriesMixin):
                         await self.cancel_order(oid)
                         result['orders_cancelled'] += 1
                 except Exception as e:
-                    result['errors'].append(f'cancel order {order.get("order_id")}: {e}')
+                    err_msg = f'cancel order {order.get("order_id")}: {e}'
+                    logger.error(err_msg)
+                    result['errors'].append(err_msg)
         except Exception as e:
-            result['errors'].append(f'get_open_orders: {e}')
+            err_msg = f'get_open_orders: {e}'
+            logger.error(err_msg)
+            result['errors'].append(err_msg)
 
         await asyncio.sleep(1)  # Let cancellations process
 
@@ -721,11 +749,17 @@ class IBKRConnector(IBKROrdersMixin, IBKROptionsMixin, IBKRQueriesMixin):
                     if order_result.get('success'):
                         result['positions_closed'] += 1
                     else:
-                        result['errors'].append(f'flatten {symbol}: {order_result}')
+                        err_msg = f'flatten {symbol}: {order_result}'
+                        logger.error(err_msg)
+                        result['errors'].append(err_msg)
                 except Exception as e:
-                    result['errors'].append(f'flatten {pos.get("symbol", "?")}: {e}')
+                    err_msg = f'flatten {pos.get("symbol", "?")}: {e}'
+                    logger.error(err_msg)
+                    result['errors'].append(err_msg)
         except Exception as e:
-            result['errors'].append(f'get_positions: {e}')
+            err_msg = f'get_positions: {e}'
+            logger.error(err_msg)
+            result['errors'].append(err_msg)
 
         result['success'] = True
         logger.critical(f"FLATTEN ALL: cancelled {result['orders_cancelled']}/{result['orders_total']} orders, "
@@ -760,9 +794,13 @@ class IBKRConnector(IBKROrdersMixin, IBKROptionsMixin, IBKRQueriesMixin):
                         await self.cancel_order(oid)
                         result['orders_cancelled'] += 1
                 except Exception as e:
-                    result['errors'].append(f'cancel order {order.get("order_id")}: {e}')
+                    err_msg = f'cancel order {order.get("order_id")}: {e}'
+                    logger.error(err_msg)
+                    result['errors'].append(err_msg)
         except Exception as e:
-            result['errors'].append(f'get_open_orders: {e}')
+            err_msg = f'get_open_orders: {e}'
+            logger.error(err_msg)
+            result['errors'].append(err_msg)
 
         await asyncio.sleep(2)  # Let cancellations + any final fills settle
 
@@ -789,13 +827,27 @@ class IBKRConnector(IBKROrdersMixin, IBKROptionsMixin, IBKRQueriesMixin):
 
                         contract = Option(symbol, expiration, float(strike), right, 'SMART')
                         await self.ib.qualifyContractsAsync(contract)
-                        ticker = self.ib.reqMktData(contract, '', snapshot=True, regulatorySnapshot=False)
-                        await asyncio.sleep(1)
-                        bid = ticker.bid or 0
-                        ask = ticker.ask or 0
-                        self.ib.cancelMktData(contract)
-                        if bid > 0 and ask > 0:
+
+                        # Get option bid/ask from MDA
+                        bid, ask, mid = 0, 0, 0
+                        try:
+                            from data.marketdata_client import get_marketdata_client
+                            _occ = f"{symbol}{expiration[2:]}{right}{int(float(strike)*1000):08d}"
+                            _oq = await get_marketdata_client().get_option_quote(_occ)
+                            if _oq:
+                                bid = _oq.get('bid') or 0
+                                ask = _oq.get('ask') or 0
+                                mid = _oq.get('mid') or 0
+                        except Exception as _mkt_err:
+                            logger.debug(f"MDA option quote failed for {symbol}: {_mkt_err}")
+
+                        if mid and mid > 0:
+                            limit_price = round(mid, 2)
+                        elif bid > 0 and ask > 0:
                             limit_price = round((bid + ask) / 2, 2)
+                        elif pos.get('market_price') and pos['market_price'] > 0:
+                            limit_price = round(pos['market_price'], 2)
+                            logger.warning(f"Using position market_price {limit_price} for option {symbol} (no MDA quote)")
                         else:
                             result['errors'].append(f'no midpoint for option {symbol} {strike}{right} {expiration}')
                             continue
@@ -838,11 +890,17 @@ class IBKRConnector(IBKROrdersMixin, IBKROptionsMixin, IBKRQueriesMixin):
                     if order_result.get('success'):
                         result['positions_closed'] += 1
                     else:
-                        result['errors'].append(f'flatten {symbol}: {order_result}')
+                        err_msg = f'flatten {symbol}: {order_result}'
+                        logger.error(err_msg)
+                        result['errors'].append(err_msg)
                 except Exception as e:
-                    result['errors'].append(f'flatten {pos.get("symbol", "?")}: {e}')
+                    err_msg = f'flatten {pos.get("symbol", "?")}: {e}'
+                    logger.error(err_msg)
+                    result['errors'].append(err_msg)
         except Exception as e:
-            result['errors'].append(f'get_positions: {e}')
+            err_msg = f'get_positions: {e}'
+            logger.error(err_msg)
+            result['errors'].append(err_msg)
 
         result['success'] = len(result['errors']) == 0
         logger.warning(

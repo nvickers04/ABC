@@ -20,7 +20,7 @@ import logging
 from datetime import datetime, timezone
 from typing import Dict, Any, List, Optional, Tuple
 
-from ib_insync import Order, Option, ComboLeg, Contract
+from ib_insync import Order, Option, ComboLeg, Contract, TagValue
 from ib_insync.contract import Stock
 
 from data.data_provider import get_data_provider
@@ -38,6 +38,61 @@ class IBKROptionsMixin:
     """
 
     # ========== HELPER METHODS ==========
+
+    async def _get_underlying_price(self, symbol: str) -> Optional[float]:
+        """Get current price of underlying via MarketData.app.
+
+        Uses MDA as the sole price source — no IBKR market data subscription
+        required. Returns None when no reliable price is available.
+        """
+        try:
+            dp = get_data_provider()
+            q = dp.get_quote(symbol)
+            if q is None:
+                logger.debug(f"_get_underlying_price({symbol}): MDA returned None")
+                return None
+            # Prefer mid (bid/ask midpoint), fall back to last
+            price = q.mid or q.last
+            if price and price > 0:
+                return float(price)
+            logger.debug(f"_get_underlying_price({symbol}): no valid price in quote")
+        except Exception as e:
+            logger.debug(f"_get_underlying_price({symbol}) failed: {e}")
+        return None
+
+    async def _check_riskless_spread(
+        self, symbol: str, long_strike: float, short_strike: float, right: str,
+    ) -> Optional[Dict[str, Any]]:
+        """Pre-flight check: block vertical spreads where both strikes are deep ITM.
+
+        IBKR rejects these as 'riskless combination orders' and shows a TWS
+        pop-up that requires manual confirmation.
+
+        Returns an error dict if the spread is riskless (or if we can't determine
+        the price — fail-closed), or None if the spread is OK to place.
+        """
+        price = await self._get_underlying_price(symbol)
+
+        if price is None:
+            return {
+                'error': f'Cannot verify spread safety for {symbol}: no price available. '
+                         f'Try again in a moment, or use single-leg options instead.'
+            }
+
+        buffer = price * 0.02  # 2% buffer
+        if right == 'C' and max(long_strike, short_strike) < price - buffer:
+            return {
+                'error': f'Both call strikes ({long_strike}/{short_strike}) are deep ITM '
+                         f'(price ~{price:.2f}). IBKR rejects riskless spreads. '
+                         f'Choose at least one strike near or above {price:.2f}.'
+            }
+        if right == 'P' and min(long_strike, short_strike) > price + buffer:
+            return {
+                'error': f'Both put strikes ({long_strike}/{short_strike}) are deep ITM '
+                         f'(price ~{price:.2f}). IBKR rejects riskless spreads. '
+                         f'Choose at least one strike near or below {price:.2f}.'
+            }
+        return None
 
     async def _create_options(self, symbol: str, expiration: str,
                               strikes_and_rights: List[Tuple[float, str]]) -> List[Option]:
@@ -97,76 +152,61 @@ class IBKROptionsMixin:
         """
         Generic combo order placement - all multi-leg strategies use this.
 
-        Args:
-            symbol: Underlying symbol
-            expiration: Expiration date 'YYYYMMDD'
-            strikes_rights_actions: List of (strike, right, action, ratio) tuples
-            quantity: Number of spreads
-            combo_action: 'BUY' or 'SELL' for the combo
-            limit_price: Limit price (positive=debit, negative=credit)
-            strategy_name: Name for logging
-
-        Returns:
-            Dict with order result
+        Routes through individual legs to avoid IBKR TWS "riskless combination"
+        pop-ups that block the API on paper accounts.
         """
         if not await self._ensure_connected():
             return {'error': 'Not connected'}
 
-        try:
-            # Create and qualify all options
-            options = await self._create_options(
-                symbol, expiration,
-                [(s, r) for s, r, _, _ in strikes_rights_actions]
-            )
+        return await self._place_combo_as_singles(
+            symbol, expiration, strikes_rights_actions,
+            quantity, combo_action, limit_price, strategy_name
+        )
 
-            # Build combo legs
-            legs = [
-                (opt.conId, ratio, action)
-                for opt, (_, _, action, ratio) in zip(options, strikes_rights_actions)
-            ]
-            combo = self._build_combo(symbol, legs)
+    async def _place_combo_as_singles(
+        self,
+        symbol: str,
+        expiration: str,
+        strikes_rights_actions: List[Tuple[float, str, str, int]],
+        quantity: int,
+        combo_action: str,
+        limit_price: Optional[float],
+        strategy_name: str,
+    ) -> Dict[str, Any]:
+        """Fallback: place combo legs as individual orders when combo is rejected."""
+        order_ids = []
+        errors = []
+        for strike, right, leg_action, ratio in strikes_rights_actions:
+            # For SELL combos (credit spreads), reverse the leg actions
+            final_action = leg_action if combo_action == 'BUY' else ('SELL' if leg_action == 'BUY' else 'BUY')
+            try:
+                result = await self._place_single_option(
+                    symbol, expiration, strike, right,
+                    action=final_action, quantity=quantity * ratio,
+                    strategy_name=f'{strategy_name} leg',
+                )
+                if result.get('success'):
+                    order_ids.append(result['order_id'])
+                    logger.info(f"{strategy_name} leg OK: {final_action} {symbol} {strike}{right}")
+                else:
+                    errors.append(f"{strike}{right}: {result.get('error', 'unknown')}")
+            except Exception as e:
+                errors.append(f"{strike}{right}: {e}")
 
-            # Create and place order
-            order = Order()
-            order.action = combo_action
-            order.totalQuantity = quantity
-            order.orderType = 'LMT' if limit_price is not None else 'MKT'
-            if limit_price is not None:
-                order.lmtPrice = abs(limit_price)
-            order.tif = 'DAY'
-            order.transmit = True
-
-            trade = self.ib.placeOrder(combo, order)
-
-            # Check for immediate broker rejection
-            rejection = await self._check_order_rejection(trade, strategy_name, symbol)
-            if rejection:
-                err_msg = rejection.get('error', '')
-                # Error 201 (Guaranteed-to-Lose) is common on paper combos — hint single-leg alternative
-                if '201' in str(err_msg) or 'guaranteed' in str(err_msg).lower():
-                    rejection['hint'] = (
-                        f'Paper account rejected this combo. Try placing legs individually: '
-                        f'buy_option for the long leg, then sell via close_option for the short leg.'
-                    )
-                    logger.warning(f"{strategy_name} combo rejected (201) for {symbol} — suggest single-leg fallback")
-                return rejection
-
-            strikes_str = '/'.join(str(s) for s, _, _, _ in strikes_rights_actions)
-            logger.info(f"{strategy_name}: {symbol} {strikes_str} x{quantity}")
-
+        if order_ids:
             return {
                 'success': True,
-                'order_id': trade.order.orderId,
+                'order_ids': order_ids,
                 'symbol': symbol,
-                'strategy': strategy_name,
+                'strategy': f'{strategy_name} (individual legs)',
                 'expiration': expiration,
                 'quantity': quantity,
                 'limit_price': limit_price,
-                'timestamp': datetime.now(timezone.utc).isoformat()
+                'note': f'Placed as {len(order_ids)} individual legs (combo rejected)',
+                'errors': errors if errors else None,
+                'timestamp': datetime.now(timezone.utc).isoformat(),
             }
-        except Exception as e:
-            logger.error(f"{strategy_name} failed for {symbol}: {e}")
-            return {'error': str(e), 'symbol': symbol}
+        return {'error': f'{strategy_name} individual legs all failed: {"; ".join(errors)}'}
 
     async def _place_single_option(
         self,
@@ -287,6 +327,11 @@ class IBKROptionsMixin:
         Place a vertical spread (bull/bear call or put spread).
         Bull = long_strike < short_strike, Bear = long_strike > short_strike
         """
+        # ── Riskless spread guard (fail-closed) ──────────────
+        riskless_err = await self._check_riskless_spread(symbol, long_strike, short_strike, right)
+        if riskless_err:
+            return riskless_err
+
         spread_type = 'Bull' if long_strike < short_strike else 'Bear'
         strategy = f"{spread_type} {'Call' if right == 'C' else 'Put'} Spread"
 
@@ -434,59 +479,35 @@ class IBKROptionsMixin:
         self, symbol: str, strike: float, near_expiration: str, far_expiration: str,
         right: str = 'C', quantity: int = 1, limit_price: float = None
     ) -> Dict[str, Any]:
-        """Place a Calendar Spread (same strike, different expirations)."""
+        """Place a Calendar Spread (same strike, different expirations) as individual legs."""
         if not await self._ensure_connected():
             return {'error': 'Not connected'}
 
-        try:
-            near_opt = Option(symbol, near_expiration, strike, right, 'SMART')
-            far_opt = Option(symbol, far_expiration, strike, right, 'SMART')
-            await self.ib.qualifyContractsAsync(near_opt, far_opt)
+        strategy = f"{'Call' if right == 'C' else 'Put'} Calendar"
+        order_ids = []
+        errors = []
 
-            # Validate both legs resolved
-            bad = []
-            if near_opt.conId == 0:
-                bad.append(f"near leg {strike}{right} {near_expiration}")
-            if far_opt.conId == 0:
-                bad.append(f"far leg {strike}{right} {far_expiration}")
-            if bad:
-                return {'error': f"Contract not found: {', '.join(bad)}. "
-                                 f"Check expiration dates exist for {symbol}.",
-                        'symbol': symbol}
+        # Sell near, buy far
+        for exp, action, label in [(near_expiration, 'SELL', 'near'), (far_expiration, 'BUY', 'far')]:
+            result = await self._place_single_option(
+                symbol, exp, strike, right, action, quantity,
+                strategy_name=f'{strategy} {label} leg',
+            )
+            if result.get('success'):
+                order_ids.append(result['order_id'])
+            else:
+                errors.append(f"{label}: {result.get('error', 'unknown')}")
 
-            combo = self._build_combo(symbol, [
-                (near_opt.conId, 1, 'SELL'),
-                (far_opt.conId, 1, 'BUY'),
-            ])
-
-            order = Order()
-            order.action = 'BUY'
-            order.totalQuantity = quantity
-            order.orderType = 'LMT' if limit_price else 'MKT'
-            if limit_price:
-                order.lmtPrice = abs(limit_price)
-            order.tif = 'DAY'
-            order.transmit = True
-
-            trade = self.ib.placeOrder(combo, order)
-            strategy = f"{'Call' if right == 'C' else 'Put'} Calendar"
-
-            # Check for immediate broker rejection
-            rejection = await self._check_order_rejection(trade, strategy, symbol)
-            if rejection:
-                return rejection
-
+        if order_ids:
             logger.info(f"{strategy}: {symbol} {strike} {near_expiration}/{far_expiration} x{quantity}")
-
             return {
-                'success': True, 'order_id': trade.order.orderId, 'symbol': symbol,
-                'strategy': strategy, 'strike': strike,
+                'success': True, 'order_ids': order_ids, 'symbol': symbol,
+                'strategy': f'{strategy} (individual legs)', 'strike': strike,
                 'near_expiration': near_expiration, 'far_expiration': far_expiration,
-                'quantity': quantity, 'timestamp': datetime.now(timezone.utc).isoformat()
+                'quantity': quantity, 'errors': errors if errors else None,
+                'timestamp': datetime.now(timezone.utc).isoformat()
             }
-        except Exception as e:
-            logger.error(f"Calendar spread failed for {symbol}: {e}")
-            return {'error': str(e), 'symbol': symbol}
+        return {'error': f'{strategy} failed: {"; ".join(errors)}', 'symbol': symbol}
 
     # ========== DIAGONAL SPREAD ==========
 
@@ -504,57 +525,36 @@ class IBKROptionsMixin:
         if not await self._ensure_connected():
             return {'error': 'Not connected'}
 
-        try:
-            near_opt = Option(symbol, near_expiration, near_strike, right, 'SMART')
-            far_opt = Option(symbol, far_expiration, far_strike, right, 'SMART')
-            await self.ib.qualifyContractsAsync(near_opt, far_opt)
+        direction = "Bullish" if (right == 'C' and far_strike > near_strike) or (right == 'P' and far_strike < near_strike) else "Bearish"
+        strategy = f"{direction} {'Call' if right == 'C' else 'Put'} Diagonal"
+        order_ids = []
+        errors = []
 
-            # Validate both legs resolved
-            bad = []
-            if near_opt.conId == 0:
-                bad.append(f"near leg {near_strike}{right} {near_expiration}")
-            if far_opt.conId == 0:
-                bad.append(f"far leg {far_strike}{right} {far_expiration}")
-            if bad:
-                return {'error': f"Contract not found: {', '.join(bad)}. "
-                                 f"Check expiration dates exist for {symbol}. "
-                                 f"Use options_chain to find valid expirations first.",
-                        'symbol': symbol}
+        # Sell near, buy far
+        for exp, strike, action, label in [
+            (near_expiration, near_strike, 'SELL', 'near'),
+            (far_expiration, far_strike, 'BUY', 'far'),
+        ]:
+            result = await self._place_single_option(
+                symbol, exp, strike, right, action, quantity,
+                strategy_name=f'{strategy} {label} leg',
+            )
+            if result.get('success'):
+                order_ids.append(result['order_id'])
+            else:
+                errors.append(f"{label}: {result.get('error', 'unknown')}")
 
-            combo = self._build_combo(symbol, [
-                (near_opt.conId, 1, 'SELL'),
-                (far_opt.conId, 1, 'BUY'),
-            ])
-
-            order = Order()
-            order.action = 'BUY'
-            order.totalQuantity = quantity
-            order.orderType = 'LMT' if limit_price else 'MKT'
-            if limit_price:
-                order.lmtPrice = abs(limit_price)
-            order.tif = 'DAY'
-            order.transmit = True
-
-            trade = self.ib.placeOrder(combo, order)
-            direction = "Bullish" if (right == 'C' and far_strike > near_strike) or (right == 'P' and far_strike < near_strike) else "Bearish"
-            strategy = f"{direction} {'Call' if right == 'C' else 'Put'} Diagonal"
-
-            # Check for immediate broker rejection
-            rejection = await self._check_order_rejection(trade, strategy, symbol)
-            if rejection:
-                return rejection
-
+        if order_ids:
             logger.info(f"{strategy}: {symbol} {near_strike}/{far_strike} {near_expiration}/{far_expiration} x{quantity}")
-
             return {
-                'success': True, 'order_id': trade.order.orderId, 'symbol': symbol,
-                'strategy': strategy, 'near_strike': near_strike, 'far_strike': far_strike,
+                'success': True, 'order_ids': order_ids, 'symbol': symbol,
+                'strategy': f'{strategy} (individual legs)',
+                'near_strike': near_strike, 'far_strike': far_strike,
                 'near_expiration': near_expiration, 'far_expiration': far_expiration,
-                'quantity': quantity, 'timestamp': datetime.now(timezone.utc).isoformat()
+                'quantity': quantity, 'errors': errors if errors else None,
+                'timestamp': datetime.now(timezone.utc).isoformat()
             }
-        except Exception as e:
-            logger.error(f"Diagonal spread failed for {symbol}: {e}")
-            return {'error': str(e), 'symbol': symbol}
+        return {'error': f'{strategy} failed: {"; ".join(errors)}', 'symbol': symbol}
 
     # ========== BUY OPTION (Long Call/Put) ==========
 
@@ -881,40 +881,42 @@ class IBKROptionsMixin:
                 else:
                     return {'error': 'Could not find valid expiration for roll'}
 
-            # Create new option contract
-            new_contract = Option(
+            # Place roll as individual legs (close current + open new)
+            order_ids = []
+            errors = []
+
+            # Close current position
+            close_result = await self._place_single_option(
+                symbol,
+                current_contract.lastTradeDateOrContractMonth,
+                current_contract.strike,
+                current_contract.right,
+                close_action,
+                quantity,
+                strategy_name=f'Roll {roll_type} close leg',
+            )
+            if close_result.get('success'):
+                order_ids.append(close_result['order_id'])
+            else:
+                errors.append(f"close: {close_result.get('error', 'unknown')}")
+
+            # Open new position
+            open_result = await self._place_single_option(
                 symbol,
                 new_expiration,
                 new_strike,
                 current_contract.right,
-                'SMART'
+                open_action,
+                quantity,
+                strategy_name=f'Roll {roll_type} open leg',
             )
-            await self.ib.qualifyContractsAsync(new_contract)
-            if new_contract.conId == 0:
-                return {'error': f'Roll target not found: {symbol} {new_strike}{current_contract.right} '
-                                 f'{new_expiration}. Check that expiration exists.'}
+            if open_result.get('success'):
+                order_ids.append(open_result['order_id'])
+            else:
+                errors.append(f"open: {open_result.get('error', 'unknown')}")
 
-            # Build roll as combo order (close current + open new)
-            combo = self._build_combo(symbol, [
-                (current_contract.conId, 1, close_action),
-                (new_contract.conId, 1, open_action),
-            ])
-
-            order = Order()
-            order.action = 'BUY'  # Combo action
-            order.totalQuantity = quantity
-            order.orderType = 'LMT' if limit_price else 'MKT'
-            if limit_price:
-                order.lmtPrice = abs(limit_price)
-            order.tif = 'DAY'
-            order.transmit = True
-
-            trade = self.ib.placeOrder(combo, order)
-
-            # Check for immediate broker rejection
-            rejection = await self._check_order_rejection(trade, f'Roll {roll_type}', symbol)
-            if rejection:
-                return rejection
+            if not order_ids:
+                return {'error': f'Roll {roll_type} failed: {"; ".join(errors)}', 'symbol': symbol}
 
             logger.info(f"Roll option: {symbol} "
                        f"{current_contract.strike}{current_contract.right} {current_contract.lastTradeDateOrContractMonth} -> "
@@ -923,7 +925,7 @@ class IBKROptionsMixin:
 
             return {
                 'success': True,
-                'order_id': trade.order.orderId,
+                'order_ids': order_ids,
                 'symbol': symbol,
                 'roll_type': roll_type,
                 'old_strike': current_contract.strike,
@@ -931,7 +933,7 @@ class IBKROptionsMixin:
                 'new_strike': new_strike,
                 'new_expiration': new_expiration,
                 'quantity': quantity,
-                'limit_price': limit_price,
+                'errors': errors if errors else None,
                 'timestamp': datetime.now(timezone.utc).isoformat()
             }
 
@@ -944,7 +946,7 @@ class IBKROptionsMixin:
         contract: Contract
     ) -> Dict[str, Any]:
         """
-        Get Greeks for an option contract.
+        Get Greeks for an option contract via MarketData.app.
 
         Args:
             contract: The option Contract
@@ -956,30 +958,48 @@ class IBKROptionsMixin:
             return {'error': 'Not connected'}
 
         try:
-            # Request market data with Greeks
-            ticker = self.ib.reqMktData(contract, '100,101,104,106', False, False)
-            await self.ib.sleep(2)  # Wait for data
+            from data.marketdata_client import get_marketdata_client
 
-            greeks = {
+            # Build OCC option symbol: SYMBOL + YYMMDD + C/P + strike*1000 (8 digits)
+            exp = contract.lastTradeDateOrContractMonth  # YYYYMMDD
+            occ = (
+                f"{contract.symbol}"
+                f"{exp[2:]}"  # YYMMDD
+                f"{contract.right}"
+                f"{int(contract.strike * 1000):08d}"
+            )
+
+            mda = get_marketdata_client()
+            oq = await mda.get_option_quote(occ)
+
+            if oq is None:
+                return {'error': f'No MDA option quote for {occ}'}
+
+            # Also get underlying price from MDA
+            underlying_price = None
+            try:
+                dp = get_data_provider()
+                uq = dp.get_quote(contract.symbol)
+                if uq:
+                    underlying_price = uq.mid or uq.last
+            except Exception:
+                pass
+
+            return {
                 'symbol': contract.symbol,
                 'strike': contract.strike,
                 'right': contract.right,
-                'expiration': contract.lastTradeDateOrContractMonth,
-                'delta': getattr(ticker, 'modelGreeks', None) and ticker.modelGreeks.delta,
-                'gamma': getattr(ticker, 'modelGreeks', None) and ticker.modelGreeks.gamma,
-                'theta': getattr(ticker, 'modelGreeks', None) and ticker.modelGreeks.theta,
-                'vega': getattr(ticker, 'modelGreeks', None) and ticker.modelGreeks.vega,
-                'iv': getattr(ticker, 'modelGreeks', None) and ticker.modelGreeks.impliedVol,
-                'underlying_price': ticker.last or ticker.close,
-                'option_price': ticker.last or ticker.close,
-                'bid': ticker.bid,
-                'ask': ticker.ask,
+                'expiration': exp,
+                'delta': oq.get('delta'),
+                'gamma': oq.get('gamma'),
+                'theta': oq.get('theta'),
+                'vega': oq.get('vega'),
+                'iv': oq.get('iv'),
+                'underlying_price': underlying_price,
+                'option_price': oq.get('mid') or oq.get('last'),
+                'bid': oq.get('bid'),
+                'ask': oq.get('ask'),
             }
-
-            # Cancel market data subscription
-            self.ib.cancelMktData(contract)
-
-            return greeks
 
         except Exception as e:
             logger.error(f"Get Greeks failed for {contract.symbol}: {e}")

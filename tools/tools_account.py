@@ -74,7 +74,8 @@ async def handle_positions(executor, params: dict) -> Any:
                 from datetime import datetime as _dt
                 exp_date = _dt.strptime(str(exp)[:8], "%Y%m%d").date()
                 entry["dte"] = (exp_date - _dt.now().date()).days
-            except Exception:
+            except Exception as e:
+                logger.debug(f"DTE parse failed for {exp}: {e}")
                 entry["dte"] = None
         result.append(entry)
     return {"positions": result, "count": len(result)}

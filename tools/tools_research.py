@@ -100,8 +100,8 @@ async def _vix_fallback(executor) -> dict:
             result["note"] = "UVXY used as VIX proxy (VIX not directly available)"
             result["symbol"] = "VIX (via UVXY)"
             return result
-    except Exception:
-        pass
+    except Exception as e:
+        logger.debug(f"UVXY quote fallback failed: {e}")
 
     # Fallback: estimate from SPY ATM options IV
     try:
@@ -115,8 +115,8 @@ async def _vix_fallback(executor) -> dict:
                 "note": "Estimated from SPY ATM call IV. Not true VIX.",
                 "source": "spy_iv_estimate",
             }
-    except Exception:
-        pass
+    except Exception as e:
+        logger.debug(f"SPY IV fallback failed: {e}")
 
     # Final fallback: estimate volatility from SPY ATR
     try:
@@ -511,34 +511,115 @@ def _query_briefing_data() -> dict:
 
 
 def _briefing_summary(data: dict) -> dict:
-    """Compact 3-5 line summary: regime, slot count, top signals, feedback 1-liner."""
+    """Compact summary with top actionable signals prominently featured."""
+    import json as _json
     env = data.get("env")
     strategies = data.get("strategies", [])
     signals = data.get("signals", [])
     feedback = data.get("feedback", [])
 
     regime = "unknown"
+    trend = "unknown"
     if env:
         regime = f"{env.get('volatility_regime','?')}/{env.get('trend_regime','?')}"
+        trend = env.get("trend_regime", "unknown")
 
-    top_signals = []
-    for sig in signals[:5]:
-        conf = "H" if (sig.get("slot_exp") or 0) > 0.003 else "M" if (sig.get("slot_exp") or 0) > 0 else "L"
-        top_signals.append(f"{sig['symbol']} {sig['direction']} [{conf}]")
+    # Determine active slots for current regime
+    from research.config import REGIME_TO_SLOTS, SLOT_MANDATES
+    active_slots = REGIME_TO_SLOTS.get(trend, [1,2,3,4,5,6,7,8,9,10,11,12])
+
+    # Filter signals to active regime slots with positive expectancy strategies
+    regime_signals = [
+        s for s in signals
+        if s.get("slot") in active_slots and (s.get("slot_exp") or 0) > 0
+    ]
+
+    # Deduplicate by symbol — pick the highest-expectancy signal per symbol
+    best_by_sym: dict = {}
+    for sig in regime_signals:
+        sym = sig.get("symbol", "")
+        exp = sig.get("slot_exp") or 0
+        if sym not in best_by_sym or exp > (best_by_sym[sym].get("slot_exp") or 0):
+            best_by_sym[sym] = sig
+    top_regime = sorted(best_by_sym.values(), key=lambda s: -(s.get("slot_exp") or 0))[:8]
+
+    # Build actionable signal summaries
+    actionable = []
+    for sig in top_regime:
+        entry = sig.get("entry_price")
+        target = sig.get("target_price")
+        stop = sig.get("stop_price")
+        rr = None
+        if entry and target and stop:
+            risk = abs(entry - stop)
+            reward = abs(target - entry)
+            rr = round(reward / risk, 1) if risk > 0 else None
+
+        mandate = SLOT_MANDATES.get(sig.get("slot"), {})
+        legs = None
+        if sig.get("legs_json"):
+            try:
+                ld = _json.loads(sig["legs_json"]) if isinstance(sig["legs_json"], str) else sig["legs_json"]
+                legs = ld.get("strategy")
+            except Exception:
+                pass
+
+        item = {
+            "symbol": sig.get("symbol"),
+            "direction": sig.get("direction"),
+            "slot": sig.get("slot"),
+            "order_class": mandate.get("order_class", "unknown"),
+            "setup": sig.get("setup_type"),
+            "entry": round(entry, 2) if entry else None,
+            "target": round(target, 2) if target else None,
+            "stop": round(stop, 2) if stop else None,
+            "rr": rr,
+            "strategy_exp": round(sig.get("slot_exp") or 0, 4),
+            "strategy_hit": round(sig.get("slot_hit") or 0, 1),
+        }
+        if legs:
+            item["legs"] = legs
+        actionable.append(item)
 
     fb_line = None
     if feedback:
         avg_pnl = sum(r.get("actual_pnl") or 0 for r in feedback) / len(feedback)
         fb_line = f"{len(feedback)} trades, avg P&L ${avg_pnl:.2f}"
 
-    return {
+    # Active graduated params + snapshot counts
+    grad_count = 0
+    snapshot_count = 0
+    hyp_count = 0
+    try:
+        from memory import get_db
+        db = get_db()
+        grad_count = (db.execute("SELECT COUNT(*) as n FROM graduated_params WHERE active = 1").fetchone() or {}).get("n", 0)
+        snapshot_count = (db.execute("SELECT COUNT(*) as n FROM execution_snapshots WHERE status = 'filled'").fetchone() or {}).get("n", 0)
+        hyp_count = (db.execute("SELECT COUNT(*) as n FROM trader_hypotheses WHERE status = 'open'").fetchone() or {}).get("n", 0)
+    except Exception:
+        pass
+
+    result = {
         "regime": regime,
-        "active_slots": len(strategies),
-        "live_signals": len(signals),
-        "top_signals": top_signals,
+        "active_regime_slots": active_slots,
+        "total_signals": len(signals),
+        "regime_signals": len(regime_signals),
+        "ACTION_REQUIRED": actionable,
+        "instruction": (
+            "Execute these signals. For 'short' direction: use bear put spreads or buy puts. "
+            "For 'neutral' iron_condor: call iron_condor() with legs. "
+            "For 'long': use bull call spreads or buy stock. "
+            "Call option_chain(symbol) first for valid expirations, then execute."
+        ),
         "feedback": fb_line,
-        "detail_options": ["signals", "strategies", "feedback", "environment"],
     }
+    if grad_count:
+        result["graduated_params"] = grad_count
+    if snapshot_count:
+        result["execution_snapshots"] = snapshot_count
+    if hyp_count:
+        result["open_hypotheses"] = hyp_count
+    return result
 
 
 def _briefing_signals(data: dict) -> dict:
@@ -620,6 +701,16 @@ def _briefing_feedback(data: dict) -> dict:
         line = format_confidence_line(label, vals, kind=kind)
         if line:
             result[label] = line
+
+    # Per-symbol execution cost breakdown
+    try:
+        from memory import get_execution_cost
+        top = get_execution_cost()  # top-10 symbols by trade count
+        if top:
+            result["per_symbol_cost"] = top
+    except Exception:
+        pass
+
     return result
 
 
@@ -705,6 +796,195 @@ async def handle_prior_research(executor, params: dict) -> Any:
     return {"prior_research": entries, "count": len(entries)}
 
 
+# ═══════════════════════════════════════════════════════════════
+# MULTI-TIMEFRAME CHART TOOLS
+# ═══════════════════════════════════════════════════════════════
+
+def _format_chart_frame(candles, resolution: str, label: str) -> dict | None:
+    """Format a single timeframe into compact columnar output with analytics."""
+    if not candles or len(candles) == 0:
+        return None
+    n = len(candles)
+    closes = candles.close
+    highs = candles.high
+    lows = candles.low
+    volumes = candles.volume
+
+    # Derived analytics
+    atr_vals = []
+    for i in range(1, n):
+        tr = max(
+            highs[i] - lows[i],
+            abs(highs[i] - closes[i - 1]),
+            abs(lows[i] - closes[i - 1]),
+        )
+        atr_vals.append(tr)
+    atr_14 = round(sum(atr_vals[-14:]) / min(len(atr_vals), 14), 4) if atr_vals else 0
+
+    # Trend label (simple: last close vs first close)
+    trend = "up" if closes[-1] > closes[0] else "down" if closes[-1] < closes[0] else "flat"
+
+    # Relative volume (last bar vs average)
+    avg_vol = sum(volumes) / n if n > 0 else 1
+    rel_vol = round(volumes[-1] / avg_vol, 2) if avg_vol > 0 else 0
+
+    # Date formatting
+    is_intraday = resolution not in ("D", "W", "M")
+    dates = []
+    for i in range(n):
+        ts = candles.timestamps[i]
+        if ts:
+            fmt = '%Y-%m-%d %H:%M' if is_intraday else '%Y-%m-%d'
+            dates.append(datetime.datetime.fromtimestamp(ts).strftime(fmt))
+        else:
+            dates.append('')
+
+    return {
+        "frame": label,
+        "bars": n,
+        "dates": dates,
+        "open": [round(candles.open[i], 2) for i in range(n)],
+        "high": [round(highs[i], 2) for i in range(n)],
+        "low": [round(lows[i], 2) for i in range(n)],
+        "close": [round(closes[i], 2) for i in range(n)],
+        "volume": list(volumes),
+        "atr_14": atr_14,
+        "trend": trend,
+        "rel_volume": rel_vol,
+    }
+
+
+async def _fetch_multi_frames(executor, symbol: str, frames: list[tuple[str, int, str]]) -> dict:
+    """Fetch multiple timeframes concurrently and return formatted result.
+
+    frames: list of (resolution, bars, label) tuples.
+    """
+    import asyncio
+
+    async def _get(res, bars, label):
+        c = await asyncio.to_thread(
+            executor.data_provider.get_candles, symbol, resolution=res, days_back=bars
+        )
+        return _format_chart_frame(c, res, label)
+
+    tasks = [_get(res, bars, label) for res, bars, label in frames]
+    results = await asyncio.gather(*tasks, return_exceptions=True)
+
+    chart_frames = []
+    for r in results:
+        if isinstance(r, dict):
+            chart_frames.append(r)
+
+    if not chart_frames:
+        return {"error": f"No chart data for {symbol}"}
+    return {"symbol": symbol, "frames": chart_frames}
+
+
+async def handle_chart_intraday(executor, params: dict) -> Any:
+    """1min 30 bars + 5min 30 bars + 15min 20 bars. For active day-trade entries."""
+    symbol = params.get("symbol")
+    if not symbol:
+        return {"error": "symbol required"}
+    return await _fetch_multi_frames(executor, symbol, [
+        ("1", 30, "1min"), ("5", 30, "5min"), ("15", 20, "15min"),
+    ])
+
+
+async def handle_chart_swing(executor, params: dict) -> Any:
+    """Hourly 20 bars + daily 30 bars + weekly 12 bars. For swing/multi-day setups."""
+    symbol = params.get("symbol")
+    if not symbol:
+        return {"error": "symbol required"}
+    return await _fetch_multi_frames(executor, symbol, [
+        ("H", 20, "hourly"), ("D", 30, "daily"), ("W", 12, "weekly"),
+    ])
+
+
+async def handle_chart_full(executor, params: dict) -> Any:
+    """5min 30 + hourly 20 + daily 30. Validate a strong thesis across timeframes."""
+    symbol = params.get("symbol")
+    if not symbol:
+        return {"error": "symbol required"}
+    return await _fetch_multi_frames(executor, symbol, [
+        ("5", 30, "5min"), ("H", 20, "hourly"), ("D", 30, "daily"),
+    ])
+
+
+async def handle_chart_quick(executor, params: dict) -> Any:
+    """Daily 10 bars + derived analytics. Fast screening tool."""
+    symbol = params.get("symbol")
+    if not symbol:
+        return {"error": "symbol required"}
+    return await _fetch_multi_frames(executor, symbol, [
+        ("D", 10, "daily"),
+    ])
+
+
+async def handle_execution_status(executor, params: dict) -> Any:
+    """Return execution autoresearch status: snapshot stats, graduated params, calibrated slippage."""
+    try:
+        from memory import get_db, get_graduated_params, get_calibrated_slippage
+        db = get_db()
+
+        # Snapshot summary
+        row = db.execute("SELECT COUNT(*) as n FROM execution_snapshots WHERE status = 'filled'").fetchone()
+        snap_total = row["n"] if row else 0
+        row = db.execute(
+            "SELECT COUNT(*) as n FROM execution_snapshots WHERE status = 'filled' AND ts > datetime('now', '-7 days')"
+        ).fetchone()
+        snap_recent = row["n"] if row else 0
+
+        # Graduated params
+        grads = get_graduated_params(active_only=True)
+        grad_list = [
+            {"key": g["param_key"], "value": g["param_value"], "improvement_bps": g["improvement_bps"], "p_value": g["p_value"]}
+            for g in grads
+        ]
+
+        # Calibrated slippage
+        cal = get_calibrated_slippage()
+        cal_list = [
+            {"order_type": k[0], "time_bucket": k[1], "atr_bucket": k[2], "median_bps": round(v, 2)}
+            for k, v in cal.items()
+        ]
+
+        return {
+            "snapshots_total": snap_total,
+            "snapshots_7d": snap_recent,
+            "graduated_params": grad_list,
+            "calibrated_slippage": cal_list,
+        }
+    except Exception as e:
+        return {"error": str(e)}
+
+
+async def handle_open_hypotheses(executor, params: dict) -> Any:
+    """Return open trader hypotheses for review."""
+    try:
+        from memory import get_db
+        db = get_db()
+        rows = db.execute(
+            """SELECT id, hypothesis_type, description, suggested_action, priority, ts
+               FROM trader_hypotheses
+               WHERE status = 'open'
+               ORDER BY priority ASC, ts DESC LIMIT 15""",
+        ).fetchall()
+        hyps = [
+            {
+                "id": r["id"],
+                "type": r["hypothesis_type"],
+                "desc": r["description"][:200],
+                "action": (r["suggested_action"] or "")[:100],
+                "priority": r["priority"],
+                "date": r["ts"][:10],
+            }
+            for r in rows
+        ]
+        return {"hypotheses": hyps, "count": len(hyps)}
+    except Exception as e:
+        return {"error": str(e)}
+
+
 HANDLERS = {
     "quote": handle_quote,
     "candles": handle_candles,
@@ -723,4 +1003,11 @@ HANDLERS = {
     "economic_calendar": handle_economic_calendar,
     "briefing": handle_briefing,
     "prior_research": handle_prior_research,
+    "chart_intraday": handle_chart_intraday,
+    "chart_swing": handle_chart_swing,
+    "chart_full": handle_chart_full,
+    "chart_quick": handle_chart_quick,
+    "execution_status": handle_execution_status,
+    "trader_rules": handle_execution_status,
+    "open_hypotheses": handle_open_hypotheses,
 }

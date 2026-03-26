@@ -38,6 +38,9 @@ from research.config import (
     ANALYSIS_PROMPT_TEMPLATE,
     BATCH_SIZE,
     CANDLE_RESOLUTION,
+    CIRCUIT_BREAKER_ALL_FAIL_ROUNDS,
+    CIRCUIT_BREAKER_COOLDOWN_SECS,
+    CIRCUIT_BREAKER_SLOT_MAX_FAILURES,
     DARWINIAN_WEIGHT_CEILING,
     DARWINIAN_WEIGHT_DOWN,
     DARWINIAN_WEIGHT_FLOOR,
@@ -50,14 +53,19 @@ from research.config import (
     MIN_KEEP_TEST_SIGNALS,
     NUM_SLOTS,
     REGIME_GATE_ENABLED,
+    REGIME_TO_SLOTS,
+    RESEARCH_DAILY_LLM_BUDGET,
     RESEARCH_SYSTEM_PROMPT,
     RESEARCH_UNIVERSE,
+    ROUND_DELAY_SECS,
     SANDBOX_ALLOWED_IMPORTS,
     SANDBOX_BLOCKED_CALLS,
     SELECTOR_EVERY_N_ROUNDS,
     SELECTOR_PROMPT,
     SIGNAL_SCHEMA,
     SLOT_CORRELATION_THRESHOLD,
+    SLOT_MANDATES,
+    validate_legs_json,
 )
 from research.environment import compute_environment, compute_environment_by_date, format_environment_for_prompt
 from research.promoter import OptionsPromoter, score_repriced_signals
@@ -78,8 +86,8 @@ _LLM_SEMAPHORE: asyncio.Semaphore | None = None  # initialized in run_research
 # ── Feature flags (toggled by __main__.py CLI args) ─────────────
 FEATURE_FLAGS: dict[str, bool] = {
     "options_promotion_enabled": True,   # run historical repricing for options signals
-    "strict_slippage": False,            # use 'strict' slippage preset in simulator
-    "replay_gating": False,              # require replay pass before promotion (Phase 3)
+    "strict_slippage": True,             # use calibrated slippage from live execution data
+    "replay_gating": True,               # require replay pass before promotion
 }
 
 
@@ -110,6 +118,62 @@ def _load_tunable_config() -> dict[str, float]:
     for key, default in _TUNABLE_DEFAULTS.items():
         cfg[key] = get_research_config(key, default)
     return cfg
+
+
+def _format_mandate(slot: int) -> str:
+    """Format the slot mandate text for the LLM system prompt."""
+    mandate = SLOT_MANDATES.get(slot)
+    if not mandate:
+        return "(No mandate assigned — evolve freely.)"
+    allowed = ", ".join(sorted(mandate["allowed_order_types"]))
+    return (
+        f"Regime group: {mandate['regime'].upper()} | "
+        f"Direction: {mandate['direction']} | "
+        f"Order class: {mandate['order_class']}\n"
+        f"Allowed order_type values: {allowed}\n"
+        f"Role: {mandate['description']}"
+    )
+
+
+def _check_mandate_compliance(slot: int, source: str, signals: list[dict]) -> str | None:
+    """Check if a strategy's signals comply with its slot mandate.
+
+    Returns an error string if non-compliant, or None if OK.
+    """
+    mandate = SLOT_MANDATES.get(slot)
+    if not mandate:
+        return None  # no mandate = no constraint
+
+    # Direction check (skip for "any" or "neutral")
+    required_dir = mandate["direction"]
+    if required_dir in ("short", "long") and signals:
+        wrong_dir = [s for s in signals if s.get("direction") != required_dir]
+        if len(wrong_dir) > len(signals) * 0.2:  # allow up to 20% hedging
+            pct = len(wrong_dir) / len(signals) * 100
+            return (
+                f"mandate violation: {pct:.0f}% signals are "
+                f"{wrong_dir[0].get('direction', '?')}, mandate requires {required_dir}"
+            )
+
+    # Order type check
+    allowed = mandate["allowed_order_types"]
+    if signals:
+        order_types = {s.get("order_type") for s in signals}
+        violations = order_types - allowed
+        if violations:
+            return (
+                f"mandate violation: order_type {violations} not in "
+                f"allowed set {sorted(allowed)}"
+            )
+
+    return None
+
+
+def _get_active_regime(env_snapshot: dict | None) -> str:
+    """Determine the current market regime label from the environment snapshot."""
+    if not env_snapshot:
+        return "flat"
+    return env_snapshot.get("trend_regime", "flat")
 
 
 def _strategy_path(slot: int) -> Path:
@@ -162,10 +226,13 @@ def _split_by_trading_day(
     return days
 
 
-def _fetch_universe_candles(
+async def _fetch_universe_candles(
     days_back: int, *, exclude_today: bool = False,
 ) -> dict[str, dict[str, pd.DataFrame]]:
     """Fetch candles for all symbols, split by trading day.
+
+    Uses async get_candles_async to avoid nest_asyncio event-loop corruption
+    when called from within the already-running event loop.
 
     Returns: {symbol: {date_str: df}}
     """
@@ -178,7 +245,7 @@ def _fetch_universe_candles(
 
     for sym in RESEARCH_UNIVERSE:
         try:
-            raw = provider.get_candles(
+            raw = await provider.get_candles_async(
                 sym, resolution=CANDLE_RESOLUTION,
                 from_date=from_date, to_date=to_date,
             )
@@ -197,7 +264,12 @@ def _train_test_split(
     universe: dict[str, dict[str, pd.DataFrame]],
     train_ratio: float = 0.7,
 ) -> tuple[dict[str, dict[str, pd.DataFrame]], dict[str, dict[str, pd.DataFrame]]]:
-    """Split universe into train/test by date.  Chronological — no leakage."""
+    """Split universe into train/test by date.  Chronological — no leakage.
+
+    Uses rolling walk-forward: train on the earliest train_ratio of days,
+    test on the remainder.  The split walks forward each call relative to the
+    data window, ensuring out-of-sample integrity.
+    """
     # Collect all unique dates
     all_dates = sorted({d for days in universe.values() for d in days})
     if len(all_dates) < 3:
@@ -219,6 +291,43 @@ def _train_test_split(
             test[sym] = te
 
     return train, test
+
+
+def walk_forward_splits(
+    universe: dict[str, dict[str, pd.DataFrame]],
+    train_days: int = 7,
+    test_days: int = 1,
+) -> list[tuple[dict[str, dict[str, pd.DataFrame]], dict[str, dict[str, pd.DataFrame]]]]:
+    """Generate rolling walk-forward train/test splits.
+
+    Yields (train_universe, test_universe) pairs where each window advances
+    by test_days.  E.g. with 10 days: train 1-7/test 8, train 2-8/test 9,
+    train 3-9/test 10.
+    """
+    all_dates = sorted({d for days in universe.values() for d in days})
+    window = train_days + test_days
+    if len(all_dates) < window:
+        # Not enough data — fall back to single split
+        return [_train_test_split(universe)]
+
+    splits = []
+    for start in range(0, len(all_dates) - window + 1, test_days):
+        train_set = set(all_dates[start:start + train_days])
+        test_set = set(all_dates[start + train_days:start + window])
+
+        train: dict[str, dict[str, pd.DataFrame]] = {}
+        test: dict[str, dict[str, pd.DataFrame]] = {}
+        for sym, days in universe.items():
+            tr = {d: df for d, df in days.items() if d in train_set}
+            te = {d: df for d, df in days.items() if d in test_set}
+            if tr:
+                train[sym] = tr
+            if te:
+                test[sym] = te
+        if train and test:
+            splits.append((train, test))
+
+    return splits if splits else [_train_test_split(universe)]
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -395,6 +504,7 @@ async def _call_llm(
     temperature: float = 0.3,
     max_tokens: int = 2048,
     purpose: str = "research",
+    timeout_seconds: float = 120,
 ):
     """Unified LLM call helper to reduce duplication across analyze/propose/selector.
 
@@ -408,7 +518,8 @@ async def _call_llm(
         temperature=temperature,
         max_tokens=max_tokens,
     )
-    response = await chat.sample()
+    async with asyncio.timeout(timeout_seconds):
+        response = await chat.sample()
 
     # Track cost
     usage = response.usage
@@ -542,6 +653,7 @@ Output ONLY the complete Python code -- no markdown fences, no explanation outsi
         num_slots=NUM_SLOTS,
         signal_schema=SIGNAL_SCHEMA,
         environment_context=environment_text,
+        slot_mandate=_format_mandate(slot),
     )
 
     messages = [
@@ -800,25 +912,33 @@ def _match_trades_to_signals():
 
     matched = 0
     for trade in unmatched:
-        # Find closest live signal for this symbol
+        # Find closest live signal for this symbol + slot within 30 min window
         signal = db.execute(
-            """SELECT ls.id, ls.slot, ls.direction,
+            """SELECT ls.id, ls.slot, ls.direction, ls.entry_price,
                       s.return_pct as sim_return, s.strategy_id
                FROM live_signals ls
                LEFT JOIN signals s ON s.strategy_id = ls.strategy_id
                    AND s.symbol = ls.symbol
                WHERE ls.symbol = ?
+                 AND ABS(julianday(ls.ts) - julianday(?)) < (30.0 / 1440.0)
                ORDER BY ABS(julianday(ls.ts) - julianday(?)) ASC
                LIMIT 1""",
-            (trade["symbol"], trade["ts"]),
+            (trade["symbol"], trade["ts"], trade["ts"]),
         ).fetchone()
 
         if signal:
-            sim_return = signal["sim_return"] or 0
-            actual_pnl = trade["pnl"] or 0
-            # Normalize: execution gap in percentage terms
-            # (positive gap = real trade did better than simulated)
-            execution_gap = actual_pnl - sim_return  # rough comparison
+            sim_return = signal["sim_return"] or 0  # percentage
+            actual_pnl = trade["pnl"] or 0  # dollars
+            entry_price = signal["entry_price"]
+
+            # Convert dollar PnL to percentage return for comparable gap.
+            # If entry_price is missing, store gap as None (unknown).
+            if entry_price and entry_price > 0:
+                actual_return_pct = (actual_pnl / entry_price) * 100
+                execution_gap = actual_return_pct - sim_return
+            else:
+                actual_return_pct = None
+                execution_gap = None
 
             db.execute(
                 """INSERT INTO trade_feedback
@@ -1003,17 +1123,63 @@ def _get_history_summary(limit: int = 10, slot: int = 1) -> str:
     return "\n".join(lines)
 
 
-def _compute_fitness(agg: dict) -> float:
-    """Use the simulator's uncertainty-adjusted search fitness when available."""
-    if "search_fitness" in agg:
-        return float(agg.get("search_fitness", 0.0) or 0.0)
+def _compute_fitness(agg: dict, *, slot: int | None = None) -> float:
+    """Use the simulator's uncertainty-adjusted search fitness when available.
 
-    exp = agg.get("expectancy", 0)
-    signals = agg.get("total_signals", 0)
-    sharpe = agg.get("sharpe_approx", 0)
-    signal_factor = min(1.0, signals / 100)
-    sharpe_factor = max(0.5, min(1.5, sharpe / 1.0)) if sharpe != 0 else 0.75
-    return exp * signal_factor * sharpe_factor
+    When *slot* is provided, applies a hard penalty based on real execution
+    gaps from the trade_feedback table: if the slot's recent trades have a
+    consistently negative gap (sim over-estimates reality), fitness is
+    penalised proportionally.  This makes the feedback loop numeric rather
+    than relying on the LLM to interpret text feedback.
+    """
+    if "search_fitness" in agg:
+        raw = float(agg.get("search_fitness", 0.0) or 0.0)
+    else:
+        exp = agg.get("expectancy", 0)
+        signals = agg.get("total_signals", 0)
+        sharpe = agg.get("sharpe_approx", 0)
+        signal_factor = min(1.0, signals / 100)
+        sharpe_factor = max(0.5, min(1.5, sharpe / 1.0)) if sharpe != 0 else 0.75
+        raw = exp * signal_factor * sharpe_factor
+
+    if slot is not None and raw > 0:
+        penalty = _execution_gap_penalty(slot)
+        if penalty > 0:
+            raw *= (1.0 - penalty)
+    return raw
+
+
+# Minimum number of feedback trades before we apply the gap penalty
+_MIN_GAP_TRADES = 5
+# Per-percentage-point penalty cap (e.g. avg gap of -3% → 3 * 0.05 = 15% penalty)
+_GAP_PENALTY_PER_PCT = 0.05
+_GAP_PENALTY_CAP = 0.40  # never penalise more than 40%
+
+
+def _execution_gap_penalty(slot: int) -> float:
+    """Return a 0–_GAP_PENALTY_CAP penalty factor for *slot* based on trade feedback.
+
+    Penalty is zero when there are fewer than _MIN_GAP_TRADES feedback rows or
+    when the average gap is non-negative (real execution >= simulation).
+    """
+    try:
+        db = get_db()
+        rows = db.execute(
+            """SELECT execution_gap FROM trade_feedback
+               WHERE slot = ? AND execution_gap IS NOT NULL
+               ORDER BY ts DESC LIMIT 20""",
+            (slot,),
+        ).fetchall()
+        if len(rows) < _MIN_GAP_TRADES:
+            return 0.0
+        avg_gap = sum(r["execution_gap"] for r in rows) / len(rows)
+        if avg_gap >= 0:
+            return 0.0  # real execution meets or beats sim — no penalty
+        # avg_gap is negative; convert to positive penalty
+        penalty = min(_GAP_PENALTY_CAP, abs(avg_gap) * _GAP_PENALTY_PER_PCT)
+        return penalty
+    except Exception:
+        return 0.0
 
 
 def _format_fitness_metrics(agg: dict) -> str:
@@ -1031,27 +1197,6 @@ def _max_condition_trades(agg: dict) -> int:
     """Return the largest repeated environment bucket size in an aggregate result."""
     condition_rows = agg.get("condition_metrics", []) or []
     return max((int(row.get("trades", 0) or 0) for row in condition_rows), default=0)
-
-
-def _keep_gate_failures(agg: dict, cfg: dict[str, float] | None = None) -> list[str]:
-    """Hard keep gates to block strategies that still look mostly like noise."""
-    min_conf = (cfg or {}).get("min_keep_confidence_score", MIN_KEEP_CONFIDENCE_SCORE)
-    min_cond = int((cfg or {}).get("min_keep_condition_trades", MIN_KEEP_CONDITION_TRADES))
-
-    reasons: list[str] = []
-    confidence_score = float(agg.get("confidence_score", 0.0) or 0.0)
-    if confidence_score < min_conf:
-        reasons.append(
-            f"confidence too low ({confidence_score:.2f}<{min_conf:.2f})"
-        )
-
-    max_condition_trades = _max_condition_trades(agg)
-    if max_condition_trades < min_cond:
-        reasons.append(
-            f"too few repeated condition trades ({max_condition_trades}<{min_cond})"
-        )
-
-    return reasons
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -1163,11 +1308,13 @@ def _get_best_strategy(slot: int = 1) -> tuple[Optional[int], Optional[str], flo
 # LIVE SCAN
 # ═══════════════════════════════════════════════════════════════
 
-def _fetch_live_candles() -> dict[str, pd.DataFrame]:
+async def _fetch_live_candles() -> dict[str, pd.DataFrame]:
     """Fetch today's 1-min candles for the full universe (called once per round).
 
     Returns an empty dict immediately when the regular market session is not
     open — avoids flooding the API with 404s every round during pre-market.
+
+    Uses async get_candles_async to avoid nest_asyncio event-loop corruption.
     """
     from data.market_hours import get_market_hours_provider
     if not get_market_hours_provider().is_market_open():
@@ -1179,7 +1326,7 @@ def _fetch_live_candles() -> dict[str, pd.DataFrame]:
     result: dict[str, pd.DataFrame] = {}
     for sym in RESEARCH_UNIVERSE:
         try:
-            raw = provider.get_candles(
+            raw = await provider.get_candles_async(
                 sym, resolution=CANDLE_RESOLUTION, from_date=today,
             )
             if raw and len(raw) > 0:
@@ -1200,13 +1347,23 @@ def _run_live_scan(
     db = get_db()
     now = datetime.now(timezone.utc).isoformat()
 
-    # Clear old live signals for THIS slot only
-    db.execute("DELETE FROM live_signals WHERE slot = ?", (slot,))
+    # Prune live signals older than 30 days; keep recent ones for feedback
+    db.execute(
+        "DELETE FROM live_signals WHERE slot = ? AND ts < datetime('now', '-30 days')",
+        (slot,),
+    )
 
     for sym, df in live_candles.items():
         try:
             signals = _execute_strategy(source, df, sym)
             for sig in signals:
+                # Validate legs_json before inserting (same check simulator uses)
+                legs = sig.get("legs_json")
+                if legs:
+                    legs_err = validate_legs_json(legs)
+                    if legs_err:
+                        logger.debug(f"Live scan [{sym}]: skipping signal with invalid legs_json: {legs_err}")
+                        continue
                 db.execute(
                     """INSERT INTO live_signals
                        (strategy_id, slot, ts, symbol, direction, order_type,
@@ -1225,7 +1382,7 @@ def _run_live_scan(
                         sig.get("target_price"),
                         sig.get("stop_price"),
                         sig.get("max_hold_bars"),
-                        json.dumps(sig.get("legs_json")) if sig.get("legs_json") else None,
+                        json.dumps(legs) if legs else None,
                     ),
                 )
         except Exception as e:
@@ -1320,7 +1477,10 @@ async def _run_slot(
     test_agg, test_per_day, test_results = await asyncio.to_thread(
         _evaluate_strategy, current_source, test_universe,
     )
-    best_test_fitness = _compute_fitness(test_agg)
+    best_test_fitness = _compute_fitness(test_agg, slot=slot)
+    gap_pen = _execution_gap_penalty(slot)
+    # Clamp historical best to fitness cap (old uncapped values may be inflated)
+    state["best_test_fitness"] = min(state["best_test_fitness"], 5.0)
     state["best_test_fitness"] = max(state["best_test_fitness"], best_test_fitness)
     logger.info(
         f"[Slot {slot:02d}] Test:  signals={test_agg['total_signals']} "
@@ -1328,6 +1488,7 @@ async def _run_slot(
         f"{_format_fitness_metrics(test_agg)} "
         f"conf={test_agg.get('confidence_score', 0):.2f} "
         f"cond_conf={test_agg.get('condition_confidence', 0):.2f}"
+        + (f" gap_penalty={gap_pen:.2%}" if gap_pen > 0 else "")
     )
 
     # Store daily return profile for cross-slot correlation analysis
@@ -1368,6 +1529,26 @@ async def _run_slot(
     proposal_temp = min(1.0, 0.5 + consecutive_failures * 0.05)
     history = _get_history_summary(slot=slot)
 
+    # Gather live-trading hypotheses so the LLM can address real execution gaps
+    hypothesis_text = ""
+    try:
+        from memory import get_open_hypotheses
+        open_hyps = get_open_hypotheses(slot=slot, limit=5)
+        if open_hyps:
+            hyp_lines = []
+            for h in open_hyps:
+                hyp_lines.append(
+                    f"  [{h['hypothesis_type']}] {h['description']} "
+                    f"→ {h['suggested_action'] or 'no action suggested'}"
+                )
+            hypothesis_text = (
+                "\n\nLIVE TRADING FEEDBACK (from real execution):\n"
+                + "\n".join(hyp_lines)
+                + "\nConsider these observations when improving the strategy."
+            )
+    except Exception as _hyp_err:
+        logger.debug(f"[Slot {slot:02d}] Hypothesis fetch failed: {_hyp_err}")
+
     # Check for selector directive (meta-learning pivot)
     directive = state.pop("selector_directive", None)
     directive_text = ""
@@ -1391,7 +1572,7 @@ async def _run_slot(
     )
     async with _LLM_SEMAPHORE:
         new_source = await _llm_propose_strategy(
-            current_source, analysis + directive_text, history,
+            current_source, analysis + directive_text + hypothesis_text, history,
             temperature=proposal_temp, slot=slot,
             environment_text=environment_text,
         )
@@ -1424,7 +1605,7 @@ async def _run_slot(
     new_test_agg, new_test_pd, new_test_res = await asyncio.to_thread(
         _evaluate_strategy, new_source, test_universe,
     )
-    new_test_fitness = _compute_fitness(new_test_agg)
+    new_test_fitness = _compute_fitness(new_test_agg, slot=slot)
     logger.info(
         f"[Slot {slot:02d}] Proposed test:  signals={new_test_agg['total_signals']} "
         f"hit={new_test_agg['hit_rate']:.0f}% exp={new_test_agg['expectancy']:.4f} "
@@ -1512,104 +1693,32 @@ async def _run_slot(
         except Exception as _replay_exc:
             logger.debug(f"[Slot {slot:02d}] Replay gating skipped: {_replay_exc}")
 
-    # ── 11. Keep or discard (fitness + annealing) ───────────────
-    min_test_signals = int((cfg or {}).get("min_keep_test_signals", MIN_KEEP_TEST_SIGNALS))
-    has_enough_signals = new_test_agg.get("total_signals", 0) >= min_test_signals
-    train_positive = new_train_agg.get("expectancy", 0) > 0
-    gate_failures = _keep_gate_failures(new_test_agg, cfg)
-    passed_hard_gates = not gate_failures
-
+    # ── 11. Keep or discard — single composite score ───────────
+    # Karpathy-style: ONE composite fitness decides everything.
+    # The simulator's search_fitness already bakes in expectancy, profit
+    # factor, sample size, drawdown, stability, confidence, and condition
+    # confidence.  Only mandate compliance remains as a structural gate.
     best_fitness = state["best_test_fitness"]
 
-    # Regime gate: suppress directional longs in bearish environments.
-    # Uses continuous metrics instead of hard label cutoffs to allow
-    # gradual adaptation across the full range of market conditions.
-    regime_gate_on = bool((cfg or {}).get("regime_gate_enabled", float(REGIME_GATE_ENABLED)))
-    regime_blocked = False
-    if regime_gate_on and env_snapshot:
-        pct_down = env_snapshot.get("pct_trending_down", 0.0)
-        adv_dec = env_snapshot.get("advance_decline_ratio", 0.0)
-        # Continuous check: >50% of universe trending down AND breadth negative
-        if pct_down > 0.50 and adv_dec < -0.20:
-            long_sigs = [r for r in new_test_res if r.get("direction") == "long"]
-            if new_test_res and len(long_sigs) / len(new_test_res) > 0.8:
-                stype = _extract_strategy_type(new_source)
-                if stype not in ("iron_condor", "straddle", "strangle"):
-                    regime_blocked = True
-                    logger.info(
-                        f"[Slot {slot:02d}] REGIME GATE: long-biased "
-                        f"(pct_down={pct_down:.0%}, a/d={adv_dec:+.2f})"
-                    )
+    # Mandate compliance: only structural gate (slot direction must match)
+    mandate_violation = _check_mandate_compliance(slot, new_source, new_test_res)
+    mandate_blocked = mandate_violation is not None
+    if mandate_blocked:
+        logger.info(f"[Slot {slot:02d}] MANDATE GATE: {mandate_violation}")
 
-    # Extreme vol gate: scale the fitness hurdle continuously by ATR.
-    # Instead of a binary "extreme vs not" label, linearly ramp the
-    # required improvement from 0% at ATR<=2.5% to EXTREME boost at ATR>=4.0%.
-    effective_best = best_fitness
-    if regime_gate_on and env_snapshot and best_fitness > 0:
-        atr = env_snapshot.get("avg_atr_pct", 0.0)
-        if atr > 2.5:
-            ramp = min(1.0, (atr - 2.5) / 1.5)  # 0→1 over ATR 2.5%→4.0%
-            vol_boost = (cfg or {}).get("extreme_vol_fitness_boost", EXTREME_VOL_FITNESS_BOOST)
-            boost = 1.0 + (vol_boost - 1.0) * ramp
-            effective_best = best_fitness * boost
-            if new_test_fitness < effective_best:
-                logger.info(
-                    f"[Slot {slot:02d}] VOL GATE: fitness {new_test_fitness:.4f} < "
-                    f"threshold {effective_best:.4f} (ATR={atr:.2f}%, ramp={ramp:.2f})"
-                )
+    # Simple composite comparison
+    strict_improved = new_test_fitness > best_fitness and not mandate_blocked
 
-    strict_improved = (
-        new_test_fitness > effective_best
-        and has_enough_signals
-        and train_positive
-        and passed_hard_gates
-    )
-
-    # If options promotion returned results, apply a coverage penalty ONLY when
-    # the API returned at least some repriced data but overall coverage is thin.
-    # If repriced_count == 0, the chain data simply isn't available in the API;
-    # that's a data gap, not evidence of strategy quality — don't penalise.
-    promotion_penalty = False
-    if promotion_score is not None:
-        repriced_n = promotion_score.get("repriced_count", 0)
-        coverage = promotion_score.get("options_coverage_pct", 100)
-        if repriced_n > 0 and coverage < 40:
-            promotion_penalty = True
-            logger.info(
-                f"[Slot {slot:02d}] Promotion penalty: options coverage only {coverage:.0f}%"
-            )
-
-    # Replay gate: if replay ran and failed, block promotion
-    replay_blocked = (
-        replay_episode is not None
-        and replay_episode.outcome in ("fail", "error", "no_signals")
-    )
-
-    annealing_accept = False
-    if (
+    # Annealing: after consecutive failures, accept near-matches
+    annealing_accept = (
         not strict_improved
-        and has_enough_signals
-        and train_positive
-        and passed_hard_gates
-        and not promotion_penalty
-        and not replay_blocked
-        and not regime_blocked
+        and not mandate_blocked
         and consecutive_failures >= 5
         and best_fitness > 0
-        and new_test_fitness >= best_fitness * 0.9
-    ):
-        annealing_accept = True
-
-    # Tentative keep decision (before adversarial review)
-    tentative_kept = (
-        (strict_improved or annealing_accept)
-        and passed_hard_gates
-        and not promotion_penalty
-        and not replay_blocked
-        and not regime_blocked
+        and new_test_fitness >= best_fitness * 0.85
     )
 
-    kept = tentative_kept
+    kept = strict_improved or annealing_accept
 
     if kept:
         if annealing_accept:
@@ -1645,27 +1754,10 @@ async def _run_slot(
         state["last_rejection_reasons"] = []
     else:
         reasons = []
+        if mandate_blocked:
+            reasons.append(mandate_violation)
         if new_test_fitness <= best_fitness:
             reasons.append(f"lower fitness ({new_test_fitness:.4f} vs {best_fitness:.4f})")
-        elif effective_best > best_fitness and new_test_fitness <= effective_best:
-            reasons.append(
-                f"below extreme-vol threshold ({new_test_fitness:.4f} < {effective_best:.4f})"
-            )
-        if not has_enough_signals:
-            reasons.append(
-                f"too few test signals ({new_test_agg.get('total_signals', 0)}<{min_test_signals})"
-            )
-        if not train_positive:
-            reasons.append("negative train expectancy")
-        reasons.extend(gate_failures)
-        if promotion_penalty:
-            reasons.append("options promotion coverage too low")
-        if replay_blocked:
-            reasons.append(f"replay={replay_episode.outcome}: {replay_episode.failure_reason}")
-        if regime_blocked:
-            pct_d = env_snapshot.get("pct_trending_down", 0.0) if env_snapshot else 0.0
-            ad_r = env_snapshot.get("advance_decline_ratio", 0.0) if env_snapshot else 0.0
-            reasons.append(f"regime gate: long-biased (down={pct_d:.0%}, a/d={ad_r:+.2f})")
 
         logger.info(f"[Slot {slot:02d}] DISCARDING: {', '.join(reasons)}")
         new_id = _store_strategy(
@@ -1683,10 +1775,20 @@ async def _run_slot(
         state["last_kept"] = False
         state["last_rejection_reasons"] = reasons
 
-    # ── 12. Live scan ───────────────────────────────────────────
-    if best_id is not None and live_candles:
-        best_source = strat_path.read_text(encoding="utf-8") if not dry_run else current_source
-        await asyncio.to_thread(_run_live_scan, best_id, best_source, slot, live_candles)
+    # ── 12. Live scan (gate on positive fitness + regime match) ──
+    active_regime = _get_active_regime(env_snapshot)
+    slot_regime_slots = REGIME_TO_SLOTS.get(active_regime, [])
+    regime_match = slot in slot_regime_slots
+    if best_id is not None and live_candles and state["best_test_fitness"] > 0:
+        if regime_match:
+            best_source = strat_path.read_text(encoding="utf-8") if not dry_run else current_source
+            await asyncio.to_thread(_run_live_scan, best_id, best_source, slot, live_candles)
+        else:
+            mandate = SLOT_MANDATES.get(slot, {})
+            logger.info(
+                f"[Slot {slot:02d}] Live scan SKIPPED: slot regime "
+                f"'{mandate.get('regime', '?')}' != active '{active_regime}'"
+            )
 
     # ── 13. Git commit ──────────────────────────────────────────
     if not dry_run:
@@ -1822,13 +1924,46 @@ async def _run_selector(
 
     rankings.sort(key=lambda x: x["env_adjusted_fitness"], reverse=True)
 
+    # ── Diversity scoring ───────────────────────────────────────
+    # Detect intra-regime type duplication and penalise converged slots.
+    regime_type_counts: dict[str, dict[str, list[int]]] = {}
+    for r in rankings:
+        m = SLOT_MANDATES.get(r["slot"], {})
+        regime = m.get("regime", "unknown")
+        stype = r["strategy_type"]
+        regime_type_counts.setdefault(regime, {}).setdefault(stype, []).append(r["slot"])
+
+    diversity_issues: list[str] = []
+    for regime, type_map in regime_type_counts.items():
+        for stype, slots in type_map.items():
+            if len(slots) > 1:
+                diversity_issues.append(
+                    f"{regime} regime: slots {slots} share type '{stype}'"
+                )
+                # Apply a 10% fitness penalty to non-best duplicates
+                best_dup = max(slots, key=lambda s: next(
+                    r["env_adjusted_fitness"] for r in rankings if r["slot"] == s
+                ))
+                for s in slots:
+                    if s != best_dup:
+                        for r in rankings:
+                            if r["slot"] == s:
+                                r["env_adjusted_fitness"] *= 0.90
+                                r["diversity_penalty"] = True
+                                break
+
+    if diversity_issues:
+        logger.info(f"  Diversity issues: {'; '.join(diversity_issues)}")
+    rankings.sort(key=lambda x: x["env_adjusted_fitness"], reverse=True)
+
     # Log rankings
     for i, r in enumerate(rankings):
         marker = " ★" if i == 0 else " ✗" if i >= len(rankings) - 2 else ""
+        dp = " [dup]" if r.get("diversity_penalty") else ""
         logger.info(
             f"  #{i+1} Slot {r['slot']:02d}: fitness={r['fitness']:.4f} "
             f"env_fit={r['env_fit']:.2f} adj={r['env_adjusted_fitness']:.4f} "
-            f"iters={r['iterations']} type={r['strategy_type']}{marker}"
+            f"iters={r['iterations']} type={r['strategy_type']}{marker}{dp}"
         )
 
     # ── Get historical and feedback context ─────────────────────
@@ -1851,9 +1986,32 @@ async def _run_selector(
         for _s1, _s2, _r in corr_data["redundant_pairs"]:
             slot_ranking_text += f"\n    Slots {_s1:02d} & {_s2:02d}: r={_r:.2f}"
 
+    if diversity_issues:
+        slot_ranking_text += "\n\n  DIVERSITY VIOLATIONS (same strategy type within regime):"
+        for issue in diversity_issues:
+            slot_ranking_text += f"\n    {issue}"
+        slot_ranking_text += (
+            "\n  ACTION: Consider issuing directives to duplicate slots to pivot to "
+            "their mandated order_class. Diversity across order types within a regime "
+            "is critical for portfolio resilience."
+        )
+
+    # Build mandate summary for selector
+    mandate_lines = []
+    for s in range(1, NUM_SLOTS + 1):
+        m = SLOT_MANDATES.get(s)
+        if m:
+            allowed = ", ".join(sorted(m["allowed_order_types"]))
+            mandate_lines.append(
+                f"  Slot {s:02d}: regime={m['regime']} dir={m['direction']} "
+                f"class={m['order_class']} allowed=[{allowed}]"
+            )
+    mandate_text = "\n".join(mandate_lines)
+
     prompt = SELECTOR_PROMPT.format(
         num_slots=NUM_SLOTS,
         slot_rankings=slot_ranking_text,
+        slot_mandates=mandate_text,
         environment_context=environment_text,
         env_slot_history=env_slot_history,
         trade_feedback=trade_feedback,
@@ -1871,16 +2029,22 @@ async def _run_selector(
         )
 
     # ── Parse response ──────────────────────────────────────────
-    text = response.content.strip()
-    json_match = re.search(r'\{.*\}', text, re.DOTALL)
-    if not json_match:
-        logger.warning("Selector: Could not parse JSON response — skipping")
-        return
+    text = response.strip()  # _call_llm already returns str
 
+    # Try full text first, then extract outermost { ... }
+    decision = None
     try:
-        decision = json.loads(json_match.group())
-    except json.JSONDecodeError:
-        logger.warning("Selector: Invalid JSON — skipping")
+        decision = json.loads(text)
+    except (json.JSONDecodeError, ValueError):
+        json_match = re.search(r'\{[^{}]*(?:\{[^{}]*\}[^{}]*)*\}', text, re.DOTALL)
+        if json_match:
+            try:
+                decision = json.loads(json_match.group())
+            except json.JSONDecodeError:
+                pass
+
+    if not isinstance(decision, dict):
+        logger.warning("Selector: Could not parse JSON response — skipping")
         return
 
     analysis = decision.get("analysis", "")
@@ -1922,8 +2086,36 @@ async def _run_selector(
                 "reason": reason,
             }
 
-            # If cloning from another slot, copy its code as the new baseline
+            # Validate directive against slot mandate before setting
+            mandate = SLOT_MANDATES.get(slot_num)
+            if mandate:
+                # If the LLM's target type is clearly an order_type, check it
+                if target_type and target_type in (
+                    "bracket", "trailing_stop_exit", "oca_exit", "limit",
+                    "vertical_spread", "diagonal_spread", "calendar_spread",
+                    "iron_condor", "butterfly", "strangle", "straddle",
+                    "midprice", "moc", "stock_momentum", "stock_bracket",
+                    "options_directional", "options_premium",
+                    "stock_mean_reversion", "stock_range",
+                ) and target_type not in mandate["allowed_order_types"] and target_type != mandate["order_class"]:
+                    logger.info(
+                        f"Selector: Slot {slot_num:02d} directive BLOCKED — "
+                        f"target '{target_type}' violates mandate (class={mandate['order_class']})"
+                    )
+                    continue
+
+            # If cloning from another slot, only allow within same regime group
             if seed_from and 1 <= seed_from <= NUM_SLOTS and seed_from != slot_num:
+                donor_mandate = SLOT_MANDATES.get(seed_from, {})
+                target_mandate = SLOT_MANDATES.get(slot_num, {})
+                if donor_mandate.get("regime") != target_mandate.get("regime"):
+                    logger.info(
+                        f"Selector: Slot {slot_num:02d} clone from {seed_from:02d} BLOCKED — "
+                        f"cross-regime ({donor_mandate.get('regime')} → {target_mandate.get('regime')})"
+                    )
+                    seed_from = None  # skip clone, still allow directive
+
+            if seed_from:
                 try:
                     donor_source = _strategy_path(seed_from).read_text(encoding="utf-8")
                     validation_err = _validate_strategy_source(donor_source)
@@ -1932,7 +2124,7 @@ async def _run_selector(
                         donor_agg, _, _ = await asyncio.to_thread(
                             _evaluate_strategy, donor_source, test_universe,
                         )
-                        donor_fitness = _compute_fitness(donor_agg)
+                        donor_fitness = _compute_fitness(donor_agg, slot=slot_num)
                         current_fitness = slot_states[slot_num]["best_test_fitness"]
 
                         if donor_fitness > current_fitness:
@@ -2115,9 +2307,11 @@ async def run_research(
             "last_rejection_reasons": [],
             "darwinian_weight": 1.0,
             "_daily_returns": {},
+            "fitness_history": [],  # Track fitness across rounds for decay detection
         }
 
     round_num = 0
+    consecutive_all_fail_rounds = 0
     _cached_universe = None  # Re-use across rounds when market is closed
 
     while True:
@@ -2148,7 +2342,7 @@ async def run_research(
             universe = _cached_universe
         else:
             logger.info("Fetching candle data...")
-            universe = _fetch_universe_candles(eval_days, exclude_today=True)
+            universe = await _fetch_universe_candles(eval_days, exclude_today=True)
             _cached_universe = universe
         unique_dates = sorted({d for days in universe.values() for d in days})
         logger.info(f"Got data for {len(universe)} symbols across {len(unique_dates)} trading days ({len(universe) * len(unique_dates)} symbol-days)")
@@ -2166,21 +2360,55 @@ async def run_research(
         logger.info(f"Environment snapshot stored (id={env_snapshot_id})")
 
         train_universe, test_universe = _train_test_split(universe)
+
+        # Walk-forward: use the last fold for primary evaluation (most recent OOS day)
+        wf_splits = walk_forward_splits(universe, train_days=7, test_days=1)
+        if len(wf_splits) > 1:
+            # Use last fold: trains on most recent 7 days, tests on most recent day
+            train_universe, test_universe = wf_splits[-1]
+            logger.info(f"Walk-forward: {len(wf_splits)} folds, using last fold for evaluation")
         train_dates = sorted({d for days in train_universe.values() for d in days})
         test_dates = sorted({d for days in test_universe.values() for d in days})
         logger.info(f"Split: train={len(train_dates)} days ({train_dates[0]}..{train_dates[-1]}), test={len(test_dates)} days ({test_dates[0]}..{test_dates[-1]})")
 
         # Fetch today's candles once for all live scans
         logger.info("Fetching live candles (today)...")
-        live_candles = _fetch_live_candles()
+        live_candles = await _fetch_live_candles()
 
-        # Run slots in batches
+        # Run slots in batches (skip frozen slots)
+        active_slot_ids = []
         for s in slot_ids:
+            if slot_states[s]["consecutive_failures"] >= CIRCUIT_BREAKER_SLOT_MAX_FAILURES:
+                logger.warning(
+                    f"[Slot {s:02d}] FROZEN — {slot_states[s]['consecutive_failures']} "
+                    f"consecutive failures (limit {CIRCUIT_BREAKER_SLOT_MAX_FAILURES})"
+                )
+                continue
+            active_slot_ids.append(s)
             slot_states[s]["iteration"] += 1
 
+        if not active_slot_ids:
+            logger.critical("All slots frozen — triggering selector to unfreeze")
+            # Force selector run to clone/replace frozen slots
+            try:
+                await _run_selector(
+                    slot_states, env_snapshot, env_snapshot_id,
+                    train_universe, test_universe,
+                )
+            except Exception as e:
+                logger.error(f"Selector failed: {e}")
+            # Check if any slots were unfrozen by selector
+            still_frozen = all(
+                slot_states[s]["consecutive_failures"] >= CIRCUIT_BREAKER_SLOT_MAX_FAILURES
+                for s in slot_ids
+            )
+            if still_frozen:
+                logger.critical("All slots still frozen after selector — waiting 5 min")
+                await asyncio.sleep(300)
+            continue
         batches = [
-            slot_ids[i:i + BATCH_SIZE]
-            for i in range(0, len(slot_ids), BATCH_SIZE)
+            active_slot_ids[i:i + BATCH_SIZE]
+            for i in range(0, len(active_slot_ids), BATCH_SIZE)
         ]
 
         for batch_num, batch in enumerate(batches, 1):
@@ -2240,10 +2468,27 @@ async def run_research(
         for s in slot_ids:
             st = slot_states[s]
             w = st.get("darwinian_weight", 1.0)
+
+            # Record fitness for decay tracking
+            st.setdefault("fitness_history", []).append(st["best_test_fitness"])
+
+            # Detect decay: fitness dropped >40% over last 3 rounds
+            decay_marker = ""
+            fh = st.get("fitness_history", [])
+            if len(fh) >= 3:
+                peak_recent = max(fh[-3:])
+                if peak_recent > 0 and fh[-1] < peak_recent * 0.6:
+                    decay_marker = " ⚠ DECAYING"
+                    st["consecutive_failures"] = max(
+                        st["consecutive_failures"],
+                        CIRCUIT_BREAKER_SLOT_MAX_FAILURES - 1,
+                    )
+
             logger.info(
                 f"  Slot {s:02d}: fitness={st['best_test_fitness']:.4f} "
                 f"weight={w:.2f} "
                 f"iter={st['iteration']} failures={st['consecutive_failures']}"
+                f"{decay_marker}"
             )
 
         rejection_counts = Counter()
@@ -2291,5 +2536,42 @@ async def run_research(
 
         # ── Auto-tune thresholds based on round outcomes ─────────
         _auto_tune_config(cfg, slot_states, slot_ids, round_num, kept_count)
+
+        # ── All-fail circuit breaker ─────────────────────────────
+        if kept_count == 0 and active_slot_ids:
+            consecutive_all_fail_rounds += 1
+            logger.warning(
+                f"All-fail round {consecutive_all_fail_rounds}/"
+                f"{CIRCUIT_BREAKER_ALL_FAIL_ROUNDS}"
+            )
+            if consecutive_all_fail_rounds >= CIRCUIT_BREAKER_ALL_FAIL_ROUNDS:
+                logger.critical(
+                    f"CIRCUIT BREAKER: {CIRCUIT_BREAKER_ALL_FAIL_ROUNDS} consecutive "
+                    f"all-fail rounds — cooling down {CIRCUIT_BREAKER_COOLDOWN_SECS}s"
+                )
+                await asyncio.sleep(CIRCUIT_BREAKER_COOLDOWN_SECS)
+                consecutive_all_fail_rounds = 0
+        else:
+            consecutive_all_fail_rounds = 0
+
+        # ── Daily LLM budget check ────────────────────────────────────
+        try:
+            from data.cost_tracker import get_cost_tracker
+            budget = get_cost_tracker().get_budget_summary()
+            today_spend = budget.today_llm_cost
+            if today_spend >= RESEARCH_DAILY_LLM_BUDGET:
+                logger.warning(
+                    f"Daily LLM budget reached: ${today_spend:.2f} >= "
+                    f"${RESEARCH_DAILY_LLM_BUDGET:.2f} — stopping research"
+                )
+                break
+            logger.info(f"Daily LLM spend: ${today_spend:.2f} / ${RESEARCH_DAILY_LLM_BUDGET:.2f}")
+        except Exception as e:
+            logger.debug(f"Budget check failed (continuing): {e}")
+
+        # ── Inter-round pacing delay ──────────────────────────────────
+        if ROUND_DELAY_SECS > 0:
+            logger.info(f"Pacing: waiting {ROUND_DELAY_SECS}s before next round...")
+            await asyncio.sleep(ROUND_DELAY_SECS)
 
         logger.info("Starting next round...")

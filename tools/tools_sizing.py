@@ -175,6 +175,24 @@ async def handle_calculate_size(executor, params: dict) -> Any:
     max_loss = recommended * stop_loss_per_share
     max_loss_pct = (max_loss / net_liq * 100) if net_liq > 0 else 0
 
+    # Execution cost model — historical gap for this symbol
+    exec_cost = None
+    try:
+        from memory import get_execution_cost
+        ec = get_execution_cost(symbol=symbol)
+        if ec and ec.get("trades", 0) >= 3:
+            exec_cost = {
+                "avg_gap_pct": ec["avg_gap_pct"],
+                "trades_observed": ec["trades"],
+            }
+            if ec["avg_gap_pct"] > 0.005:
+                reasoning.append(
+                    f"⚠ Execution cost: {symbol} has {ec['avg_gap_pct']:.2%} avg gap "
+                    f"over {ec['trades']} trades — factor into stops"
+                )
+    except Exception as e:
+        logger.debug(f"Execution cost lookup failed for {symbol}: {e}")
+
     return {
         "symbol": symbol,
         "side": side,
@@ -201,6 +219,7 @@ async def handle_calculate_size(executor, params: dict) -> Any:
             "cash_shares": max_by_cash if side == 'BUY' else "N/A (sell)",
         },
         "reasoning": reasoning,
+        "execution_cost": exec_cost,
         "account": {
             "net_liq": round(net_liq, 2),
             "cash_available": round(available_cash_total, 2),

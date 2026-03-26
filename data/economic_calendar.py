@@ -178,6 +178,11 @@ def _is_thursday(d: date) -> bool:
 def get_todays_events(today: Optional[date] = None) -> List[MacroEvent]:
     """Return all macro events scheduled for today (ET date)."""
     today = today or date.today()
+    if today.year != 2026:
+        logger.warning(
+            f"Economic calendar only covers 2026 — no curated data for {today.year}. "
+            "Update _EVENTS_{year} in economic_calendar.py."
+        )
     events = [e for e in _EVENTS_2026 if e.date == today]
     # Weekly: Initial Jobless Claims every Thursday at 08:30 ET
     if _is_thursday(today):
@@ -189,6 +194,11 @@ def get_upcoming_events(days: int = 3, today: Optional[date] = None) -> List[Mac
     """Return macro events scheduled in the next *days* calendar days (inclusive today)."""
     today = today or date.today()
     end = today + timedelta(days=days)
+    if today.year != 2026 and end.year != 2026:
+        logger.warning(
+            f"Economic calendar only covers 2026 — no curated data for {today.year}. "
+            "Update _EVENTS_{year} in economic_calendar.py."
+        )
     events = [e for e in _EVENTS_2026 if today <= e.date <= end]
     # Add weekly jobless claims Thursdays in range
     d = today

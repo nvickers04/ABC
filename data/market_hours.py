@@ -4,6 +4,7 @@ Provides comprehensive market session detection and trading hours information.
 Integrates with IBKR API to get actual contract trading hours including premarket/postmarket.
 """
 
+import asyncio
 import logging
 from datetime import datetime, time, timezone, timedelta
 from typing import Dict, Any, Optional
@@ -66,21 +67,47 @@ class MarketHoursProvider:
         self.regular_close = _parse_time('regular_close', time(16, 0))
         self.postmarket_end = _parse_time('postmarket_end', time(20, 0))
 
+        # Early close state (checked once per day via MDA)
+        self._early_close_date: Optional[str] = None   # date string checked
+        self._is_early_close: bool = False
+        self._early_close_time = time(13, 0)  # Standard US early close
+
         # Try to use zoneinfo for DST-aware ET, fall back to fixed offset
-        try:
-            from zoneinfo import ZoneInfo
-            self._et_tz = ZoneInfo('America/New_York')
-        except ImportError:
-            self._et_tz = None
-            logger.warning("zoneinfo not available, using fixed UTC-5 offset (may be wrong during DST)")
+        from zoneinfo import ZoneInfo
+        self._et_tz = ZoneInfo('America/New_York')
 
     def _to_eastern(self, dt: datetime) -> datetime:
         """Convert datetime to Eastern Time (DST-aware)."""
-        if self._et_tz is not None:
-            return dt.astimezone(self._et_tz)
-        else:
-            # Fallback: assume EST (UTC-5) - may be wrong during DST
-            return dt.astimezone(timezone(timedelta(hours=-5)))
+        return dt.astimezone(self._et_tz)
+
+    def _check_early_close(self, date_str: str) -> None:
+        """Query MDA market status once per day to detect early closes."""
+        if self._early_close_date == date_str:
+            return  # Already checked today
+        self._early_close_date = date_str
+        self._is_early_close = False
+        try:
+            from data.marketdata_client import get_marketdata_client
+            client = get_marketdata_client()
+            loop = asyncio.get_event_loop()
+            if loop.is_running():
+                import nest_asyncio
+                nest_asyncio.apply()
+            result = loop.run_until_complete(client.get_market_status(date=date_str))
+            if result and result.get("statuses"):
+                for entry in result["statuses"]:
+                    if entry.get("date") == date_str:
+                        status = (entry.get("status") or "").lower()
+                        if "early" in status:
+                            self._is_early_close = True
+                            logger.info(f"Early close detected for {date_str}")
+        except Exception as e:
+            logger.debug(f"Early close check failed: {e}")
+
+    def _effective_close(self, et_time: datetime) -> time:
+        """Return the effective regular close time, accounting for early closes."""
+        self._check_early_close(et_time.date().isoformat())
+        return self._early_close_time if self._is_early_close else self.regular_close
 
     def get_current_session(self, dt: Optional[datetime] = None) -> MarketSession:
         """
@@ -103,12 +130,13 @@ class MarketHoursProvider:
         if not self.is_trading_day(et_time):
             return MarketSession.CLOSED
 
-        # Determine session based on time
+        # Determine session based on time (accounting for early close)
+        close = self._effective_close(et_time)
         if current_time >= self.premarket_start and current_time < self.regular_open:
             return MarketSession.PREMARKET
-        elif current_time >= self.regular_open and current_time < self.regular_close:
+        elif current_time >= self.regular_open and current_time < close:
             return MarketSession.REGULAR
-        elif current_time >= self.regular_close and current_time < self.postmarket_end:
+        elif current_time >= close and current_time < self.postmarket_end:
             return MarketSession.POSTMARKET
         else:
             return MarketSession.CLOSED
@@ -170,6 +198,7 @@ class MarketHoursProvider:
 
         session = self.get_current_session(dt)
         et_time = self._to_eastern(dt)
+        close = self._effective_close(et_time)
 
         info = {
             'session': session.value,
@@ -179,10 +208,14 @@ class MarketHoursProvider:
             'exchange': self.exchange,
         }
 
+        if self._is_early_close:
+            info['early_close'] = True
+            info['close_time'] = self._early_close_time.strftime('%H:%M')
+
         # Compute minutes to open / close
         now_minutes = et_time.hour * 60 + et_time.minute
         open_minutes = self.regular_open.hour * 60 + self.regular_open.minute
-        close_minutes = self.regular_close.hour * 60 + self.regular_close.minute
+        close_minutes = close.hour * 60 + close.minute
         if session == MarketSession.PREMARKET:
             info['minutes_to_open'] = open_minutes - now_minutes
         elif session == MarketSession.REGULAR:
@@ -194,7 +227,7 @@ class MarketHoursProvider:
             info['next_transition'] = 'regular_open'
             info['next_transition_time'] = next_open.isoformat()
         elif session == MarketSession.REGULAR:
-            next_close = datetime.combine(et_time.date(), self.regular_close)
+            next_close = datetime.combine(et_time.date(), close)
             info['next_transition'] = 'regular_close'
             info['next_transition_time'] = next_close.isoformat()
         elif session == MarketSession.POSTMARKET:
@@ -220,10 +253,7 @@ class MarketHoursProvider:
             # Combine with premarket start time
             next_open = datetime.combine(next_session, self.premarket_start)
             # Return with ET timezone
-            if self._et_tz is not None:
-                return next_open.replace(tzinfo=self._et_tz)
-            else:
-                return next_open.replace(tzinfo=timezone(timedelta(hours=-5)))
+            return next_open.replace(tzinfo=self._et_tz)
         except Exception as e:
             logger.warning(f"Error getting next market open: {e}")
             return None

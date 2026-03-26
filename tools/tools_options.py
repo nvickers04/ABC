@@ -220,6 +220,32 @@ async def handle_vertical_spread(executor, params: dict) -> Any:
     cash = executor._check_cash(max_debit)
     if cash:
         return cash
+    # ── Riskless spread guard ──────────────────────────────────
+    # IBKR rejects "riskless combination orders" (both strikes deep ITM).
+    # Detect and block before submission to avoid TWS pop-ups.
+    long_f, short_f = float(long_strike), float(short_strike)
+    price = None
+    try:
+        q = executor.data_provider.get_quote(symbol)
+        if q and q.last and q.last > 0:
+            price = q.last
+    except Exception:
+        pass
+    # Fallback: use last daily close when quote is unavailable
+    if price is None:
+        try:
+            candles = executor.data_provider.get_candles(symbol, resolution="D", days_back=3)
+            if candles and len(candles) > 0:
+                price = candles.latest_close
+        except Exception:
+            pass
+    if price and price > 0:
+        buffer = price * 0.02  # 2% buffer
+        if right == 'C' and max(long_f, short_f) < price - buffer:
+            return {"error": f"Both call strikes ({long_f}/{short_f}) are deep ITM (price ~{price:.2f}). IBKR rejects riskless spreads. Choose strikes closer to or above the current price."}
+        if right == 'P' and min(long_f, short_f) > price + buffer:
+            return {"error": f"Both put strikes ({long_f}/{short_f}) are deep ITM (price ~{price:.2f}). IBKR rejects riskless spreads. Choose strikes closer to or below the current price."}
+
     logger.info(f"VERTICAL SPREAD: {symbol} {right} long={long_strike} short={short_strike} exp={expiration} qty={quantity}")
     limit_price = params.get("limit_price")
     result = await executor.gateway.place_vertical_spread(
@@ -697,7 +723,18 @@ async def handle_option_chain(executor, params: dict) -> Any:
     # --- Format output ---
     include_greeks = str(params.get("include_greeks", "false")).lower() in ("true", "1", "yes")
     contracts_out = []
-    for c in chain.contracts[:limit]:
+
+    # If no side filter, balance output: half calls, half puts
+    if not side:
+        calls = [c for c in chain.contracts if c.side == 'call']
+        puts = [c for c in chain.contracts if c.side == 'put']
+        half = max(1, limit // 2)
+        balanced = calls[:half] + puts[:half]
+        source_list = balanced[:limit]
+    else:
+        source_list = chain.contracts[:limit]
+
+    for c in source_list:
         entry = {
             "symbol": c.option_symbol,
             "strike": c.strike,

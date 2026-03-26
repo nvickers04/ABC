@@ -104,8 +104,8 @@ def main():
     parser = argparse.ArgumentParser(description="Grok 4.20 Trader")
     parser.add_argument("--test", action="store_true", help="Test Grok connection")
     parser.add_argument("--verbose", action="store_true", help="Enable DEBUG logging")
-    parser.add_argument("--research", action="store_true",
-                        help="Run research agent alongside trader")
+    parser.add_argument("--no-research", action="store_true",
+                        help="Disable research agent (runs by default)")
     parser.add_argument(
         "--account",
         choices=["paper", "live"],
@@ -133,7 +133,7 @@ def main():
 
     from core.agent import run_agent
 
-    if args.research:
+    if not args.no_research:
         from research.agent import run_research
         print("Research agent running alongside trader\n")
 

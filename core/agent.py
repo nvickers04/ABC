@@ -10,7 +10,6 @@ Grok chains actions until it signals 'done' to refresh context.
 research() is the primary discovery mechanism.
 """
 
-import ast
 import asyncio
 import json
 import logging
@@ -24,6 +23,10 @@ from core.config import (
     CYCLE_SLEEP_SECONDS,
 
     MAX_DAILY_LOSS_PCT,
+    INTRADAY_DRAWDOWN_PCT,
+    EOD_FLATTEN_MINUTES,
+    OPEN_GAP_GUARD_PCT,
+    OPEN_GUARD_DELAY_MINUTES,
     MAX_DAILY_LLM_COST,
     LLM_TEMPERATURE,
     LLM_SEED,
@@ -119,11 +122,7 @@ def _try_repair_json(raw: str) -> list[dict[str, Any]]:
     except Exception:
         pass
 
-    try:
-        obj = ast.literal_eval(text)
-        return [obj] if isinstance(obj, dict) else [i for i in obj if isinstance(i, dict)]
-    except Exception:
-        return []
+    return []
 
 
 def _close_truncated_json(text: str) -> str:
@@ -177,12 +176,8 @@ def _parse_json_objects(raw: str) -> list[dict]:
 
 def _now_et() -> datetime:
     """Current time in US/Eastern."""
-    try:
-        from zoneinfo import ZoneInfo
-        return datetime.now(ZoneInfo("America/New_York"))
-    except Exception:
-        from datetime import timezone, timedelta
-        return datetime.now(timezone(timedelta(hours=-5)))
+    from zoneinfo import ZoneInfo
+    return datetime.now(ZoneInfo("America/New_York"))
 
 
 # ── The Agent ───────────────────────────────────────────────────
@@ -212,9 +207,14 @@ class TradingAgent:
         self._last_cycle_summary = ""
         self._halted = False
         self._start_of_day_cash: Optional[float] = None
+        self._session_high_water: Optional[float] = None  # Peak NLV for drawdown tracking
+        self._gap_guard_until: Optional[datetime] = None   # Delay entries after large gap
+        self._eod_flattened_date: Optional[str] = None     # Track EOD flatten per day
         self._market_snapshots: list[str] = []  # Rolling 5-cycle summaries
         self._research_results: dict[str, dict] = {}  # query -> {summary, ts, session, category, ttl, created}
         self._current_session: str = "unknown"
+        self._daily_review_date: Optional[str] = None  # Track which day we've reviewed
+        self._pre_scan_date: Optional[str] = None  # Track which day we've pre-scanned
 
         logger.info("TradingAgent initialized (minimal ReAct mode)")
 
@@ -285,13 +285,46 @@ class TradingAgent:
         loss_pct = (self._start_of_day_cash - current) / self._start_of_day_cash * 100
         return loss_pct if loss_pct >= MAX_DAILY_LOSS_PCT else None
 
+    def _check_intraday_drawdown(self) -> Optional[float]:
+        """Check peak-to-trough drawdown within current session.
+
+        Tracks the highest NLV seen today. If current NLV drops more than
+        INTRADAY_DRAWDOWN_PCT from the peak, returns the drawdown %.
+        """
+        current = self.gateway.net_liquidation if self.gateway else 0
+        if current <= 0:
+            current = self.gateway.cash_value if self.gateway else 0
+        if current <= 0:
+            return None
+
+        # Update high water mark
+        if self._session_high_water is None or current > self._session_high_water:
+            self._session_high_water = current
+
+        drawdown_pct = (self._session_high_water - current) / self._session_high_water * 100
+        return drawdown_pct if drawdown_pct >= INTRADAY_DRAWDOWN_PCT else None
+
     async def _emergency_flatten(self, reason: str):
         """EMERGENCY: Flatten all positions and halt for the day."""
         logger.critical("=" * 60)
         logger.critical(f"EMERGENCY FLATTEN: {reason}")
         logger.critical("=" * 60)
         if self.gateway:
-            await self.gateway.flatten_all()
+            for attempt in range(3):
+                result = await self.gateway.flatten_all()
+                errors = result.get("errors", [])
+                closed = result.get("positions_closed", 0)
+                total = result.get("positions_total", 0)
+                logger.critical(
+                    f"Flatten attempt {attempt+1}: {closed}/{total} positions closed, "
+                    f"{len(errors)} errors"
+                )
+                if not errors or closed >= total:
+                    break
+                logger.critical(f"Flatten errors: {errors} — retrying in 2s")
+                await asyncio.sleep(2)
+            else:
+                logger.critical("FLATTEN INCOMPLETE after 3 attempts — positions may remain open!")
         self._halted = True
 
     def _check_llm_cost(self) -> bool:
@@ -335,6 +368,22 @@ class TradingAgent:
                 lines.append(f"  Momentum: {env['momentum_regime']}")
                 lines.append(f"  Volume: {env['volume_regime']}")
                 lines.append(f"  Dispersion: {env['dispersion']:.2f}")
+
+                # Check environment staleness — warn if snapshot is old
+                try:
+                    snap_ts = db.execute(
+                        "SELECT ts FROM environment_snapshots ORDER BY id DESC LIMIT 1"
+                    ).fetchone()
+                    if snap_ts and snap_ts["ts"]:
+                        snap_time = datetime.fromisoformat(snap_ts["ts"].replace("Z", "+00:00"))
+                        age_hours = (datetime.now(timezone.utc) - snap_time).total_seconds() / 3600
+                        if age_hours > 4:
+                            lines.append(
+                                f"  ⚠ STALE: last snapshot {age_hours:.0f}h ago — "
+                                f"regime may have shifted. Run research() to refresh."
+                            )
+                except Exception:
+                    pass
 
                 # Strategy fit scores
                 try:
@@ -395,10 +444,35 @@ class TradingAgent:
             ).fetchall()
 
             if live:
+                # Detect conflicting signals: opposing directions on same symbol
+                symbol_signals: dict[str, list] = {}
+                for sig in live:
+                    symbol_signals.setdefault(sig["symbol"], []).append(sig)
+
+                conflicts: set[str] = set()
+                for sym, sigs in symbol_signals.items():
+                    directions = {s["direction"] for s in sigs}
+                    if len(directions) > 1:
+                        conflicts.add(sym)
+
                 lines.append("")
+                if conflicts:
+                    lines.append(f"⚠ SIGNAL CONFLICTS on {len(conflicts)} symbols: {', '.join(sorted(conflicts))}")
+                    lines.append("  Conflicting signals resolved by highest expectancy (shown first).")
+
                 lines.append(f"LIVE SIGNALS ({len(live)} total):")
                 for sig in live[:20]:
                     conf = "HIGH" if (sig["slot_exp"] or 0) > 0.003 else "MED" if (sig["slot_exp"] or 0) > 0 else "LOW"
+
+                    # Mark conflicts
+                    conflict_tag = ""
+                    if sig["symbol"] in conflicts:
+                        # Already sorted by expectancy DESC — first one wins
+                        best = symbol_signals[sig["symbol"]][0]
+                        if sig is best or sig["slot"] == best["slot"]:
+                            conflict_tag = " [CONFLICT-WINNER]"
+                        else:
+                            conflict_tag = " [CONFLICT-SKIP]"
                     rr = ""
                     if sig["entry_price"] and sig["target_price"] and sig["stop_price"]:
                         risk = abs(sig["entry_price"] - sig["stop_price"])
@@ -416,7 +490,7 @@ class TradingAgent:
                         f"  [{conf}] [Slot {sig['slot']:02d}] {sig['symbol']} "
                         f"{sig['direction']} {sig['order_type']} @ {sig['entry_price']:.2f} "
                         f"tgt={sig['target_price']:.2f} stp={sig['stop_price']:.2f}"
-                        f"{rr}{legs} ({sig['setup_type']})"
+                        f"{rr}{legs} ({sig['setup_type']}){conflict_tag}"
                     )
                 if len(live) > 20:
                     lines.append(f"  ... and {len(live) - 20} more")
@@ -512,7 +586,8 @@ class TradingAgent:
                 )
 
             return "\n".join(lines) if len(lines) > 1 else None
-        except Exception:
+        except Exception as e:
+            logger.warning(f"Research briefing failed: {e}")
             return None
 
     def record_trade(self, symbol: str, side: str, pnl: float, held_minutes: int = 0):
@@ -575,6 +650,400 @@ class TradingAgent:
         except Exception as exc:
             logger.debug(f"Failed to emit hypothesis: {exc}")
 
+    async def _run_daily_review(self) -> None:
+        """End-of-day review: aggregate performance, run execution analysis if data threshold met.
+
+        Called once when session transitions to POSTMARKET. Computes execution
+        gaps, triggers execution analysis when enough snapshots exist.
+        """
+        try:
+            from memory import get_db, get_new_snapshot_count
+            db = get_db()
+            today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+
+            # 1. Aggregate today's trade_feedback for execution gap
+            rows = db.execute(
+                """SELECT slot, symbol,
+                          AVG(execution_gap) as avg_gap,
+                          COUNT(*) as n,
+                          SUM(actual_pnl) as total_pnl,
+                          SUM(simulated_return) as total_sim
+                   FROM trade_feedback
+                   WHERE ts >= ? || 'T00:00:00'
+                   GROUP BY slot""",
+                (today,),
+            ).fetchall()
+
+            for r in rows:
+                gap = r["avg_gap"] if r["avg_gap"] else 0
+                if abs(gap) > 0.005:  # >0.5% gap is noteworthy
+                    self._emit_hypothesis(
+                        hypothesis_type="execution_gap",
+                        description=f"Slot {r['slot']} avg execution gap {gap:+.3f} on {r['n']} trades",
+                        suggested_action=f"Factor {gap:+.1%} execution cost into slot {r['slot']} sizing",
+                        priority=4,
+                        related_slot=r["slot"],
+                    )
+
+            today_trades = db.execute(
+                "SELECT COUNT(*) as n, SUM(pnl) as total_pnl FROM trades WHERE ts >= ? || 'T00:00:00'",
+                (today,),
+            ).fetchone()
+            day_trade_count = today_trades["n"] if today_trades and today_trades["n"] else 0
+
+            # 2. Execution analysis: triggered by data threshold
+            new_snaps = get_new_snapshot_count()
+            if new_snaps >= 10:
+                await self._run_execution_analysis()
+
+            # 3. Risk ramp-up evaluation (live mode only: 0.5% → 1.0%)
+            if TRADING_MODE == "live":
+                self._evaluate_risk_ramp(db, today)
+
+            logger.info(f"Daily review complete for {today}: {day_trade_count} trades, {new_snaps} new snapshots")
+        except Exception as e:
+            logger.warning(f"Daily review failed: {e}")
+
+    async def _run_execution_analysis(self) -> None:
+        """Analyze execution snapshots: calibrate simulator slippage, propose graduated params.
+
+        Runs when enough new snapshots have accumulated. Groups filled snapshots
+        by (order_type, time_bucket, atr_bucket) and computes empirical medians.
+        Then asks Grok to review the data and propose execution config changes.
+        """
+        try:
+            import statistics as _stats
+            from memory import (
+                get_db, get_filled_snapshots, get_graduated_params,
+                get_research_config, set_research_config,
+                upsert_calibrated_slippage, insert_graduated_param,
+                validate_param_key, deactivate_graduated_param,
+                get_snapshots_for_param_review,
+            )
+            db = get_db()
+            last_id = int(get_research_config("last_analysis_snapshot_id", 0.0))
+
+            # Get all filled snapshots since last analysis
+            snapshots = get_filled_snapshots(since_id=last_id, limit=500)
+            if len(snapshots) < 5:
+                logger.info(f"Execution analysis: only {len(snapshots)} new snapshots, skipping")
+                return
+
+            # ── 1. Calibrate simulator slippage ──────────────────
+            # Group by (order_type, time_bucket, atr_bucket)
+            from collections import defaultdict
+            groups: dict[tuple[str, str, str], list[float]] = defaultdict(list)
+            # Also collect broad groups for fallbacks
+            by_order_type: dict[str, list[float]] = defaultdict(list)
+
+            for snap in snapshots:
+                slip = snap.get("slippage_bps")
+                if slip is None:
+                    continue
+                ot = snap.get("order_type", "unknown") or "unknown"
+                tb = snap.get("time_bucket", "all") or "all"
+                ab = snap.get("atr_bucket", "all") or "all"
+                groups[(ot, tb, ab)].append(abs(slip))
+                by_order_type[ot].append(abs(slip))
+
+            calibrated_count = 0
+            for (ot, tb, ab), slips in groups.items():
+                if len(slips) < 3:
+                    continue
+                slips.sort()
+                median = _stats.median(slips)
+                p25 = slips[len(slips) // 4] if len(slips) >= 4 else slips[0]
+                p75 = slips[3 * len(slips) // 4] if len(slips) >= 4 else slips[-1]
+                upsert_calibrated_slippage(
+                    order_type=ot, time_bucket=tb, atr_bucket=ab,
+                    median_bps=round(median, 2), sample_count=len(slips),
+                    p25_bps=round(p25, 2), p75_bps=round(p75, 2),
+                )
+                calibrated_count += 1
+
+            # Also store time-bucket calibrations: (ot, tb, "all") — used by simulator
+            by_ot_tb: dict[tuple[str, str], list[float]] = defaultdict(list)
+            for (ot, tb, ab), slips in groups.items():
+                by_ot_tb[(ot, tb)].extend(slips)
+            for (ot, tb), slips in by_ot_tb.items():
+                if len(slips) < 3:
+                    continue
+                slips.sort()
+                median = _stats.median(slips)
+                upsert_calibrated_slippage(
+                    order_type=ot, time_bucket=tb, atr_bucket="all",
+                    median_bps=round(median, 2), sample_count=len(slips),
+                )
+
+            # Also store broad per-order-type calibrations (time_bucket='all', atr_bucket='all')
+            for ot, slips in by_order_type.items():
+                if len(slips) < 3:
+                    continue
+                slips.sort()
+                median = _stats.median(slips)
+                upsert_calibrated_slippage(
+                    order_type=ot, time_bucket="all", atr_bucket="all",
+                    median_bps=round(median, 2), sample_count=len(slips),
+                )
+
+            logger.info(f"Simulator calibration: {calibrated_count} bucket(s) updated from {len(snapshots)} snapshots")
+
+            # ── 1b. Review active graduated params (closed-loop) ─
+            active_params = get_graduated_params(active_only=True)
+            for gp in active_params:
+                review = get_snapshots_for_param_review(gp["id"], gp["ts"])
+                after = review["after"]
+                before = review["before"]
+                if len(after) < 10:
+                    continue  # Not enough post-activation data yet
+                if not before:
+                    continue  # No baseline data — can't judge regression
+                after_median = _stats.median(after)
+                before_median = _stats.median(before)
+                # Deactivate if post-activation slippage is worse (higher) than pre-activation
+                if after_median > before_median * 1.10:
+                    deactivate_graduated_param(
+                        gp["id"],
+                        f"Rolled back: after median {after_median:.1f}bps > before {before_median:.1f}bps "
+                        f"(n_after={len(after)}, n_before={len(before)})"
+                    )
+                    logger.info(
+                        f"Rolled back graduated param {gp['param_key']}: "
+                        f"after={after_median:.1f}bps vs before={before_median:.1f}bps"
+                    )
+
+            # ── 2. Propose graduated params via LLM ──────────────
+            # Build summary stats for the LLM
+            summary_lines = []
+            for (ot, tb, ab), slips in sorted(groups.items(), key=lambda x: -len(x[1])):
+                if len(slips) < 3:
+                    continue
+                median = _stats.median(slips)
+                mean = _stats.mean(slips)
+                summary_lines.append(
+                    f"  {ot} | {tb} | {ab}: n={len(slips)}, "
+                    f"median={median:.1f}bps, mean={mean:.1f}bps, "
+                    f"range=[{min(slips):.1f}, {max(slips):.1f}]"
+                )
+
+            # Get current graduated params for context
+            current_params = get_graduated_params(active_only=True)
+            param_lines = [
+                f"  {p['param_key']} = {p['param_value']} (since {p['ts'][:10]}, {p['improvement_bps']:.1f}bps improvement)"
+                for p in current_params
+            ] if current_params else ["  (none)"]
+
+            if summary_lines:
+                prompt = f"""Execution analysis review. {len(snapshots)} new order executions analyzed.
+
+Slippage by (order_type | time_bucket | atr_bucket):
+{chr(10).join(summary_lines[:20])}
+
+Current graduated parameters:
+{chr(10).join(param_lines)}
+
+Based on this data, propose 0 to 2 execution config changes that would reduce slippage.
+Only propose a change if the evidence is clear (n >= 10 for both comparison groups).
+Changes must be specific and testable, e.g., "use adaptive orders instead of market orders during open for high-ATR stocks".
+
+CRITICAL: param_key MUST use exactly this 4-part dot-separated format:
+  {{order_type}}.{{intent}}.{{time_bucket}}.{{atr_bucket}}
+
+The param_key describes the CONTEXT to match (the CURRENT order type and conditions),
+NOT the new value. The new value goes in param_value.
+Example: to switch from market to adaptive for entries at open with high ATR:
+  param_key: "market.entry.open.high"  (matches current market orders in this context)
+  param_value: "adaptive"  (the replacement order type)
+  previous_value: "market"  (what it replaces)
+
+Valid order_type: market, limit, stop_entry, bracket, trailing_stop, oca_exit, midprice, adaptive, vwap, twap, relative, snap_mid, moc, moo, loc, loo, all
+Valid intent: entry, exit, stop, all
+Valid time_bucket: open, morning, midday, close, extended, all
+Valid atr_bucket: low, medium, high, all
+
+Respond with ONLY a JSON array of objects:
+  "param_key": "order_type.intent.time_bucket.atr_bucket",
+  "param_value": "the new value",
+  "previous_value": "what it replaces or null",
+  "evidence_summary": "brief stats justification",
+  "estimated_improvement_bps": number
+
+If no changes warranted: []"""
+
+                try:
+                    chat = self.grok.client.chat.create(
+                        model=self.grok.model,
+                        messages=[
+                            sdk_system("You are an execution quality analyst. Review slippage data and propose concrete parameter changes. Be conservative — only propose when evidence is strong. Respond ONLY with a JSON array."),
+                            sdk_user(prompt),
+                        ],
+                        temperature=0.3,
+                        max_tokens=1024,
+                    )
+                    response = None
+                    for _api_attempt in range(3):
+                        try:
+                            response = await chat.sample()
+                            break
+                        except Exception as api_err:
+                            if _api_attempt < 2:
+                                await asyncio.sleep(2 ** (_api_attempt + 1))
+                            else:
+                                raise
+
+                    usage = response.usage
+                    self.cost_tracker.log_llm_call(
+                        model=self.grok.model,
+                        tokens_in=usage.prompt_tokens,
+                        tokens_out=usage.completion_tokens,
+                        purpose="execution_analysis",
+                    )
+
+                    raw = response.content or ""
+                    proposals = _parse_json_objects(raw)
+                    if not proposals:
+                        try:
+                            parsed = json.loads(raw.strip())
+                            if isinstance(parsed, list):
+                                proposals = parsed
+                        except Exception:
+                            pass
+                    if len(proposals) == 1 and isinstance(proposals[0], list):
+                        proposals = proposals[0]
+
+                    for prop in proposals[:2]:
+                        if not isinstance(prop, dict) or not prop.get("param_key"):
+                            continue
+                        # Validate param_key against structured schema
+                        key_err = validate_param_key(prop["param_key"])
+                        if key_err:
+                            logger.info(f"Proposal rejected (bad key): {key_err}")
+                            continue
+                        # Validate with Mann-Whitney U test if we have comparison data
+                        p_value = self._test_proposal(prop, groups)
+                        if p_value is not None and p_value < 0.20:
+                            insert_graduated_param(
+                                param_key=prop["param_key"],
+                                param_value=str(prop.get("param_value", "")),
+                                previous_value=prop.get("previous_value"),
+                                evidence_json=json.dumps(prop.get("evidence_summary", "")),
+                                snapshots_analyzed=len(snapshots),
+                                improvement_bps=float(prop.get("estimated_improvement_bps", 0)),
+                                p_value=p_value,
+                            )
+                            logger.info(f"Graduated param: {prop['param_key']} = {prop['param_value']} (p={p_value:.3f})")
+                        else:
+                            logger.info(f"Proposal rejected (p={p_value}): {prop.get('param_key')}")
+
+                except Exception as llm_err:
+                    logger.warning(f"Execution analysis LLM call failed: {llm_err}")
+
+            # Mark analysis as complete up to the latest snapshot
+            max_id = max(s["id"] for s in snapshots)
+            set_research_config("last_analysis_snapshot_id", float(max_id), "execution_analysis_complete")
+            logger.info(f"Execution analysis complete: analyzed {len(snapshots)} snapshots")
+
+        except Exception as e:
+            logger.warning(f"Execution analysis failed: {e}", exc_info=True)
+
+    def _test_proposal(self, proposal: dict, groups: dict) -> float | None:
+        """Run Mann-Whitney U test on a proposal's implied comparison.
+
+        Uses the structured param_key to identify the target bucket group
+        and compares it against all other groups of the same order type.
+        Returns p-value or None if insufficient data.
+        """
+        try:
+            from scipy.stats import mannwhitneyu
+        except ImportError:
+            # scipy not available — reject, can't validate
+            logger.info("scipy not available, cannot validate proposal statistically")
+            return None
+
+        key = proposal.get("param_key", "")
+        parts = key.split(".")
+        if len(parts) != 4:
+            return None
+
+        target_ot, target_intent, target_tb, target_ab = parts
+
+        # Collect the target group's slippage data
+        target_data = []
+        other_data = []
+        for (ot, tb, ab), slips in groups.items():
+            if len(slips) < 3:
+                continue
+            ot_match = (target_ot == "all" or ot == target_ot)
+            tb_match = (target_tb == "all" or tb == target_tb)
+            ab_match = (target_ab == "all" or ab == target_ab)
+            if ot_match and tb_match and ab_match:
+                target_data.extend(slips)
+            elif ot_match:
+                # Same order type but different bucket — use as comparison
+                other_data.extend(slips)
+
+        if len(target_data) >= 5 and len(other_data) >= 5:
+            try:
+                _, p_value = mannwhitneyu(target_data, other_data, alternative='two-sided')
+                return round(p_value, 4)
+            except Exception:
+                pass
+
+        # Not enough data for statistical comparison — reject
+        logger.debug(
+            f"Proposal {key} rejected: insufficient data "
+            f"(target={len(target_data)}, other={len(other_data)}, need 5 each)"
+        )
+        return None
+
+    def _evaluate_risk_ramp(self, db, today: str) -> None:
+        """Check if live trading performance warrants risk ramp-up 0.5% → 1.0%.
+
+        Criteria: 10+ trading days with trades, cumulative P&L > 0, win rate > 45%.
+        """
+        try:
+            from memory import get_research_config, set_research_config
+            if get_research_config("risk_ramp_approved", 0.0) >= 1.0:
+                return  # Already ramped
+
+            # Count trading days with at least 1 trade in last 30 days
+            stats = db.execute(
+                """SELECT COUNT(DISTINCT date(ts)) as trading_days,
+                          COUNT(*) as total_trades,
+                          SUM(pnl) as total_pnl,
+                          SUM(CASE WHEN pnl > 0 THEN 1 ELSE 0 END) as wins
+                   FROM trades
+                   WHERE ts >= date(?, '-30 days') || 'T00:00:00'""",
+                (today,),
+            ).fetchone()
+
+            if not stats or not stats["total_trades"]:
+                return
+
+            trading_days = stats["trading_days"] or 0
+            total_trades = stats["total_trades"] or 0
+            total_pnl = stats["total_pnl"] or 0
+            wins = stats["wins"] or 0
+            win_rate = wins / total_trades if total_trades > 0 else 0
+
+            if trading_days >= 10 and total_pnl > 0 and win_rate > 0.45:
+                set_research_config(
+                    "risk_ramp_approved", 1.0,
+                    f"Auto-approved: {trading_days} days, {total_trades} trades, "
+                    f"P&L=${total_pnl:.2f}, WR={win_rate:.0%}"
+                )
+                logger.info(
+                    f"RISK RAMP-UP APPROVED: {trading_days} days, "
+                    f"{total_trades} trades, P&L=${total_pnl:.2f}, WR={win_rate:.0%} → 1.0%"
+                )
+            else:
+                logger.info(
+                    f"Risk ramp check: {trading_days}/10 days, "
+                    f"P&L=${total_pnl:.2f}, WR={win_rate:.0%} — not yet"
+                )
+        except Exception as e:
+            logger.warning(f"Risk ramp evaluation failed: {e}")
+
     async def _build_state_context(self) -> str:
         """Build the complete dynamic state context for the agent.
 
@@ -598,6 +1067,8 @@ class TradingAgent:
                 detail = f" | Open in {info['minutes_to_open']}min"
             elif "minutes_to_close" in info:
                 detail = f" | Close in {info['minutes_to_close']}min"
+            if info.get("early_close"):
+                detail += f" | ⚠ EARLY CLOSE {info['close_time']} ET"
             lines.append(f"═══ MARKET: {session} ({time_et} ET){detail} ═══")
         except Exception as e:
             lines.append(f"═══ MARKET: UNKNOWN (error: {e}) ═══")
@@ -696,6 +1167,18 @@ class TradingAgent:
         except Exception as e:
             lines.append(f"Order error: {e}")
 
+        # ── Active graduated params (execution research) ────────
+        try:
+            from memory import get_graduated_params
+            params = get_graduated_params(active_only=True)
+            if params:
+                lines.append("")
+                lines.append("═══ EXECUTION OPTIMIZATIONS (auto-graduated) ═══")
+                for p in params[:5]:
+                    lines.append(f"  {p['param_key']} = {p['param_value']} (+{p['improvement_bps']:.1f}bps)")
+        except Exception:
+            pass
+
         return "\n".join(lines)
 
     async def run_cycle(self) -> int:
@@ -716,6 +1199,74 @@ class TradingAgent:
             pass
         self._prune_research_cache(self._current_session)
 
+        # Daily review: run once when session transitions to postmarket
+        if self._current_session == "postmarket":
+            today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+            if self._daily_review_date != today:
+                self._daily_review_date = today
+                await self._run_daily_review()
+
+        # Pre-scan: inject research prompt on first premarket/regular cycle of the day
+        pre_scan_prompt = ""
+        if self._current_session in ("premarket", "regular"):
+            today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+            if self._pre_scan_date != today:
+                self._pre_scan_date = today
+                pre_scan_prompt = (
+                    "\n🔍 PRE-SCAN: New trading day. Before placing any trades, run research() "
+                    "on today's macro outlook (e.g. 'market outlook today earnings economic data') "
+                    "and check economic_calendar(). Review briefing(detail='environment') for regime context. "
+                    "This primes your thesis with fresh data before committing capital.\n"
+                )
+                logger.info("Pre-scan prompt injected for new trading day")
+
+        # Open volatility guard: detect overnight gap and delay entries
+        gap_guard_prompt = ""
+        if self._current_session == "regular":
+            try:
+                if self._gap_guard_until and datetime.now(timezone.utc) < self._gap_guard_until:
+                    mins_left = int((self._gap_guard_until - datetime.now(timezone.utc)).total_seconds() / 60)
+                    gap_guard_prompt = (
+                        f"\n⚠️ GAP GUARD ACTIVE: Large overnight gap detected. "
+                        f"Wait {mins_left} more minutes before new entries. "
+                        f"Manage existing positions only.\n"
+                    )
+                elif self._gap_guard_until is None:
+                    # First regular-session cycle: check for gap
+                    _info_gap = _mh.get_session_info()  # noqa: F841
+                    mins_since_open = _info_gap.get("minutes_to_close")
+                    # Only check gap in first 5 minutes of regular session
+                    if mins_since_open is not None:
+                        total_regular = 390  # minutes in regular session
+                        mins_elapsed = total_regular - mins_since_open
+                        if mins_elapsed <= 5:
+                            try:
+                                dp = get_data_provider()
+                                spy_quote = await dp.get_quote("SPY")
+                                if spy_quote:
+                                    last = spy_quote.get("last", 0) or spy_quote.get("close", 0)
+                                    prev_close = spy_quote.get("previous_close", 0) or spy_quote.get("close", 0)
+                                    if last > 0 and prev_close > 0:
+                                        gap_pct = abs(last - prev_close) / prev_close * 100
+                                        if gap_pct >= OPEN_GAP_GUARD_PCT:
+                                            self._gap_guard_until = (
+                                                datetime.now(timezone.utc)
+                                                + timedelta(minutes=OPEN_GUARD_DELAY_MINUTES)
+                                            )
+                                            gap_guard_prompt = (
+                                                f"\n⚠️ GAP GUARD: SPY gapped {gap_pct:.1f}% overnight. "
+                                                f"Waiting {OPEN_GUARD_DELAY_MINUTES} min before new entries. "
+                                                f"Manage existing positions only.\n"
+                                            )
+                                            logger.warning(f"Gap guard triggered: SPY gap {gap_pct:.1f}%")
+                                        else:
+                                            self._gap_guard_until = datetime.min.replace(tzinfo=timezone.utc)
+                            except Exception as e:
+                                logger.debug(f"Gap guard quote check failed: {e}")
+                                self._gap_guard_until = datetime.min.replace(tzinfo=timezone.utc)
+            except Exception:
+                pass
+
         # Build state context from broker
         state_text = await self._build_state_context()
 
@@ -724,6 +1275,33 @@ class TradingAgent:
         if loss_pct is not None:
             await self._emergency_flatten(f"Daily loss: -{loss_pct:.1f}%")
             return 999999
+
+        # Check intraday drawdown (peak-to-trough)
+        dd_pct = self._check_intraday_drawdown()
+        if dd_pct is not None:
+            await self._emergency_flatten(
+                f"Intraday drawdown: -{dd_pct:.1f}% from session high"
+            )
+            return 999999
+
+        # EOD flatten: close all positions N minutes before market close
+        if self._current_session == "regular":
+            try:
+                _info_eod = _mh.get_session_info()
+                mins_to_close = _info_eod.get("minutes_to_close")
+                today_eod = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+                if (mins_to_close is not None
+                        and mins_to_close <= EOD_FLATTEN_MINUTES
+                        and self._eod_flattened_date != today_eod):
+                    self._eod_flattened_date = today_eod
+                    await self._emergency_flatten(
+                        f"EOD flatten: {mins_to_close} min to close"
+                    )
+                    # Don't halt — just flatten and continue (postmarket may follow)
+                    self._halted = False
+                    return CYCLE_SLEEP_SECONDS
+            except Exception:
+                pass
 
         # Check LLM cost
         if self._check_llm_cost():
@@ -746,10 +1324,12 @@ class TradingAgent:
         if self._market_snapshots:
             continuity += "RECENT SNAPSHOTS:\n" + "\n".join(self._market_snapshots[-5:]) + "\n"
 
+        from zoneinfo import ZoneInfo
+        _et_now = datetime.now(ZoneInfo("America/New_York"))
         context = f"""{state_text}
 {cost_line}
-Time: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
-{continuity}
+Time: {_et_now.strftime('%Y-%m-%d %H:%M:%S')} ET
+{continuity}{pre_scan_prompt}{gap_guard_prompt}
 Account state above. Start by calling briefing() to assess research status."""
 
         # ── Build xAI SDK chat instance ─────────────────────────
@@ -781,7 +1361,19 @@ Account state above. Start by calling briefing() to assess research status."""
             logger.info(f"Cycle {self._cycle_id} turn {turn}")
 
             try:
-                response = await chat.sample()
+                # Retry Grok API with exponential backoff
+                response = None
+                for _api_attempt in range(3):
+                    try:
+                        response = await chat.sample()
+                        break
+                    except Exception as api_err:
+                        if _api_attempt < 2:
+                            wait = 2 ** (_api_attempt + 1)  # 2s, 4s
+                            logger.warning(f"Grok API error (attempt {_api_attempt+1}/3): {api_err} — retrying in {wait}s")
+                            await asyncio.sleep(wait)
+                        else:
+                            raise  # Last attempt, propagate
 
                 raw = response.content
 
@@ -922,15 +1514,20 @@ async def run_agent():
         logger.info(">>> AGGRESSIVE PAPER MODE — stress testing complex orders <<<")
     logger.info("=" * 60)
 
-    # Connect broker
-    try:
-        gateway = await create_gateway({})
-    except BrokerConfigError as e:
-        logger.error(f"Broker config error: {e}")
-        return
-    except ConnectionError as e:
-        logger.error(f"Broker connection failed: {e}")
-        return
+    # Connect broker (retry with backoff)
+    gateway = None
+    for _conn_attempt in range(5):
+        try:
+            gateway = await create_gateway({})
+            break
+        except (BrokerConfigError, ConnectionError) as e:
+            if _conn_attempt < 4:
+                wait = 2 ** (_conn_attempt + 1)  # 2, 4, 8, 16s
+                logger.warning(f"Broker connect attempt {_conn_attempt+1}/5 failed: {e} — retrying in {wait}s")
+                await asyncio.sleep(wait)
+            else:
+                logger.error(f"Broker connection failed after 5 attempts: {e}")
+                return
 
     # Build tools and agent
     data_provider = get_data_provider()
@@ -952,52 +1549,59 @@ async def run_agent():
 
     # ── Main loop ───────────────────────────────────────────────
     cycle = 0
-    while True:
-        if agent._halted:
-            logger.critical("AGENT HALTED — waiting for market close")
-            await asyncio.sleep(300)
+    try:
+        while True:
+            if agent._halted:
+                logger.critical("AGENT HALTED — waiting for market close")
+                await asyncio.sleep(300)
+                try:
+                    mh = get_market_hours_provider()
+                    info = mh.get_session_info()
+                    if info.get("session") == "closed":
+                        break
+                except Exception:
+                    pass
+                continue
+
+            if agent._start_of_day_cash is None:
+                agent._capture_start_of_day_cash()
+
+            # No auto-shutdown — Grok decides hold time (overnight OK)
+            # Only halt if agent is explicitly halted (daily loss, LLM cost)
             try:
                 mh = get_market_hours_provider()
                 info = mh.get_session_info()
-                if info.get("session") == "closed":
-                    break
+                session = info.get("session", "")
+                # Log session state but DO NOT force shutdown
+                if session == "closed":
+                    now_et = _now_et()
+                    if now_et.hour >= 20:  # After 8 PM ET, go to sleep mode
+                        logger.info("Market closed, extended hours over — sleeping 30 min")
+                        await asyncio.sleep(1800)
+                        continue
             except Exception:
                 pass
-            continue
 
-        if agent._start_of_day_cash is None:
-            agent._capture_start_of_day_cash()
+            cycle += 1
+            logger.info(f"{'='*40} CYCLE {cycle} {'='*40}")
 
-        # No auto-shutdown — Grok decides hold time (overnight OK)
-        # Only halt if agent is explicitly halted (daily loss, LLM cost)
-        try:
-            mh = get_market_hours_provider()
-            info = mh.get_session_info()
-            session = info.get("session", "")
-            # Log session state but DO NOT force shutdown
-            if session == "closed":
-                now_et = _now_et()
-                if now_et.hour >= 20:  # After 8 PM ET, go to sleep mode
-                    logger.info("Market closed, extended hours over — sleeping 30 min")
-                    await asyncio.sleep(1800)
-                    continue
-        except Exception:
-            pass
+            try:
+                wait_seconds = await agent.run_cycle()
+                logger.info(f"Cooldown: {wait_seconds}s")
+                await asyncio.sleep(wait_seconds)
 
-        cycle += 1
-        logger.info(f"{'='*40} CYCLE {cycle} {'='*40}")
-
-        try:
-            wait_seconds = await agent.run_cycle()
-            logger.info(f"Cooldown: {wait_seconds}s")
-            await asyncio.sleep(wait_seconds)
-
-        except KeyboardInterrupt:
-            logger.info("Shutting down...")
-            break
-        except Exception as e:
-            logger.error(f"Cycle error: {e}", exc_info=True)
-            await asyncio.sleep(30)
+            except KeyboardInterrupt:
+                logger.info("Shutting down...")
+                break
+            except Exception as e:
+                logger.error(f"Cycle error: {e}", exc_info=True)
+                await asyncio.sleep(30)
+    finally:
+        if gateway:
+            try:
+                await gateway.disconnect()
+            except Exception:
+                pass
 
 
 if __name__ == "__main__":

@@ -243,8 +243,8 @@ async def handle_instrument_selector(executor, params: dict) -> Any:
             if q and q.last:
                 context["price"] = q.last
                 context["change_pct"] = q.change_pct
-        except Exception:
-            pass
+        except Exception as e:
+            logger.debug(f"Quote lookup failed for {symbol}: {e}")
         try:
             iv_dte_min = params.get("iv_dte_min")
             iv_dte_max = params.get("iv_dte_max")
@@ -259,14 +259,14 @@ async def handle_instrument_selector(executor, params: dict) -> Any:
                 if iv:
                     context["iv_current"] = iv.iv_current
                     context["iv_rank"] = iv.iv_rank
-        except Exception:
-            pass
+        except Exception as e:
+            logger.debug(f"IV info lookup failed for {symbol}: {e}")
         try:
             atr = executor.data_provider.get_atr(symbol)
             if atr:
                 context["atr_pct"] = round(atr.value / context.get("price", 1) * 100, 1) if context.get("price") else None
-        except Exception:
-            pass
+        except Exception as e:
+            logger.debug(f"ATR lookup failed for {symbol}: {e}")
 
     # Get regime for context (simplified — no LiveState regime tracker)
     regime_label = None

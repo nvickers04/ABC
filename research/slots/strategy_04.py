@@ -1,26 +1,26 @@
 """
-Slot 04 — Regime-Gated Bearish-Skew Iron Condor (Blacklist + Tighter Filters)
+Slot 04 — Regime-Gated Bearish-Skew Iron Condor (Tighter Upside + Dynamic ROC + More Samples)
 
 Mandate: bearish / neutral / options_premium
 Allowed order_types: butterfly, iron_condor, straddle, strangle
 
-Adapted to CURRENT environment: Volatility=high (ATR 5.15%), Trend=down,
-Breadth=bearish (A/D -0.56), Momentum=decelerating (-2.22), Volume=normal.
-Short-premium fit 0.65. 
+Adapted to CURRENT environment: Volatility=high (ATR 5.02%), Trend=down,
+Breadth=bearish (A/D -0.54), Momentum=decelerating (-2.18), Volume=normal,
+Dispersion=11.02. Short-premium fit 0.65.
 
 Core logic:
-- Hard regime gate for bearish breadth + down trend only
-- Blacklist momentum-explosion names (PLTR, AFRM, ROKU, APP, DUOL) that caused
-  the largest losers in prior versions
+- Hard regime gate for bearish breadth + down trend + high vol only
+- Removed static symbol blacklist; now relies on dynamic ROC <= -0.010
 - Price below SMA50 respects bearish backdrop
-- Tighter momentum filter: clear negative drift (roc <= -0.008)
-- Realized-range vs ATR filter (kept at 1.8× for signal count)
-- Dynamic downside-skewed iron condor: tighter call wing in extreme vol
+- ROC threshold tightened to -0.010 to filter weak momentum
+- Realized-range vs ATR filter loosened (2.1×) to increase sample size
+- Dynamic downside-skewed iron condor: tighter call wing (0.009-0.012)
 - Strikes percentage-based then rounded to realistic increments
-- Moderate entry window (bar 30+) + SIGNAL_INTERVAL=10
-- Tighter volatility-scaled exits (stop 0.50×) and reduced max hold (40 bars)
-  for high-vol regime to protect theta and limit large losers
-- Dispersion gate (<13) to avoid high-chaos days
+- Earlier entry window (bar 25+) + SIGNAL_INTERVAL=5 for more signals
+- Tighter volatility-scaled stop (0.35×) and reduced max hold (25 bars)
+  for high-vol regime to limit gamma risk on upside spikes
+- Dispersion gate (<12.5) and volatility regime gate
+- Target biased mildly lower to align with 67% down-trending symbols
 """
 
 import pandas as pd
@@ -30,10 +30,9 @@ ATR_PERIOD = 14
 SMA_PERIOD = 50
 ROC_BARS = 5
 RANGE_BARS = 25
-MIN_BAR = 30
-MAX_HOLD_BARS = 40
-SIGNAL_INTERVAL = 10
-BAD_MOMENTUM_SYMBOLS = {"PLTR", "AFRM", "ROKU", "APP", "DUOL"}
+MIN_BAR = 25
+MAX_HOLD_BARS = 25
+SIGNAL_INTERVAL = 5
 
 
 def _atr(candles: pd.DataFrame, period: int) -> pd.Series:
@@ -62,17 +61,16 @@ def scan(candles: pd.DataFrame, symbol: str, env: dict = None) -> list[dict]:
     if env is not None:
         breadth_regime = env.get("breadth_regime", "")
         trend_regime = env.get("trend_regime", "")
+        volatility_regime = env.get("volatility_regime", "")
         if breadth_regime != "bearish" or trend_regime != "down":
             return []
-        
-        # Avoid high-chaos days per analysis
-        dispersion = env.get("dispersion", 11.0)
-        if dispersion > 13.0:
+        if volatility_regime != "high":
             return []
-
-    # Skip known momentum names that explode against short calls
-    if symbol in BAD_MOMENTUM_SYMBOLS:
-        return []
+        
+        # Avoid high-chaos days
+        dispersion = env.get("dispersion", 11.0)
+        if dispersion > 12.5:
+            return []
 
     signals = []
     close = candles["close"]
@@ -94,41 +92,42 @@ def scan(candles: pd.DataFrame, symbol: str, env: dict = None) -> list[dict]:
         if price >= sma50.iloc[i]:
             continue
 
-        # Tighter momentum filter for decelerating bearish regime
-        if roc.iloc[i] > -0.008:
+        # Dynamic momentum filter for decelerating bearish regime
+        if roc.iloc[i] > -0.010:
             continue
 
         # Realized range filter — prefer periods not excessively stretched
         start = max(0, i - RANGE_BARS)
         recent_range = float(high.iloc[start:i+1].max() - low.iloc[start:i+1].min())
-        expected_range = a * np.sqrt(RANGE_BARS) * 1.8
+        expected_range = a * np.sqrt(RANGE_BARS) * 2.1
         if recent_range > expected_range:
             continue
 
         # Dynamic skew based on realized volatility (tighter call wing in high vol)
         vol_pct = a / price if price > 0 else 0
         if vol_pct > 0.045:
-            call_mult = 0.012
+            call_mult = 0.009
             put_mult = 0.060
         else:
-            call_mult = 0.015
+            call_mult = 0.012
             put_mult = 0.055
-        wing_width = 0.019 * price
+        wing_width = 0.021 * price
 
         short_call = _round_strike(price + call_mult * price)
         long_call = _round_strike(short_call + wing_width)
         short_put = _round_strike(price - put_mult * price)
         long_put = _round_strike(short_put - wing_width)
 
-        # Avoid degenerate strikes
+        # Avoid degenerate or too-narrow strikes
         if (short_call <= price or short_put >= price or 
-            long_call <= short_call or long_put >= short_put):
+            long_call <= short_call or long_put >= short_put or
+            (long_call - short_call) < 0.5 or (short_put - long_put) < 0.5):
             continue
 
         # Tighter volatility-scaled exits for high-ATR regime
-        vol_move = 1.0 * a * np.sqrt(20)
+        vol_move = 1.0 * a * np.sqrt(18)
         target_price = price - 0.55 * vol_move
-        stop_price = price + 0.50 * vol_move
+        stop_price = price + 0.35 * vol_move
 
         signals.append({
             "entry_bar": i,
@@ -138,7 +137,7 @@ def scan(candles: pd.DataFrame, symbol: str, env: dict = None) -> list[dict]:
             "target_price": float(target_price),
             "stop_price": float(stop_price),
             "max_hold_bars": MAX_HOLD_BARS,
-            "setup_type": "regime_gated_bearish_skew_iron_condor",
+            "setup_type": "regime_gated_bearish_skew_iron_condor_v2",
             "legs_json": {
                 "strategy": "iron_condor",
                 "expiration": "nearest_weekly",

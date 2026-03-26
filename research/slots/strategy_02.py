@@ -2,37 +2,49 @@
 Slot 02 — Short Stock Bracket (Bearish regime)
 
 Mandate: bearish / short / stock_bracket
-Allowed order_types: bracket, trailing_stop_exit, oca_exit, limit
+Allowed order_types: bracket, limit, oca_exit, trailing_stop_exit
 
-Short breakdown with bracket order risk management. Enters short on limit
-when price rejects resistance and falls below EMA21. Bracket wraps the
-entry with a defined stop-loss above the rejection high and trailing
-profit target.
+Adapted for CURRENT MARKET ENVIRONMENT: high volatility (ATR 5.15%), 
+down-trend (68% trending down, 77% trend confidence), bearish breadth 
+(A/D = -0.56), decelerating momentum (-2.22), normal volume (0.97x).
 
-Core logic:
-- Price must be below VWAP and EMA50 (bearish context)
-- EMA21 cross-down on elevated volume (1.5x avg)
-- RSI(14) < 45 confirms weakness
-- Bracket order: entry at close, stop above recent swing high, target 2.0 ATR
-- Morning/midday entries only (before bar 200)
+Leans into momentum_breakout (0.85 fit) + vwap (0.80 fit) while 
+staying strictly inside the short-bracket mandate.
+
+Core logic (addressing prior failures: regime-mismatched entries, 
+inverted R:R in high-vol, stops getting wicked, targets never reached, 
+timeout bleed, weak confirmation, low confidence):
+- Hard regime gate using env (only trade on down + bearish breadth days)
+- Strong bearish structure: below VWAP + EMA50 with declining EMA50 slope
+- Momentum breakdown: red bar + new 10-bar close low + negative 5-bar mom
+- Volume expansion (1.7× 20-bar avg, tuned for normal-volume regime)
+- RSI(14) < 40 confirms weakness
+- Bracket tuned for high-vol regime: stop 1.6×ATR above entry 
+  (wide enough to survive 5%+ ATR wicks), realistic target 0.85×ATR below
+- Recent swing-high buffer on stop (20-bar lookback)
+- Strictly morning-to-midday entries only (bars 40-180)
+- Reduced max hold (28 bars) to limit timeout decay
+- Setup reflects vwap_momentum_breakdown_short for interpretability
 """
 
 import pandas as pd
 import numpy as np
 
 
-MAX_HOLD_BARS = 45
-MIN_BAR = 55
-VOL_MULT = 1.5
+MAX_HOLD_BARS = 28
+MIN_BAR = 40
+VOL_MULT = 1.7
 EMA_SHORT = 21
 EMA_LONG = 50
 RSI_PERIOD = 14
 ATR_PERIOD = 14
-STOP_ATR_MULT = 0.9
-TARGET_ATR_MULT = 2.0
-MAX_ENTRY_BAR = 200
-SWING_LOOKBACK = 15
-RSI_MAX = 45.0
+STOP_ATR_MULT = 1.6
+TARGET_ATR_MULT = 0.85
+MAX_ENTRY_BAR = 180
+SWING_LOOKBACK = 20
+RSI_MAX = 40.0
+LOW_LOOKBACK = 10
+MOM_PERIOD = 5
 
 
 def _atr(candles: pd.DataFrame, period: int) -> pd.Series:
@@ -55,6 +67,13 @@ def scan(candles: pd.DataFrame, symbol: str, env: dict = None) -> list[dict]:
     if len(candles) < MIN_BAR + 30:
         return []
 
+    # Hard regime gate - only trade in the current bearish environment
+    if env is not None:
+        if env.get("trend_regime") != "down" or env.get("breadth_regime") != "bearish":
+            return []
+        if env.get("volatility_regime") not in (None, "high"):
+            return []
+
     signals = []
     ema21 = candles["close"].ewm(span=EMA_SHORT, adjust=False).mean()
     ema50 = candles["close"].ewm(span=EMA_LONG, adjust=False).mean()
@@ -74,26 +93,44 @@ def scan(candles: pd.DataFrame, symbol: str, env: dict = None) -> list[dict]:
             continue
 
         price = candles["close"].iloc[i]
-        prev_price = candles["close"].iloc[i - 1]
         a = atr.iloc[i]
 
-        # Bearish context: below VWAP and EMA50
+        # Bearish structure
         if price >= vwap.iloc[i] or price >= ema50.iloc[i]:
             continue
-        # EMA21 cross-down
-        if not (prev_price >= ema21.iloc[i - 1] and price < ema21.iloc[i]):
+
+        # Declining EMA50 slope (bearish regime confirmation)
+        if i > 5 and ema50.iloc[i] >= ema50.iloc[i - 5]:
             continue
+
+        # Momentum breakdown: new 10-bar close low
+        prev_min_close = candles["close"].iloc[max(0, i - LOW_LOOKBACK):i].min()
+        if price >= prev_min_close:
+            continue
+
+        # Red bar (bearish candle)
+        if candles["close"].iloc[i] >= candles["open"].iloc[i]:
+            continue
+
+        # Short-term negative momentum
+        if i > MOM_PERIOD and (price >= candles["close"].iloc[i - MOM_PERIOD]):
+            continue
+
         # RSI weakness
         if rsi.iloc[i] >= RSI_MAX:
             continue
+
         # Volume confirmation
         if candles["volume"].iloc[i] < vol_avg.iloc[i] * VOL_MULT:
             continue
 
-        # Bracket: stop above recent swing high
+        # Bracket levels tuned for high-vol regime (small realistic moves)
         swing_high = candles["high"].iloc[max(0, i - SWING_LOOKBACK):i + 1].max()
         stop = max(price + STOP_ATR_MULT * a, swing_high + 0.05 * a)
         target = price - TARGET_ATR_MULT * a
+
+        if stop <= price or target >= price:
+            continue
 
         signals.append({
             "entry_bar": i,
@@ -103,7 +140,7 @@ def scan(candles: pd.DataFrame, symbol: str, env: dict = None) -> list[dict]:
             "target_price": target,
             "stop_price": stop,
             "max_hold_bars": MAX_HOLD_BARS,
-            "setup_type": "bearish_bracket_short",
+            "setup_type": "vwap_momentum_breakdown_short",
             "legs_json": None,
         })
 

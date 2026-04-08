@@ -497,6 +497,121 @@ def get_execution_cost(symbol: str | None = None, slot: int | None = None) -> di
 
 
 # ═══════════════════════════════════════════════════════════════
+# TRADE RECORDING (for fitness feedback loop)
+# ═══════════════════════════════════════════════════════════════
+
+def record_trade(
+    symbol: str,
+    side: str,
+    pnl: float,
+    held_minutes: int = 0,
+    signal_id: int | None = None,
+) -> int | None:
+    """Record a closed trade into the trades table.
+
+    This feeds the research feedback loop: _match_trades_to_signals() in the
+    research agent matches these rows to live_signals by symbol + time
+    proximity, then writes trade_feedback rows that penalize slot fitness
+    via _execution_gap_penalty().
+
+    Returns the trade row id, or None on failure.
+    """
+    try:
+        db = get_db()
+        cur = db.execute(
+            """INSERT INTO trades (ts, symbol, side, pnl, signal_id, held_minutes)
+               VALUES (?, ?, ?, ?, ?, ?)""",
+            (
+                datetime.now(timezone.utc).isoformat(),
+                symbol.upper(),
+                side,
+                round(pnl, 2),
+                signal_id,
+                held_minutes,
+            ),
+        )
+        db.commit()
+        trade_id = cur.lastrowid
+        logger.info(f"Trade recorded: {symbol} {side} pnl=${pnl:.2f} id={trade_id}")
+
+        # Immediately try to match this trade to a signal for feedback
+        try:
+            _match_trade_to_signal(db, trade_id, symbol)
+        except Exception as match_err:
+            logger.debug(f"Trade-signal matching failed: {match_err}")
+
+        return trade_id
+    except Exception as e:
+        logger.warning(f"Failed to record trade: {e}")
+        return None
+
+
+def _match_trade_to_signal(db, trade_id: int, symbol: str) -> None:
+    """Match a single trade to the closest live_signal by symbol + time proximity.
+
+    Writes to trade_feedback table, which feeds _execution_gap_penalty() in
+    the research agent to penalize slot fitness when real execution
+    underperforms simulation.
+    """
+    trade = db.execute(
+        "SELECT id, symbol, side, pnl, ts FROM trades WHERE id = ?",
+        (trade_id,),
+    ).fetchone()
+    if not trade:
+        return
+
+    signal = db.execute(
+        """SELECT ls.id, ls.slot, ls.direction, ls.entry_price,
+                  s.return_pct as sim_return, s.strategy_id
+           FROM live_signals ls
+           LEFT JOIN signals s ON s.strategy_id = ls.strategy_id
+               AND s.symbol = ls.symbol
+           WHERE ls.symbol = ?
+             AND ABS(julianday(ls.ts) - julianday(?)) < 7.0
+           ORDER BY ABS(julianday(ls.ts) - julianday(?)) ASC
+           LIMIT 1""",
+        (symbol.upper(), trade["ts"], trade["ts"]),
+    ).fetchone()
+
+    if not signal:
+        logger.debug(f"No matching signal for trade {trade_id} ({symbol})")
+        return
+
+    sim_return = signal["sim_return"] or 0
+    actual_pnl = trade["pnl"] or 0
+    entry_price = signal["entry_price"]
+
+    if entry_price and entry_price > 0:
+        actual_return_pct = (actual_pnl / entry_price) * 100
+        execution_gap = actual_return_pct - sim_return
+    else:
+        execution_gap = None
+
+    db.execute(
+        """INSERT INTO trade_feedback
+           (ts, trade_id, signal_id, slot, simulated_return,
+            actual_pnl, execution_gap, symbol)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+        (
+            datetime.now(timezone.utc).isoformat(),
+            trade_id,
+            signal["id"],
+            signal["slot"],
+            sim_return,
+            actual_pnl,
+            execution_gap,
+            symbol.upper(),
+        ),
+    )
+    db.commit()
+    gap_str = f"{execution_gap:.2f}%" if execution_gap is not None else "unknown"
+    logger.info(
+        f"Trade feedback: trade {trade_id} -> signal {signal['id']} "
+        f"slot={signal['slot']} gap={gap_str}"
+    )
+
+
+# ═══════════════════════════════════════════════════════════════
 # EXECUTION AUTORESEARCH
 # ═══════════════════════════════════════════════════════════════
 

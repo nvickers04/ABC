@@ -173,12 +173,16 @@ class IBKROptionsMixin:
         limit_price: Optional[float],
         strategy_name: str,
     ) -> Dict[str, Any]:
-        """Fallback: place combo legs as individual orders when combo is rejected."""
+        """Place combo legs as individual orders (always used — combos disabled).
+        
+        The leg actions (BUY/SELL) are already correct for individual placement.
+        Do NOT reverse based on combo_action — that reversal only applied to
+        IBKR combo orders where 'SELL combo' means reverse all legs internally.
+        """
         order_ids = []
         errors = []
         for strike, right, leg_action, ratio in strikes_rights_actions:
-            # For SELL combos (credit spreads), reverse the leg actions
-            final_action = leg_action if combo_action == 'BUY' else ('SELL' if leg_action == 'BUY' else 'BUY')
+            final_action = leg_action
             try:
                 result = await self._place_single_option(
                     symbol, expiration, strike, right,

@@ -99,6 +99,7 @@ jade_lizard: {symbol, expiration, put_strike, call_short_strike, call_long_strik
 
 === OPTIONS - MANAGEMENT ===
 close_option: {symbol, expiration, strike, right, limit_price?} -> auto-midpoint if no limit_price
+close_spread: {symbol} -> closes ALL option legs for a symbol at once (both sides of a spread)
 roll_option: {symbol, old_expiration, old_strike, new_expiration, new_strike, right, quantity?=1}
 option_chain: {symbol, expiration?='YYYY-MM-DD', side?='call'|'put', dte_min?, dte_max?, strike_min?, strike_max?, limit?=20, date?='YYYY-MM-DD'} -> contracts with Greeks; add 'date' for historical snapshot (back to 2005)
 option_quote: {option_symbol, date?='YYYY-MM-DD', from_date?='YYYY-MM-DD', to_date?='YYYY-MM-DD'} -> single contract quote; add date for historical, from_date+to_date for daily series
@@ -331,7 +332,7 @@ _ORDER_ACTIONS = {
     "buy_option", "covered_call", "cash_secured_put", "protective_put",
     "vertical_spread", "iron_condor", "iron_butterfly", "straddle",
     "strangle", "collar", "calendar_spread", "diagonal_spread",
-    "butterfly", "ratio_spread", "jade_lizard", "close_option", "roll_option",
+    "butterfly", "ratio_spread", "jade_lizard", "close_option", "close_spread", "roll_option",
     "plan_order", "enter_option", "multi_leg",
 }
 
@@ -463,6 +464,7 @@ class ToolExecutor:
         "collar", "calendar_spread", "diagonal_spread", "butterfly",
         "ratio_spread", "jade_lizard", "multi_leg", "enter_option",
         "option_chain", "option_greeks", "option_quote", "position_greeks",
+        "close_spread",
         # Position management tools — these modify/protect existing positions,
         # never open naked shorts. Trailing stops and OCA always need an existing position.
         "trailing_stop", "trailing_stop_limit", "oca_order",
@@ -1749,7 +1751,7 @@ class ToolExecutor:
         # Exempt: position-management actions (need to close/modify any held position),
         # account tools, meta tools, and anything without a symbol param.
         _UNIVERSE_EXEMPT = {
-            "close_option", "roll_option", "close_position", "cancel_order",
+            "close_option", "close_spread", "roll_option", "close_position", "cancel_order",
             "cancel_stops", "flatten_limits", "modify_stop", "trailing_stop",
             "stop_order", "stop_limit",  # protective exits on existing positions
         }

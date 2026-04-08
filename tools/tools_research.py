@@ -606,10 +606,12 @@ def _briefing_summary(data: dict) -> dict:
         "regime_signals": len(regime_signals),
         "ACTION_REQUIRED": actionable,
         "instruction": (
-            "Execute these signals. For 'short' direction: use bear put spreads or buy puts. "
-            "For 'neutral' iron_condor: call iron_condor() with legs. "
-            "For 'long': use bull call spreads or buy stock. "
-            "Call option_chain(symbol) first for valid expirations, then execute."
+            "ADAPT these signals to CURRENT prices — do NOT skip because entry_price is stale. "
+            "The signal gives you direction + strategy type. Build the trade at today's price. "
+            "For 'short': bear put spread around current price (buy ATM put, sell 1-ATR OTM put). "
+            "For 'neutral' iron_condor: build around current price (short strikes ~0.5 ATR out, wings ~1 ATR). "
+            "For 'long': bull call spread or buy stock. "
+            "Call option_chain(symbol, side='put') or side='call', then EXECUTE. Do not wait for perfect levels."
         ),
         "feedback": fb_line,
     }

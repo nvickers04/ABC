@@ -1531,6 +1531,7 @@ async def _run_slot(
 
     # Gather live-trading hypotheses so the LLM can address real execution gaps
     hypothesis_text = ""
+    _consumed_hyps = []
     try:
         from memory import get_open_hypotheses
         open_hyps = get_open_hypotheses(slot=slot, limit=5)
@@ -1541,6 +1542,7 @@ async def _run_slot(
                     f"  [{h['hypothesis_type']}] {h['description']} "
                     f"→ {h['suggested_action'] or 'no action suggested'}"
                 )
+                _consumed_hyps.append(h)
             hypothesis_text = (
                 "\n\nLIVE TRADING FEEDBACK (from real execution):\n"
                 + "\n".join(hyp_lines)
@@ -1752,6 +1754,16 @@ async def _run_slot(
         state["last_total_signals"] = new_train_agg.get("total_signals", 0)
         state["last_kept"] = True
         state["last_rejection_reasons"] = []
+
+        # Mark consumed hypotheses as incorporated now that the strategy was kept
+        if _consumed_hyps:
+            try:
+                from memory import mark_hypothesis_incorporated
+                for h in _consumed_hyps:
+                    mark_hypothesis_incorporated(h["hypothesis_type"], h["description"])
+                logger.info(f"[Slot {slot:02d}] Marked {len(_consumed_hyps)} hypotheses as incorporated")
+            except Exception as _mark_err:
+                logger.debug(f"[Slot {slot:02d}] Failed to mark hypotheses: {_mark_err}")
     else:
         reasons = []
         if mandate_blocked:

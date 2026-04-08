@@ -592,17 +592,8 @@ class TradingAgent:
 
     def record_trade(self, symbol: str, side: str, pnl: float, held_minutes: int = 0):
         """Record a closed trade into the research memory DB."""
-        try:
-            from memory import get_db
-            db = get_db()
-            db.execute(
-                """INSERT INTO trades (ts, symbol, side, pnl, held_minutes)
-                   VALUES (?, ?, ?, ?, ?)""",
-                (datetime.now(timezone.utc).isoformat(), symbol, side, pnl, held_minutes),
-            )
-            db.commit()
-        except Exception as e:
-            logger.debug(f"Failed to record trade: {e}")
+        from memory import record_trade
+        record_trade(symbol, side, pnl, held_minutes)
 
     def _emit_hypothesis(
         self,

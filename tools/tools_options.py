@@ -216,6 +216,28 @@ async def handle_vertical_spread(executor, params: dict) -> Any:
     pdt = executor._check_pdt('BUY')
     if pdt:
         return pdt
+    # ── Duplicate position guard ───────────────────────────────
+    # Block opening another spread on a symbol where we already hold option positions.
+    # To close an existing spread, use close_option on each leg instead.
+    try:
+        positions = await executor.gateway.get_positions()
+        existing_opts = [p for p in positions
+                         if p.get("symbol", "").upper() == symbol.upper()
+                         and p.get("sec_type") == "OPT"]
+        if existing_opts:
+            legs_desc = ", ".join(
+                f"{p.get('quantity')}x {p.get('strike')}{p.get('right')} exp={p.get('expiration')}"
+                for p in existing_opts
+            )
+            return {
+                "error": f"DUPLICATE BLOCKED: You already have option positions on {symbol}: "
+                         f"[{legs_desc}]. To CLOSE a spread, use close_option on each leg "
+                         f"(e.g. close_option symbol={symbol} strike=X right=P expiration=YYYYMMDD). "
+                         f"Do NOT open another spread on the same symbol."
+            }
+    except Exception as e:
+        logger.warning(f"Position check failed for {symbol}: {e}")
+
     max_debit = abs(float(long_strike) - float(short_strike)) * 100 * int(quantity)
     cash = executor._check_cash(max_debit)
     if cash:
@@ -540,9 +562,19 @@ async def handle_close_option(executor, params: dict) -> Any:
     if not all([symbol, expiration, strike, right]):
         return {"error": "Required: symbol, expiration, strike, right"}
     
-    # Warn if this leg belongs to a spread (spread tracking removed with LiveState)
-    # With no spread registry, we skip the orphan-leg warning.
-    # The agent should still manage spreads carefully.
+    # Snapshot unrealized P&L before closing for trade feedback
+    pre_close_pnl = None
+    try:
+        positions = await executor.gateway.get_positions()
+        for p in positions:
+            if (p.get("symbol", "").upper() == symbol.upper()
+                    and p.get("sec_type") == "OPT"
+                    and abs(float(p.get("strike", 0)) - float(strike)) < 0.01
+                    and p.get("right") == right.upper()):
+                pre_close_pnl = p.get("unrealized_pnl", 0) or 0
+                break
+    except Exception:
+        pass
     
     logger.info(f"CLOSE OPTION: {symbol} {right}{strike} exp={expiration} limit={limit_price}")
     result = await executor.gateway.close_option_position(
@@ -550,8 +582,80 @@ async def handle_close_option(executor, params: dict) -> Any:
         limit_price=float(limit_price) if limit_price else None
     )
     logger.info(f"CLOSE OPTION RESULT: {symbol} -> {result}")
+
+    # Record trade for fitness feedback loop
+    if isinstance(result, dict) and result.get("success") and pre_close_pnl is not None:
+        try:
+            from memory import record_trade
+            side = "short" if right.upper() == "C" else "long"  # put buyer = bearish = "long put"
+            record_trade(symbol, side, pre_close_pnl)
+        except Exception as e:
+            logger.debug(f"Trade recording failed: {e}")
+
     await executor._refresh_state()
     return result
+
+
+async def handle_close_spread(executor, params: dict) -> Any:
+    """Close ALL option legs for a symbol at once (closes the entire spread)."""
+    if not executor.gateway:
+        return {"error": "broker not connected"}
+    symbol = str(params.get("symbol", "")).upper()
+    if not symbol:
+        return {"error": "Required: symbol"}
+
+    positions = await executor.gateway.get_positions()
+    opt_legs = [p for p in positions
+                if p.get("symbol", "").upper() == symbol and p.get("sec_type") == "OPT"]
+    if not opt_legs:
+        return {"error": f"No option positions found for {symbol}"}
+
+    # Snapshot total unrealized P&L across all legs before closing
+    spread_pnl = sum(float(leg.get("unrealized_pnl", 0) or 0) for leg in opt_legs)
+
+    results = []
+    errors = []
+    for leg in opt_legs:
+        strike = leg.get("strike")
+        right = leg.get("right")
+        exp = leg.get("expiration")
+        logger.info(f"CLOSE SPREAD LEG: {symbol} {right}{strike} exp={exp}")
+        try:
+            r = await executor.gateway.close_option_position(
+                symbol, exp, float(strike), right
+            )
+            if isinstance(r, dict) and r.get("success"):
+                results.append(f"{strike}{right}: closed")
+            else:
+                err = r.get("error", "unknown") if isinstance(r, dict) else str(r)
+                errors.append(f"{strike}{right}: {err}")
+        except Exception as e:
+            errors.append(f"{strike}{right}: {e}")
+
+    await executor._refresh_state()
+
+    # Record spread trade for fitness feedback loop
+    if results:
+        try:
+            from memory import record_trade
+            # Determine side from the legs (put spread = bearish, call spread = bullish)
+            rights = {leg.get("right") for leg in opt_legs}
+            side = "short" if rights == {"C"} else ("long" if rights == {"P"} else "neutral")
+            record_trade(symbol, side, spread_pnl)
+        except Exception as e:
+            logger.debug(f"Spread trade recording failed: {e}")
+
+    await executor._refresh_state()
+
+    if results:
+        return {
+            "success": True,
+            "symbol": symbol,
+            "legs_closed": len(results),
+            "details": results,
+            "errors": errors if errors else None,
+        }
+    return {"error": f"Failed to close any legs: {'; '.join(errors)}"}
 
 
 async def handle_roll_option(executor, params: dict) -> Any:
@@ -980,6 +1084,7 @@ HANDLERS = {
     "jade_lizard": handle_jade_lizard,
     # Management
     "close_option": handle_close_option,
+    "close_spread": handle_close_spread,
     "roll_option": handle_roll_option,
     "option_chain": handle_option_chain,
     "option_greeks": handle_option_greeks,

@@ -15,11 +15,12 @@ Usage:
 import asyncio
 import logging
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Any, Dict, List, Optional, Protocol, runtime_checkable
 from concurrent.futures import ThreadPoolExecutor
 
 import numpy as np
+import pandas as pd
 import yfinance as yf
 
 logger = logging.getLogger(__name__)
@@ -65,7 +66,11 @@ class Quote:
 
 @dataclass
 class Candles:
-    """Historical OHLCV data with source tracking."""
+    """Historical OHLCV data with source tracking.
+
+    Supports iteration and slicing to yield SimpleNamespace bar objects
+    with .open, .high, .low, .close, .volume, .timestamp attributes.
+    """
     symbol: str
     open: List[float]
     high: List[float]
@@ -77,6 +82,33 @@ class Candles:
 
     def __len__(self) -> int:
         return len(self.close)
+
+    def _bar(self, i: int):
+        from types import SimpleNamespace
+        return SimpleNamespace(
+            open=self.open[i] if i < len(self.open) else None,
+            high=self.high[i] if i < len(self.high) else None,
+            low=self.low[i] if i < len(self.low) else None,
+            close=self.close[i] if i < len(self.close) else None,
+            volume=self.volume[i] if i < len(self.volume) else None,
+            timestamp=self.timestamps[i] if i < len(self.timestamps) else None,
+        )
+
+    def __getitem__(self, key):
+        n = len(self.close)
+        if isinstance(key, slice):
+            return [self._bar(i) for i in range(*key.indices(n))]
+        if isinstance(key, int):
+            if key < 0:
+                key += n
+            if 0 <= key < n:
+                return self._bar(key)
+            raise IndexError(key)
+        raise TypeError(key)
+
+    def __iter__(self):
+        for i in range(len(self.close)):
+            yield self._bar(i)
 
     @property
     def latest_close(self) -> Optional[float]:
@@ -562,6 +594,41 @@ class DataProvider:
 
         return results
 
+    def get_candles_bulk(self, symbols: List[str]) -> Dict[str, Candles]:
+        """
+        Get daily candles for multiple symbols in a single API call.
+
+        Args:
+            symbols: List of stock tickers
+
+        Returns:
+            Dict mapping symbol -> Candles
+        """
+        results = {}
+
+        try:
+            raw_bulk = self._run_async(
+                self._mda_client.get_bulk_daily_candles(symbols)
+            )
+
+            for symbol, raw in raw_bulk.items():
+                if raw and raw.get('close'):
+                    results[symbol] = Candles(
+                        symbol=symbol,
+                        open=raw.get('open', []),
+                        high=raw.get('high', []),
+                        low=raw.get('low', []),
+                        close=raw.get('close', []),
+                        volume=[int(v) for v in raw.get('volume', []) if v is not None],
+                        timestamps=raw.get('timestamps', []),
+                        source=raw.get('source', 'marketdata_bulk'),
+                    )
+
+        except Exception as e:
+            logger.warning(f"Bulk candle fetch failed: {e}")
+
+        return results
+
     # ==================== CANDLES ====================
 
     def get_candles(
@@ -1028,12 +1095,26 @@ class DataProvider:
             )
 
             if raw:
+                iv_current = raw.get('iv_current', 0)
+                iv_high = raw.get('iv_high')
+                iv_low = raw.get('iv_low')
+                iv_rank = raw.get('iv_rank')
+
+                # Compute iv_rank from iv_high/iv_low if not provided by API
+                if iv_rank is None and iv_high and iv_low and iv_high != iv_low:
+                    iv_rank = (iv_current - iv_low) / (iv_high - iv_low) * 100
+                    iv_rank = max(0.0, min(100.0, iv_rank))
+
+                # Fallback: estimate IV rank from historical candle volatility
+                if iv_rank is None and iv_current:
+                    iv_rank = self._estimate_iv_rank_from_candles(symbol, iv_current)
+
                 return IVInfo(
                     symbol=symbol,
-                    iv_current=raw.get('iv_current', 0),
-                    iv_rank=raw.get('iv_rank'),
-                    iv_high=raw.get('iv_high'),
-                    iv_low=raw.get('iv_low'),
+                    iv_current=iv_current,
+                    iv_rank=iv_rank,
+                    iv_high=iv_high,
+                    iv_low=iv_low,
                     source=raw.get('source', 'unknown')
                 )
 
@@ -1041,6 +1122,28 @@ class DataProvider:
             logger.warning(f"Failed to get IV info for {symbol}: {e}")
 
         return None
+
+    def _estimate_iv_rank_from_candles(self, symbol: str, iv_current: float) -> Optional[float]:
+        """Estimate IV rank by comparing current IV to 52-week realized vol distribution."""
+        try:
+            import numpy as np
+            candles = self.get_candles(symbol, days_back=252)
+            if not candles or len(candles) < 60:
+                return None
+            closes = np.array(candles.close, dtype=float)
+            log_returns = np.diff(np.log(closes))
+            # Rolling 20-day realized vol windows
+            rv_history = []
+            for i in range(20, len(log_returns)):
+                rv = np.std(log_returns[i - 20:i]) * np.sqrt(252) * 100
+                rv_history.append(rv)
+            if len(rv_history) < 10:
+                return None
+            # IV rank = percentile of current IV vs historical RV distribution
+            rank = sum(1 for rv in rv_history if rv <= iv_current) / len(rv_history) * 100
+            return round(max(0.0, min(100.0, rank)), 1)
+        except Exception:
+            return None
 
     # ==================== FUNDAMENTALS ====================
 
@@ -1149,25 +1252,57 @@ class DataProvider:
 
     def get_earnings_history(self, symbol: str, countback: int = 8) -> Optional[list]:
         """
-        Get historical earnings records (EPS, surprise, report dates) via MDA.
+        Get historical earnings records (EPS, surprise, report dates).
 
-        Returns list of dicts with fiscal_year, fiscal_quarter, reported_eps,
-        estimated_eps, surprise_eps, surprise_eps_pct, report_date, report_time.
+        Tries MDA first, then falls back to yfinance.
+        Returns list of dicts with surprise_eps_pct etc.
         """
         cache_key = f"earnings_hist:{symbol}:{countback}"
         cached = self._get_cached(cache_key)
         if cached is not _CACHE_MISS:
             return cached
 
+        # Try MDA first
         try:
             data = self._run_async(self._mda_client.get_earnings(symbol, countback=countback))
-            if not data or not data.get("earnings"):
-                return None
-            self._set_cached(cache_key, data["earnings"])
-            return data["earnings"]
+            if data and data.get("earnings"):
+                # Only use MDA if at least one record has surprise data
+                has_surprise = any(
+                    r.get("surprise_eps_pct") is not None for r in data["earnings"]
+                )
+                if has_surprise:
+                    self._set_cached(cache_key, data["earnings"])
+                    return data["earnings"]
         except Exception as e:
-            logger.debug(f"Failed to get earnings history for {symbol}: {e}")
-            return None
+            logger.debug(f"MDA earnings history for {symbol}: {e}")
+
+        # Fallback: yfinance earnings history (with timeout to prevent hangs)
+        try:
+            import concurrent.futures
+            def _fetch_yf_earnings():
+                ticker = yf.Ticker(symbol)
+                return ticker.earnings_dates
+            with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
+                hist = pool.submit(_fetch_yf_earnings).result(timeout=15)
+            if hist is not None and not hist.empty:
+                records = []
+                for idx, row in hist.head(countback).iterrows():
+                    surprise_pct = None
+                    if "Surprise(%)" in row.index and pd.notna(row.get("Surprise(%)")):
+                        surprise_pct = float(row["Surprise(%)"])
+                    records.append({
+                        "report_date": int(idx.timestamp()) if hasattr(idx, "timestamp") else None,
+                        "reported_eps": float(row["Reported EPS"]) if pd.notna(row.get("Reported EPS")) else None,
+                        "estimated_eps": float(row["EPS Estimate"]) if pd.notna(row.get("EPS Estimate")) else None,
+                        "surprise_eps_pct": surprise_pct,
+                    })
+                if records:
+                    self._set_cached(cache_key, records)
+                    return records
+        except Exception as e:
+            logger.debug(f"yfinance earnings history for {symbol}: {e}")
+
+        return None
 
     def get_sector(self, symbol: str) -> Optional[str]:
         """

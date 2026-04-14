@@ -106,6 +106,8 @@ def main():
     parser.add_argument("--verbose", action="store_true", help="Enable DEBUG logging")
     parser.add_argument("--no-research", action="store_true",
                         help="Disable research agent (runs by default)")
+    parser.add_argument("--no-evolution", action="store_true",
+                        help="Disable template evolution (runs by default)")
     parser.add_argument(
         "--account",
         choices=["paper", "live"],
@@ -134,16 +136,23 @@ def main():
     from core.agent import run_agent
 
     if not args.no_research:
-        from research.agent import run_research
-        print("Research agent running alongside trader\n")
+        from signals.scorer import run_research
+        print("Research scorer running alongside trader\n")
 
-        async def _run_both():
-            await asyncio.gather(
-                run_agent(),
-                run_research(verbose=args.verbose),
-            )
+        tasks = [run_agent(), run_research(verbose=args.verbose)]
 
-        asyncio.run(_run_both())
+        if not args.no_evolution:
+            from signals.template_evolution import run_template_evolution
+            tasks.append(run_template_evolution())
+            print("Template evolution running alongside trader\n")
+
+        async def _run_all():
+            results = await asyncio.gather(*tasks, return_exceptions=True)
+            for r in results:
+                if isinstance(r, Exception):
+                    logger.error("Task crashed: %s", r, exc_info=r)
+
+        asyncio.run(_run_all())
     else:
         asyncio.run(run_agent())
 

@@ -32,6 +32,7 @@ from execution.ibkr_utils import is_live_trading
 
 from execution.ibkr_utils import resolve_ibkr_endpoint
 from execution.order_types import IBKROrderType
+from core.async_utils import safe_sleep as _safe_sleep
 
 # Memory for autoresearch fill updates
 from memory import update_execution_snapshot_fill
@@ -491,7 +492,7 @@ class IBKRConnector(IBKROrdersMixin, IBKROptionsMixin, IBKRQueriesMixin):
                     )
 
                     # Brief wait for connection to stabilize
-                    await asyncio.sleep(0.5)
+                    await _safe_sleep(0.5)
 
                     if self.ib.isConnected():
                         self._connected = True
@@ -532,7 +533,7 @@ class IBKRConnector(IBKROrdersMixin, IBKROptionsMixin, IBKRQueriesMixin):
                     logger.warning(f"Connection attempt {attempt + 1} failed: {e}")
 
                 if attempt < max_retries - 1:
-                    await asyncio.sleep(2)
+                    await _safe_sleep(2)
 
             logger.error(f"Failed to connect after {max_retries} attempts")
             return False
@@ -585,7 +586,7 @@ class IBKRConnector(IBKROrdersMixin, IBKROptionsMixin, IBKRQueriesMixin):
             else:
                 # If still zero, request subscription
                 self.ib.reqAccountUpdates(subscribe=True, account=self.account_id)
-                await asyncio.sleep(0.5)  # Give time for update
+                await _safe_sleep(0.5)  # Give time for update
                 account_values = self.ib.accountValues(self.account_id)
                 for av in account_values:
                     if av.tag == 'NetLiquidation':
@@ -676,7 +677,7 @@ class IBKRConnector(IBKROrdersMixin, IBKROptionsMixin, IBKRQueriesMixin):
                 # For paper trading, Inactive often means price moved -
                 # give it more time before giving up
                 if elapsed < timeout * 0.9:
-                    await asyncio.sleep(poll_interval)
+                    await _safe_sleep(poll_interval)
                     continue
                 else:
                     logger.warning(f"Order Inactive after {elapsed:.1f}s - limit price may be stale")
@@ -688,7 +689,7 @@ class IBKRConnector(IBKROrdersMixin, IBKROptionsMixin, IBKRQueriesMixin):
                     }
 
             # Still pending (PreSubmitted, Submitted, etc.)
-            await asyncio.sleep(poll_interval)
+            await _safe_sleep(poll_interval)
 
     # ========== EMERGENCY OPERATIONS ==========
 
@@ -724,7 +725,7 @@ class IBKRConnector(IBKROrdersMixin, IBKROptionsMixin, IBKRQueriesMixin):
             logger.error(err_msg)
             result['errors'].append(err_msg)
 
-        await asyncio.sleep(1)  # Let cancellations process
+        await _safe_sleep(1)  # Let cancellations process
 
         # Step 2: Close ALL positions with MKT IOC orders
         try:
@@ -802,7 +803,7 @@ class IBKRConnector(IBKROrdersMixin, IBKROptionsMixin, IBKRQueriesMixin):
             logger.error(err_msg)
             result['errors'].append(err_msg)
 
-        await asyncio.sleep(2)  # Let cancellations + any final fills settle
+        await _safe_sleep(2)  # Let cancellations + any final fills settle
 
         # Step 2: Re-read positions AFTER cancellations (flip-guard)
         # Positions may have changed if fills arrived during cancel phase
@@ -932,7 +933,7 @@ class IBKRConnector(IBKROrdersMixin, IBKROptionsMixin, IBKRQueriesMixin):
         """Ping broker every 60s to keep connection alive. Auto-reconnect on failure."""
         try:
             while True:
-                await asyncio.sleep(60)
+                await _safe_sleep(60)
                 if not self.connected:
                     logger.warning("Heartbeat: connection lost, attempting reconnect...")
                     try:
@@ -1065,7 +1066,7 @@ async def test_connection():
     print("\nTesting real-time data for SPY (delayed)...")
     ticker = await connector.subscribe_market_data('SPY', delayed=True)
     if ticker:
-        await asyncio.sleep(3)  # Wait longer for delayed data
+        await _safe_sleep(3)  # Wait longer for delayed data
         price = connector.get_realtime_price(ticker)
         print(f"   Last: ${price.get('last', 'N/A')}")
         print(f"   Bid/Ask: ${price.get('bid', 'N/A')} / ${price.get('ask', 'N/A')}")

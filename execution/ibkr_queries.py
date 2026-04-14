@@ -13,6 +13,8 @@ This mixin is imported by IBKRConnector in ibkr_core.py.
 
 import logging
 import asyncio
+
+from core.async_utils import safe_sleep as _safe_sleep
 from datetime import datetime, timezone
 from typing import Dict, List, Any, Optional
 from threading import Lock
@@ -98,14 +100,14 @@ class IBKRQueriesMixin:
 
             # Brief pause to let TWS sync position/portfolio data after refresh.
             # Without this, portfolio() can return empty right after new fills.
-            await asyncio.sleep(0.3)
+            await _safe_sleep(0.3)
 
             # Use portfolio() instead of positions() to get unrealized P/L
             portfolio_items = self.ib.portfolio()
 
             # Retry once if empty — TWS sometimes needs an extra moment after fills
             if not portfolio_items:
-                await asyncio.sleep(0.5)
+                await _safe_sleep(0.5)
                 portfolio_items = self.ib.portfolio()
             positions = []
             
@@ -249,7 +251,7 @@ class IBKRQueriesMixin:
             
             # Request ALL open orders from broker (all client sessions)
             await self.ib.reqAllOpenOrdersAsync()
-            await asyncio.sleep(0.5)
+            await _safe_sleep(0.5)
             
             # Collect matching stop orders
             targets = []
@@ -276,11 +278,11 @@ class IBKRQueriesMixin:
                     logger.warning(f"Cancel call failed for #{trade.order.orderId}: {cancel_err}")
             
             # Wait for cancellations to process (error 10147 comes async)
-            await asyncio.sleep(1.5)
+            await _safe_sleep(1.5)
             
             # Verify: re-request all orders and check which are actually gone
             await self.ib.reqAllOpenOrdersAsync()
-            await asyncio.sleep(0.5)
+            await _safe_sleep(0.5)
             
             still_open = set()
             for trade in self.ib.openTrades():
@@ -340,7 +342,7 @@ class IBKRQueriesMixin:
             
             # Get ALL open orders
             await self.ib.reqAllOpenOrdersAsync()
-            await asyncio.sleep(0.5)
+            await _safe_sleep(0.5)
             
             ACTIVE_STATUSES = {'PreSubmitted', 'Submitted', 'PendingSubmit'}
             orphan_trades = []
@@ -381,11 +383,11 @@ class IBKRQueriesMixin:
                 logger.info(f"Cancel orphan: {trade.order.action} {trade.order.totalQuantity} {trade.contract.symbol} #{trade.order.orderId} (clientId={trade.order.clientId})")
             
             # Wait for IBKR to process (error 10147 comes async for cross-client)
-            await asyncio.sleep(2.0)
+            await _safe_sleep(2.0)
             
             # Verify: re-check which are actually gone
             await self.ib.reqAllOpenOrdersAsync()
-            await asyncio.sleep(0.5)
+            await _safe_sleep(0.5)
             
             still_open_ids = set()
             for trade in self.ib.openTrades():
@@ -427,7 +429,7 @@ class IBKRQueriesMixin:
         try:
             # Request all open orders (including from other sessions)
             await self.ib.reqAllOpenOrdersAsync()
-            await asyncio.sleep(0.3)  # Give time for orders to arrive
+            await _safe_sleep(0.3)  # Give time for orders to arrive
 
             trades = self.ib.openTrades()
             orders = []

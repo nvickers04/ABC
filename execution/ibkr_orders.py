@@ -17,6 +17,7 @@ import asyncio
 from datetime import datetime, timezone
 from typing import Dict, Any, Optional, Tuple
 
+from core.async_utils import safe_sleep as _safe_sleep
 from ib_insync import Order, TagValue
 from ib_insync.contract import Stock
 
@@ -59,8 +60,8 @@ class IBKROrdersMixin:
 
         Returns error dict if rejected, None if order looks OK.
         """
-        await asyncio.sleep(1.0)
-        await asyncio.sleep(0)  # yield to event loop — flushes IBKR callbacks
+        await _safe_sleep(1.0)
+        await _safe_sleep(0)  # yield to event loop — flushes IBKR callbacks
 
         status = trade.orderStatus.status
         has_error = any(e.errorCode for e in trade.log)
@@ -537,8 +538,8 @@ class IBKROrdersMixin:
                 stop_id = stop_trade.order.orderId
 
                 # Wait for broker to accept/reject
-                await asyncio.sleep(0.5)
-                await asyncio.sleep(0)  # flush callbacks
+                await _safe_sleep(0.5)
+                await _safe_sleep(0)  # flush callbacks
 
                 if stop_trade.orderStatus.status not in ('ApiCancelled', 'Cancelled', 'Error'):
                     break  # Stop accepted
@@ -547,7 +548,7 @@ class IBKROrdersMixin:
                     f"{stop_trade.orderStatus.status}"
                 )
                 if _stop_attempt < 2:
-                    await asyncio.sleep(1.0 * (_stop_attempt + 1))
+                    await _safe_sleep(1.0 * (_stop_attempt + 1))
 
             # After retries, check if stop is still rejected
             if stop_trade.orderStatus.status in ('ApiCancelled', 'Cancelled', 'Error'):
@@ -564,7 +565,7 @@ class IBKROrdersMixin:
                     emergency_order.tif = 'GTC'
                     emergency_order.transmit = True
                     emergency_trade = self.ib.placeOrder(contract, emergency_order)
-                    await asyncio.sleep(2.0)
+                    await _safe_sleep(2.0)
                     logger.critical(
                         f"Emergency market exit placed for {symbol}: "
                         f"order_id={emergency_trade.order.orderId}, "
@@ -598,7 +599,7 @@ class IBKROrdersMixin:
             target_id = target_trade.order.orderId
 
             # Brief wait and verify target order was accepted
-            await asyncio.sleep(0.1)
+            await _safe_sleep(0.1)
 
             if target_trade.orderStatus.status in ('ApiCancelled', 'Cancelled', 'Error'):
                 # Target failed - BUT KEEP THE STOP (position is protected)
@@ -698,7 +699,7 @@ class IBKROrdersMixin:
             stop_id = stop_trade.order.orderId
 
             # Brief wait to ensure stop order is accepted before placing target
-            await asyncio.sleep(0.1)
+            await _safe_sleep(0.1)
 
             # Check if stop order was rejected before placing target
             if stop_trade.orderStatus.status in ('ApiCancelled', 'Cancelled', 'Error'):
@@ -713,7 +714,7 @@ class IBKROrdersMixin:
             target_id = target_trade.order.orderId
 
             # Brief wait and verify target order was accepted
-            await asyncio.sleep(0.1)
+            await _safe_sleep(0.1)
 
             if target_trade.orderStatus.status in ('ApiCancelled', 'Cancelled', 'Error'):
                 # Target failed - MUST cancel stop to avoid orphaned order

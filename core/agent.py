@@ -17,6 +17,7 @@ import re
 from datetime import datetime, timezone, timedelta
 from typing import Any, Optional
 
+from core.async_utils import safe_sleep as _safe_sleep
 from core.config import (
     SYSTEM_PROMPT,
     RISK_PER_TRADE,
@@ -42,8 +43,6 @@ from data.cost_tracker import get_cost_tracker
 from data.data_provider import get_data_provider
 from data.broker_gateway import create_gateway, BrokerConfigError
 from data.market_hours import get_market_hours_provider
-from research.simulator import compute_sample_confidence, format_confidence_line
-from research.agent import _get_env_slot_history
 from tools.tools_executor import ToolExecutor
 
 logger = logging.getLogger(__name__)
@@ -322,7 +321,7 @@ class TradingAgent:
                 if not errors or closed >= total:
                     break
                 logger.critical(f"Flatten errors: {errors} — retrying in 2s")
-                await asyncio.sleep(2)
+                await _safe_sleep(2)
             else:
                 logger.critical("FLATTEN INCOMPLETE after 3 attempts — positions may remain open!")
         self._halted = True
@@ -331,264 +330,6 @@ class TradingAgent:
         """Returns True if daily LLM cost ceiling reached."""
         summary = self.cost_tracker.get_budget_summary()
         return summary.today_llm_cost >= MAX_DAILY_LLM_COST
-
-    def _get_research_briefing(self) -> str | None:
-        """Read environment snapshot + best strategies + live signals from research DB.
-
-        Produces an actionable briefing that includes:
-        - Current market environment regime
-        - Strategy-environment fit scores
-        - Best strategy per slot with conviction scores
-        - Live signals with environment-adjusted confidence
-        - Real trade feedback summary
-        """
-        try:
-            from memory import get_db
-            db = get_db()
-
-            lines = ["=== RESEARCH BRIEFING ==="]
-
-            # ── Environment context ─────────────────────────────
-            env = db.execute(
-                """SELECT volatility_regime, trend_regime, breadth_regime,
-                          momentum_regime, volume_regime, avg_atr_pct,
-                          dispersion, strategy_fit_json
-                   FROM environment_snapshots
-                   ORDER BY id DESC LIMIT 1"""
-            ).fetchone()
-
-            if env:
-                lines.append("")
-                lines.append("MARKET ENVIRONMENT:")
-                lines.append(
-                    f"  Volatility: {env['volatility_regime']} (ATR {env['avg_atr_pct']:.2f}%)"
-                )
-                lines.append(f"  Trend: {env['trend_regime']}")
-                lines.append(f"  Breadth: {env['breadth_regime']}")
-                lines.append(f"  Momentum: {env['momentum_regime']}")
-                lines.append(f"  Volume: {env['volume_regime']}")
-                lines.append(f"  Dispersion: {env['dispersion']:.2f}")
-
-                # Check environment staleness — warn if snapshot is old
-                try:
-                    snap_ts = db.execute(
-                        "SELECT ts FROM environment_snapshots ORDER BY id DESC LIMIT 1"
-                    ).fetchone()
-                    if snap_ts and snap_ts["ts"]:
-                        snap_time = datetime.fromisoformat(snap_ts["ts"].replace("Z", "+00:00"))
-                        age_hours = (datetime.now(timezone.utc) - snap_time).total_seconds() / 3600
-                        if age_hours > 4:
-                            lines.append(
-                                f"  ⚠ STALE: last snapshot {age_hours:.0f}h ago — "
-                                f"regime may have shifted. Run research() to refresh."
-                            )
-                except Exception:
-                    pass
-
-                # Strategy fit scores
-                try:
-                    fit = json.loads(env['strategy_fit_json']) if env['strategy_fit_json'] else {}
-                    if fit:
-                        lines.append("  Strategy-environment fit:")
-                        for stype, score in sorted(fit.items(), key=lambda x: -x[1])[:5]:
-                            lines.append(f"    {stype}: {score:.2f}")
-                except (json.JSONDecodeError, TypeError):
-                    pass
-
-            # ── Environment history from research (what works/doesn't) ──
-            try:
-                history = _get_env_slot_history()
-                if history and len(history) > 20:
-                    lines.append("")
-                    lines.append("ENVIRONMENT HISTORY:")
-                    lines.append(history[:500] + "\n... (truncated)")
-            except Exception:
-                pass
-
-            # ── Best strategy per slot ──────────────────────────
-            rows = db.execute(
-                """SELECT s.id, s.slot, s.expectancy, s.hit_rate, s.avg_rr,
-                          s.total_signals, s.llm_analysis
-                   FROM strategies s
-                   INNER JOIN (
-                       SELECT slot, MAX(expectancy) as max_exp
-                       FROM strategies WHERE kept = 1
-                       GROUP BY slot
-                   ) best ON s.slot = best.slot AND s.expectancy = best.max_exp
-                   WHERE s.kept = 1
-                   ORDER BY s.expectancy DESC"""
-            ).fetchall()
-
-            if rows:
-                lines.append("")
-                lines.append("STRATEGY SLOTS (ranked by expectancy):")
-                for row in rows:
-                    lines.append(
-                        f"  [Slot {row['slot']:02d}] #{row['id']}: "
-                        f"exp={row['expectancy']:.4f} hit={row['hit_rate']:.0f}% "
-                        f"R:R={row['avg_rr']:.1f} ({row['total_signals']} signals)"
-                    )
-                    if row["llm_analysis"]:
-                        snippet = row["llm_analysis"][:200].replace("\n", " ")
-                        lines.append(f"    Insight: {snippet}")
-
-            # ── Live signals with confidence ────────────────────
-            live = db.execute(
-                """SELECT ls.slot, ls.symbol, ls.direction, ls.order_type,
-                          ls.setup_type, ls.entry_price, ls.target_price,
-                          ls.stop_price, ls.legs_json,
-                          s.expectancy as slot_exp, s.hit_rate as slot_hit
-                   FROM live_signals ls
-                   LEFT JOIN strategies s ON s.id = ls.strategy_id
-                   ORDER BY s.expectancy DESC, ls.slot, ls.symbol"""
-            ).fetchall()
-
-            if live:
-                # Detect conflicting signals: opposing directions on same symbol
-                symbol_signals: dict[str, list] = {}
-                for sig in live:
-                    symbol_signals.setdefault(sig["symbol"], []).append(sig)
-
-                conflicts: set[str] = set()
-                for sym, sigs in symbol_signals.items():
-                    directions = {s["direction"] for s in sigs}
-                    if len(directions) > 1:
-                        conflicts.add(sym)
-
-                lines.append("")
-                if conflicts:
-                    lines.append(f"⚠ SIGNAL CONFLICTS on {len(conflicts)} symbols: {', '.join(sorted(conflicts))}")
-                    lines.append("  Conflicting signals resolved by highest expectancy (shown first).")
-
-                lines.append(f"LIVE SIGNALS ({len(live)} total):")
-                for sig in live[:20]:
-                    conf = "HIGH" if (sig["slot_exp"] or 0) > 0.003 else "MED" if (sig["slot_exp"] or 0) > 0 else "LOW"
-
-                    # Mark conflicts
-                    conflict_tag = ""
-                    if sig["symbol"] in conflicts:
-                        # Already sorted by expectancy DESC — first one wins
-                        best = symbol_signals[sig["symbol"]][0]
-                        if sig is best or sig["slot"] == best["slot"]:
-                            conflict_tag = " [CONFLICT-WINNER]"
-                        else:
-                            conflict_tag = " [CONFLICT-SKIP]"
-                    rr = ""
-                    if sig["entry_price"] and sig["target_price"] and sig["stop_price"]:
-                        risk = abs(sig["entry_price"] - sig["stop_price"])
-                        reward = abs(sig["target_price"] - sig["entry_price"])
-                        if risk > 0:
-                            rr = f" R:R={reward/risk:.1f}"
-                    legs = ""
-                    if sig["legs_json"]:
-                        try:
-                            legs_data = json.loads(sig["legs_json"]) if isinstance(sig["legs_json"], str) else sig["legs_json"]
-                            legs = f" [{legs_data.get('strategy', '')}]"
-                        except (json.JSONDecodeError, TypeError, AttributeError):
-                            pass
-                    lines.append(
-                        f"  [{conf}] [Slot {sig['slot']:02d}] {sig['symbol']} "
-                        f"{sig['direction']} {sig['order_type']} @ {sig['entry_price']:.2f} "
-                        f"tgt={sig['target_price']:.2f} stp={sig['stop_price']:.2f}"
-                        f"{rr}{legs} ({sig['setup_type']}){conflict_tag}"
-                    )
-                if len(live) > 20:
-                    lines.append(f"  ... and {len(live) - 20} more")
-
-            # ── Trade feedback summary ──────────────────────────
-            feedback_rows = db.execute(
-                """SELECT simulated_return, actual_pnl, execution_gap
-                   FROM trade_feedback
-                   WHERE ts > datetime('now', '-7 days')
-                   ORDER BY ts DESC"""
-            ).fetchall()
-
-            if feedback_rows:
-                feedback = {
-                    "cnt": len(feedback_rows),
-                    "avg_gap": sum(r["execution_gap"] or 0 for r in feedback_rows) / len(feedback_rows),
-                    "avg_pnl": sum(r["actual_pnl"] or 0 for r in feedback_rows) / len(feedback_rows),
-                }
-                sim_returns = [r["simulated_return"] for r in feedback_rows if r["simulated_return"] is not None]
-                actual_pnls = [r["actual_pnl"] for r in feedback_rows if r["actual_pnl"] is not None]
-                gaps = [r["execution_gap"] for r in feedback_rows if r["execution_gap"] is not None]
-
-                lines.append("")
-                lines.append("TRADE FEEDBACK (last 7 days):")
-                lines.append(f"  Matched trades: {feedback['cnt']}")
-                lines.append(f"  Avg actual P&L: ${feedback['avg_pnl']:.2f}")
-                lines.append(f"  Avg execution gap: {feedback['avg_gap']:+.3f}")
-                for line in (
-                    format_confidence_line("Simulated return", sim_returns, kind="pct"),
-                    format_confidence_line("Actual P&L", actual_pnls, kind="usd"),
-                    format_confidence_line("Execution gap metric", gaps),
-                ):
-                    if line:
-                        lines.append(line)
-
-                # Hypothesis: large persistent execution gap indicates slippage model drift
-                if feedback["cnt"] >= 5 and feedback["avg_gap"] is not None:
-                    gap = float(feedback["avg_gap"])
-                    if abs(gap) > 0.5:
-                        direction = "positive" if gap > 0 else "negative"
-                        self._emit_hypothesis(
-                            hypothesis_type="execution_gap",
-                            description=(
-                                f"Avg execution gap is {gap:+.3f} over last {feedback['cnt']} trades "
-                                f"({direction} drift) — simulated vs. actual diverging."
-                            ),
-                            suggested_action=(
-                                "Review slippage_preset settings in research/simulator.py. "
-                                "Consider adjusting slippage presets to reflect observed gaps."
-                            ),
-                            priority=4 if abs(gap) > 1.0 else 6,
-                        )
-
-            # ── Hypothesis: regime mismatch ─────────────────────
-            # If the current env regime is not well covered by any kept strategy, note it.
-            if env and rows:
-                vol_regime = env["volatility_regime"]
-                covered_types = set()
-                for row in rows:
-                    if row["llm_analysis"]:
-                        a = row["llm_analysis"].lower()
-                        for stype in ("momentum", "mean_reversion", "breakout", "options",
-                                      "scalp", "trend", "volatility"):
-                            if stype in a:
-                                covered_types.add(stype)
-                if vol_regime == "high" and "volatility" not in covered_types:
-                    self._emit_hypothesis(
-                        hypothesis_type="regime_mismatch",
-                        description=(
-                            f"High-volatility regime detected but no volatility-focused strategy "
-                            f"is currently kept. Covered types: {covered_types or 'unknown'}."
-                        ),
-                        suggested_action=(
-                            "Allocate a research slot to a volatility/options-centric strategy "
-                            "(straddles, strangles, or vol-breakout patterns) for the current regime."
-                        ),
-                        priority=5,
-                    )
-
-            # ── Hypothesis: no live signals ─────────────────────
-            if not live and rows:
-                self._emit_hypothesis(
-                    hypothesis_type="missed_opportunity",
-                    description=(
-                        "Research has kept strategies but no live signals were generated today. "
-                        "Possible causes: signal filters too strict, wrong market session, data lag."
-                    ),
-                    suggested_action=(
-                        "Lower entry threshold or widen scanning window. "
-                        "Check that candle data is flowing and RESEARCH_UNIVERSE symbols are liquid."
-                    ),
-                    priority=7,
-                )
-
-            return "\n".join(lines) if len(lines) > 1 else None
-        except Exception as e:
-            logger.warning(f"Research briefing failed: {e}")
-            return None
 
     def record_trade(self, symbol: str, side: str, pnl: float, held_minutes: int = 0):
         """Record a closed trade into the research memory DB."""
@@ -878,7 +619,7 @@ If no changes warranted: []"""
                             break
                         except Exception as api_err:
                             if _api_attempt < 2:
-                                await asyncio.sleep(2 ** (_api_attempt + 1))
+                                await _safe_sleep(2 ** (_api_attempt + 1))
                             else:
                                 raise
 
@@ -1362,7 +1103,7 @@ Account state above. Start by calling briefing() to assess research status."""
                         if _api_attempt < 2:
                             wait = 2 ** (_api_attempt + 1)  # 2s, 4s
                             logger.warning(f"Grok API error (attempt {_api_attempt+1}/3): {api_err} — retrying in {wait}s")
-                            await asyncio.sleep(wait)
+                            await _safe_sleep(wait)
                         else:
                             raise  # Last attempt, propagate
 
@@ -1515,7 +1256,7 @@ async def run_agent():
             if _conn_attempt < 4:
                 wait = 2 ** (_conn_attempt + 1)  # 2, 4, 8, 16s
                 logger.warning(f"Broker connect attempt {_conn_attempt+1}/5 failed: {e} — retrying in {wait}s")
-                await asyncio.sleep(wait)
+                await _safe_sleep(wait)
             else:
                 logger.error(f"Broker connection failed after 5 attempts: {e}")
                 return
@@ -1544,7 +1285,7 @@ async def run_agent():
         while True:
             if agent._halted:
                 logger.critical("AGENT HALTED — waiting for market close")
-                await asyncio.sleep(300)
+                await _safe_sleep(300)
                 try:
                     mh = get_market_hours_provider()
                     info = mh.get_session_info()
@@ -1568,7 +1309,7 @@ async def run_agent():
                     now_et = _now_et()
                     if now_et.hour >= 20:  # After 8 PM ET, go to sleep mode
                         logger.info("Market closed, extended hours over — sleeping 30 min")
-                        await asyncio.sleep(1800)
+                        await _safe_sleep(1800)
                         continue
             except Exception:
                 pass
@@ -1579,14 +1320,14 @@ async def run_agent():
             try:
                 wait_seconds = await agent.run_cycle()
                 logger.info(f"Cooldown: {wait_seconds}s")
-                await asyncio.sleep(wait_seconds)
+                await _safe_sleep(wait_seconds)
 
             except KeyboardInterrupt:
                 logger.info("Shutting down...")
                 break
             except Exception as e:
                 logger.error(f"Cycle error: {e}", exc_info=True)
-                await asyncio.sleep(30)
+                await _safe_sleep(30)
     finally:
         if gateway:
             try:

@@ -436,245 +436,27 @@ async def handle_economic_calendar(executor, params: dict) -> Any:
 
 
 def _query_briefing_data() -> dict:
-    """Query all briefing data from research DB. Returns raw sections dict."""
-    try:
-        from memory import get_db
-        db = get_db()
-    except Exception:
-        return {}
-
-    result: dict = {}
-
-    # Environment
-    try:
-        env = db.execute(
-            """SELECT volatility_regime, trend_regime, breadth_regime,
-                      momentum_regime, volume_regime, avg_atr_pct,
-                      dispersion, strategy_fit_json
-               FROM environment_snapshots
-               ORDER BY id DESC LIMIT 1"""
-        ).fetchone()
-        if env:
-            result["env"] = dict(env)
-    except Exception:
-        pass
-
-    # Strategy slots
-    try:
-        rows = db.execute(
-            """SELECT s.id, s.slot, s.expectancy, s.hit_rate, s.avg_rr,
-                      s.total_signals, s.llm_analysis
-               FROM strategies s
-               INNER JOIN (
-                   SELECT slot, MAX(expectancy) as max_exp
-                   FROM strategies WHERE kept = 1
-                   GROUP BY slot
-               ) best ON s.slot = best.slot AND s.expectancy = best.max_exp
-               WHERE s.kept = 1
-               ORDER BY s.expectancy DESC"""
-        ).fetchall()
-        if rows:
-            result["strategies"] = [dict(r) for r in rows]
-    except Exception:
-        pass
-
-    # Live signals
-    try:
-        live = db.execute(
-            """SELECT ls.slot, ls.symbol, ls.direction, ls.order_type,
-                      ls.setup_type, ls.entry_price, ls.target_price,
-                      ls.stop_price, ls.legs_json,
-                      s.expectancy as slot_exp, s.hit_rate as slot_hit
-               FROM live_signals ls
-               LEFT JOIN strategies s ON s.id = ls.strategy_id
-               ORDER BY s.expectancy DESC, ls.slot, ls.symbol"""
-        ).fetchall()
-        if live:
-            result["signals"] = [dict(s) for s in live]
-    except Exception:
-        pass
-
-    # Feedback
-    try:
-        feedback_rows = db.execute(
-            """SELECT simulated_return, actual_pnl, execution_gap
-               FROM trade_feedback
-               WHERE ts > datetime('now', '-7 days')
-               ORDER BY ts DESC"""
-        ).fetchall()
-        if feedback_rows:
-            result["feedback"] = [dict(r) for r in feedback_rows]
-    except Exception:
-        pass
-
-    return result
+    """Query all briefing data from signal combination engine."""
+    from signals.briefing import query_briefing_data
+    return query_briefing_data()
 
 
 def _briefing_summary(data: dict) -> dict:
-    """Compact summary with top actionable signals prominently featured."""
-    import json as _json
-    env = data.get("env")
-    strategies = data.get("strategies", [])
-    signals = data.get("signals", [])
-    feedback = data.get("feedback", [])
-
-    regime = "unknown"
-    trend = "unknown"
-    if env:
-        regime = f"{env.get('volatility_regime','?')}/{env.get('trend_regime','?')}"
-        trend = env.get("trend_regime", "unknown")
-
-    # Determine active slots for current regime
-    from research.config import REGIME_TO_SLOTS, SLOT_MANDATES
-    active_slots = REGIME_TO_SLOTS.get(trend, [1,2,3,4,5,6,7,8,9,10,11,12])
-
-    # Filter signals to active regime slots with positive expectancy strategies
-    regime_signals = [
-        s for s in signals
-        if s.get("slot") in active_slots and (s.get("slot_exp") or 0) > 0
-    ]
-
-    # Deduplicate by symbol — pick the highest-expectancy signal per symbol
-    best_by_sym: dict = {}
-    for sig in regime_signals:
-        sym = sig.get("symbol", "")
-        exp = sig.get("slot_exp") or 0
-        if sym not in best_by_sym or exp > (best_by_sym[sym].get("slot_exp") or 0):
-            best_by_sym[sym] = sig
-    top_regime = sorted(best_by_sym.values(), key=lambda s: -(s.get("slot_exp") or 0))[:8]
-
-    # Build actionable signal summaries
-    actionable = []
-    for sig in top_regime:
-        entry = sig.get("entry_price")
-        target = sig.get("target_price")
-        stop = sig.get("stop_price")
-        rr = None
-        if entry and target and stop:
-            risk = abs(entry - stop)
-            reward = abs(target - entry)
-            rr = round(reward / risk, 1) if risk > 0 else None
-
-        mandate = SLOT_MANDATES.get(sig.get("slot"), {})
-        legs = None
-        if sig.get("legs_json"):
-            try:
-                ld = _json.loads(sig["legs_json"]) if isinstance(sig["legs_json"], str) else sig["legs_json"]
-                legs = ld.get("strategy")
-            except Exception:
-                pass
-
-        item = {
-            "symbol": sig.get("symbol"),
-            "direction": sig.get("direction"),
-            "slot": sig.get("slot"),
-            "order_class": mandate.get("order_class", "unknown"),
-            "setup": sig.get("setup_type"),
-            "entry": round(entry, 2) if entry else None,
-            "target": round(target, 2) if target else None,
-            "stop": round(stop, 2) if stop else None,
-            "rr": rr,
-            "strategy_exp": round(sig.get("slot_exp") or 0, 4),
-            "strategy_hit": round(sig.get("slot_hit") or 0, 1),
-        }
-        if legs:
-            item["legs"] = legs
-        actionable.append(item)
-
-    fb_line = None
-    if feedback:
-        avg_pnl = sum(r.get("actual_pnl") or 0 for r in feedback) / len(feedback)
-        fb_line = f"{len(feedback)} trades, avg P&L ${avg_pnl:.2f}"
-
-    # Active graduated params + snapshot counts
-    grad_count = 0
-    snapshot_count = 0
-    hyp_count = 0
-    try:
-        from memory import get_db
-        db = get_db()
-        grad_count = (db.execute("SELECT COUNT(*) as n FROM graduated_params WHERE active = 1").fetchone() or {}).get("n", 0)
-        snapshot_count = (db.execute("SELECT COUNT(*) as n FROM execution_snapshots WHERE status = 'filled'").fetchone() or {}).get("n", 0)
-        hyp_count = (db.execute("SELECT COUNT(*) as n FROM trader_hypotheses WHERE status = 'open'").fetchone() or {}).get("n", 0)
-    except Exception:
-        pass
-
-    result = {
-        "regime": regime,
-        "active_regime_slots": active_slots,
-        "total_signals": len(signals),
-        "regime_signals": len(regime_signals),
-        "ACTION_REQUIRED": actionable,
-        "instruction": (
-            "ADAPT these signals to CURRENT prices — do NOT skip because entry_price is stale. "
-            "The signal gives you direction + strategy type. Build the trade at today's price. "
-            "For 'short': bear put spread around current price (buy ATM put, sell 1-ATR OTM put). "
-            "For 'neutral' iron_condor: build around current price (short strikes ~0.5 ATR out, wings ~1 ATR). "
-            "For 'long': bull call spread or buy stock. "
-            "Call option_chain(symbol, side='put') or side='call', then EXECUTE. Do not wait for perfect levels."
-        ),
-        "feedback": fb_line,
-    }
-    if grad_count:
-        result["graduated_params"] = grad_count
-    if snapshot_count:
-        result["execution_snapshots"] = snapshot_count
-    if hyp_count:
-        result["open_hypotheses"] = hyp_count
-    return result
+    """Composite briefing: signal quality, top composites, recommended trades."""
+    from signals.briefing import briefing_summary
+    return briefing_summary(data)
 
 
 def _briefing_signals(data: dict) -> dict:
-    """Full live signals list with entry/target/stop/R:R/legs."""
-    import json as _json
-    signals = data.get("signals", [])
-    out = []
-    for sig in signals[:30]:
-        rr = None
-        if sig.get("entry_price") and sig.get("target_price") and sig.get("stop_price"):
-            risk = abs(sig["entry_price"] - sig["stop_price"])
-            reward = abs(sig["target_price"] - sig["entry_price"])
-            if risk > 0:
-                rr = round(reward / risk, 1)
-        legs = None
-        if sig.get("legs_json"):
-            try:
-                ld = _json.loads(sig["legs_json"]) if isinstance(sig["legs_json"], str) else sig["legs_json"]
-                legs = ld.get("strategy")
-            except Exception:
-                pass
-        out.append({
-            "slot": sig.get("slot"),
-            "symbol": sig.get("symbol"),
-            "dir": sig.get("direction"),
-            "type": sig.get("order_type"),
-            "entry": sig.get("entry_price"),
-            "target": sig.get("target_price"),
-            "stop": sig.get("stop_price"),
-            "rr": rr,
-            "legs": legs,
-            "setup": sig.get("setup_type"),
-        })
-    return {"signals": out, "count": len(signals)}
+    """Full recommended trade list with composite + template details."""
+    from signals.briefing import briefing_signals
+    return briefing_signals(data)
 
 
 def _briefing_strategies(data: dict) -> dict:
-    """Full strategy slot table."""
-    strategies = data.get("strategies", [])
-    out = []
-    for row in strategies:
-        entry = {
-            "slot": row.get("slot"),
-            "id": row.get("id"),
-            "exp": row.get("expectancy"),
-            "hit": row.get("hit_rate"),
-            "rr": row.get("avg_rr"),
-            "sigs": row.get("total_signals"),
-        }
-        if row.get("llm_analysis"):
-            entry["insight"] = row["llm_analysis"][:200].replace("\n", " ")
-        out.append(entry)
-    return {"strategies": out, "count": len(strategies)}
+    """Template performance table."""
+    from signals.briefing import briefing_strategies
+    return briefing_strategies(data)
 
 
 def _briefing_feedback(data: dict) -> dict:
@@ -717,37 +499,9 @@ def _briefing_feedback(data: dict) -> dict:
 
 
 def _briefing_environment(data: dict) -> dict:
-    """Full environment regimes, fit scores, history."""
-    import json as _json
-    env = data.get("env")
-    if not env:
-        return {"environment": "No environment data"}
-
-    result = {
-        "volatility": env.get("volatility_regime"),
-        "trend": env.get("trend_regime"),
-        "breadth": env.get("breadth_regime"),
-        "momentum": env.get("momentum_regime"),
-        "volume": env.get("volume_regime"),
-        "atr_pct": env.get("avg_atr_pct"),
-        "dispersion": env.get("dispersion"),
-    }
-    try:
-        fit = _json.loads(env["strategy_fit_json"]) if env.get("strategy_fit_json") else {}
-        if fit:
-            result["strategy_fit"] = {k: round(v, 2) for k, v in sorted(fit.items(), key=lambda x: -x[1])[:8]}
-    except Exception:
-        pass
-
-    try:
-        from research.agent import _get_env_slot_history
-        history = _get_env_slot_history()
-        if history and len(history) > 20:
-            result["history"] = history[:600]
-    except Exception:
-        pass
-
-    return result
+    """Full environment regimes + signal health + N_eff trend."""
+    from signals.briefing import briefing_environment
+    return briefing_environment(data)
 
 
 async def handle_briefing(executor, params: dict) -> Any:
@@ -755,7 +509,7 @@ async def handle_briefing(executor, params: dict) -> Any:
     
     detail=None or "summary" -> compact overview (~100 tokens)
     detail="signals"         -> full live signals
-    detail="strategies"      -> full strategy slots
+    detail="strategies"      -> template performance
     detail="feedback"        -> trade feedback stats
     detail="environment"     -> full regimes + fit scores + history
     """

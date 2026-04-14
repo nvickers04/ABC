@@ -3,6 +3,10 @@
 import logging
 from typing import Any
 
+import numpy as np
+
+from research.config import CV_BOOTSTRAP_SAMPLES
+
 logger = logging.getLogger(__name__)
 
 
@@ -40,7 +44,8 @@ async def handle_calculate_size(executor, params: dict) -> Any:
                          f"For bearish views, use long puts or bear put spreads."
             }
 
-    risk_per_trade_pct = float(params.get("risk_per_trade_pct", 1.5))
+    risk_per_trade_pct = float(params.get("risk_per_trade_pct",
+                                             _cv_adjusted_risk(1.5)))
     max_position_pct = float(params.get("max_position_pct", 20.0))
     stop_distance_pct = params.get("stop_distance_pct")
 
@@ -227,6 +232,44 @@ async def handle_calculate_size(executor, params: dict) -> Any:
             "existing_exposure_in_symbol": round(existing_value, 2),
         },
     }
+
+
+def _estimate_cv_edge() -> float:
+    """
+    Bootstrap-resample matched trade returns to estimate coefficient of variation
+    of the edge. Higher CV = less certain about edge = smaller positions.
+
+    Returns CV (0.0 if < 20 matched fills — inactive).
+    """
+    try:
+        from memory import get_db
+        db = get_db()
+        rows = db.execute(
+            "SELECT actual_pnl FROM trade_feedback WHERE actual_pnl IS NOT NULL ORDER BY ts DESC LIMIT 200"
+        ).fetchall()
+        if not rows or len(rows) < 20:
+            return 0.0
+
+        returns = np.array([r["actual_pnl"] for r in rows], dtype=float)
+        n = len(returns)
+        edges = np.empty(CV_BOOTSTRAP_SAMPLES)
+        for i in range(CV_BOOTSTRAP_SAMPLES):
+            sample = np.random.choice(returns, size=n, replace=True)
+            edges[i] = sample.mean()
+
+        mu = edges.mean()
+        sigma = edges.std()
+        if abs(mu) < 1e-9:
+            return 1.0  # Edge indistinguishable from zero — maximum caution
+        return float(min(abs(sigma / mu), 1.0))
+    except Exception:
+        return 0.0
+
+
+def _cv_adjusted_risk(base_risk: float) -> float:
+    """Adjust base risk % downward based on CV of edge estimate."""
+    cv = _estimate_cv_edge()
+    return round(base_risk * (1.0 - cv), 4)
 
 
 HANDLERS = {

@@ -25,3 +25,4 @@ exchange-calendars>=4.5,<5.0
 
 # Market data (research tools — yfinance for fundamentals/analyst/insider data)
 yfinance>=0.2.44,<1.0
+lxml>=5.0,<6.0

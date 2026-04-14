@@ -128,6 +128,8 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Any
 
+from core.async_utils import safe_sleep as _safe_sleep
+
 from core.config import TRADING_MODE, PAPER_AGGRESSIVE
 from memory import (
     get_graduated_params, _time_bucket, _atr_bucket,
@@ -1625,7 +1627,7 @@ class ToolExecutor:
             return {"verified": False, "reason": "no_gateway"}, True
 
         try:
-            await asyncio.sleep(wait_seconds)
+            await _safe_sleep(wait_seconds)
             orders = await self.gateway.get_open_orders()
             for order in orders:
                 if int(order.get("order_id", 0)) == int(order_id):

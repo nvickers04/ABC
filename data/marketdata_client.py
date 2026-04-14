@@ -21,6 +21,7 @@ import os
 from typing import Any, Dict, List, Optional
 from datetime import datetime, timedelta
 
+from core.async_utils import safe_sleep as _safe_sleep
 import httpx
 
 logger = logging.getLogger(__name__)
@@ -165,7 +166,7 @@ class MarketDataClient:
                         f"Retrying {label} after transport error "
                         f"({attempt + 1}/{_OPTIONS_RETRY_ATTEMPTS}): {exc}"
                     )
-                await asyncio.sleep(0.5 * (attempt + 1))
+                await _safe_sleep(0.5 * (attempt + 1))
             return None
 
         if not throttle_options:
@@ -1303,7 +1304,7 @@ class MarketDataClient:
             params=params or None,
             label=f"earnings({symbol})",
         )
-        if not resp or resp.status_code != 200:
+        if not resp or resp.status_code not in (200, 203):
             return None
 
         data = resp.json()
@@ -1358,7 +1359,7 @@ class MarketDataClient:
             params=params or None,
             label=f"news({symbol})",
         )
-        if not resp or resp.status_code != 200:
+        if not resp or resp.status_code not in (200, 203):
             return None
 
         data = resp.json()
@@ -1409,7 +1410,7 @@ class MarketDataClient:
             params=params or None,
             label="market_status",
         )
-        if not resp or resp.status_code != 200:
+        if not resp or resp.status_code not in (200, 203):
             return None
 
         data = resp.json()

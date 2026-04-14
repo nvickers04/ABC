@@ -1,1 +1,1 @@
-# research/ — Karpathy-style autonomous strategy evolution for day trading
+# research/ — signal combination engine and trade simulation for day trading

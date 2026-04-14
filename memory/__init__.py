@@ -362,6 +362,89 @@ def init_db() -> sqlite3.Connection:
         CREATE INDEX IF NOT EXISTS idx_calib_slip_lookup ON calibrated_slippage(order_type, time_bucket, atr_bucket);
     """)
 
+    # ── Signal combination engine tables ─────────────────────────
+    conn.executescript("""
+        CREATE TABLE IF NOT EXISTS signal_scores (
+            signal_name TEXT NOT NULL,
+            symbol TEXT NOT NULL,
+            ts REAL NOT NULL,
+            score REAL NOT NULL,
+            confidence REAL NOT NULL,
+            components_json TEXT,
+            PRIMARY KEY (signal_name, symbol, ts)
+        );
+
+        CREATE TABLE IF NOT EXISTS signal_weights (
+            signal_name TEXT NOT NULL,
+            weight REAL NOT NULL,
+            n_eff REAL,
+            category TEXT,
+            updated_ts REAL NOT NULL,
+            PRIMARY KEY (signal_name)
+        );
+
+        CREATE TABLE IF NOT EXISTS signal_returns (
+            signal_name TEXT NOT NULL,
+            symbol TEXT NOT NULL,
+            ts REAL NOT NULL,
+            score_at_entry REAL NOT NULL,
+            forward_return REAL NOT NULL,
+            r_value REAL NOT NULL,
+            horizon_bars INTEGER NOT NULL,
+            PRIMARY KEY (signal_name, symbol, ts)
+        );
+
+        CREATE TABLE IF NOT EXISTS composite_scores (
+            symbol TEXT NOT NULL,
+            ts REAL NOT NULL,
+            composite_score REAL NOT NULL,
+            signal_breakdown_json TEXT,
+            PRIMARY KEY (symbol, ts)
+        );
+
+        CREATE TABLE IF NOT EXISTS template_performance (
+            template_name TEXT NOT NULL,
+            regime_key TEXT NOT NULL,
+            composite_bucket TEXT,
+            trades INTEGER DEFAULT 0,
+            wins INTEGER DEFAULT 0,
+            avg_return_pct REAL DEFAULT 0,
+            avg_gap_pct REAL DEFAULT 0,
+            sharpe REAL,
+            updated_ts REAL NOT NULL,
+            PRIMARY KEY (template_name, regime_key, composite_bucket)
+        );
+
+        CREATE TABLE IF NOT EXISTS template_boundaries (
+            template_name TEXT NOT NULL,
+            param_name TEXT NOT NULL,
+            param_value REAL NOT NULL,
+            generation INTEGER DEFAULT 0,
+            fitness REAL,
+            updated_ts REAL NOT NULL,
+            PRIMARY KEY (template_name, param_name)
+        );
+
+        CREATE TABLE IF NOT EXISTS template_recommendations (
+            symbol TEXT NOT NULL,
+            ts REAL NOT NULL,
+            template_name TEXT NOT NULL,
+            direction TEXT NOT NULL,
+            composite_score REAL NOT NULL,
+            order_type TEXT,
+            entry_price REAL,
+            target_price REAL,
+            stop_price REAL,
+            legs_json TEXT,
+            PRIMARY KEY (symbol, ts)
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_signal_scores_ts ON signal_scores(ts);
+        CREATE INDEX IF NOT EXISTS idx_signal_returns_signal ON signal_returns(signal_name, ts);
+        CREATE INDEX IF NOT EXISTS idx_composite_scores_ts ON composite_scores(ts);
+        CREATE INDEX IF NOT EXISTS idx_template_recs_ts ON template_recommendations(ts);
+    """)
+
     # ── Migrations for existing DBs ─────────────────────────────
     # Use helper for idempotent column adds (simplified from repeated try/except)
     _ensure_column(conn, "strategies", "slot", "INTEGER NOT NULL DEFAULT 1")
@@ -432,14 +515,14 @@ def get_all_research_config() -> dict[str, float]:
 # EXECUTION COST MODEL
 # ═══════════════════════════════════════════════════════════════
 
-def get_execution_cost(symbol: str | None = None, slot: int | None = None) -> dict:
+def get_execution_cost(symbol: str | None = None) -> dict:
     """Query aggregated execution gaps from trade_feedback.
 
-    Returns per-symbol or per-slot cost model from last 30 days:
-      {symbol/slot -> {avg_gap, n, total_pnl, total_sim}}
+    Returns per-symbol cost model from last 30 days:
+      {symbol -> {avg_gap, n, total_pnl, total_sim}}
 
-    If symbol given, returns single entry. If slot given, groups by slot.
-    If neither, returns top-10 symbols by trade count.
+    If symbol given, returns single entry.
+    If not, returns top-10 symbols by trade count.
     """
     db = get_db()
     cutoff = "datetime('now', '-30 days')"
@@ -461,23 +544,6 @@ def get_execution_cost(symbol: str | None = None, slot: int | None = None) -> di
                 "trades": row["n"],
                 "total_pnl": round(row["total_pnl"] or 0, 2),
                 "total_sim": round(row["total_sim"] or 0, 4),
-            }
-        return {}
-    elif slot is not None:
-        row = db.execute(
-            f"""SELECT slot,
-                       AVG(execution_gap) as avg_gap,
-                       COUNT(*) as n,
-                       SUM(actual_pnl) as total_pnl
-                FROM trade_feedback
-                WHERE slot = ? AND ts >= {cutoff}""",
-            (slot,),
-        ).fetchone()
-        if row and row["n"]:
-            return {
-                "slot": row["slot"],
-                "avg_gap_pct": round(row["avg_gap"] or 0, 4),
-                "trades": row["n"],
             }
         return {}
     else:
@@ -509,10 +575,9 @@ def record_trade(
 ) -> int | None:
     """Record a closed trade into the trades table.
 
-    This feeds the research feedback loop: _match_trades_to_signals() in the
-    research agent matches these rows to live_signals by symbol + time
-    proximity, then writes trade_feedback rows that penalize slot fitness
-    via _execution_gap_penalty().
+    This feeds the feedback loop: _match_trade_to_signal() matches these
+    rows to live_signals by symbol + time proximity, then writes
+    trade_feedback rows tracking execution gaps.
 
     Returns the trade row id, or None on failure.
     """
@@ -549,9 +614,7 @@ def record_trade(
 def _match_trade_to_signal(db, trade_id: int, symbol: str) -> None:
     """Match a single trade to the closest live_signal by symbol + time proximity.
 
-    Writes to trade_feedback table, which feeds _execution_gap_penalty() in
-    the research agent to penalize slot fitness when real execution
-    underperforms simulation.
+    Writes to trade_feedback table for execution quality tracking.
     """
     trade = db.execute(
         "SELECT id, symbol, side, pnl, ts FROM trades WHERE id = ?",

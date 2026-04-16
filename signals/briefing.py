@@ -45,7 +45,9 @@ def query_briefing_data() -> dict:
         ).fetchall()
         if rows:
             result["weights"] = [dict(r) for r in rows]
-            result["n_eff"] = float(rows[0]["n_eff"]) if rows[0]["n_eff"] else None
+            # Use ``is not None`` so a legitimate n_eff of 0.0 is preserved
+            # (the previous truthiness check turned 0.0 into None).
+            result["n_eff"] = float(rows[0]["n_eff"]) if rows[0]["n_eff"] is not None else None
     except Exception:
         pass
 
@@ -150,7 +152,8 @@ def briefing_summary(data: dict) -> dict:
         try:
             breakdown = json.loads(comp["signal_breakdown_json"]) if comp.get("signal_breakdown_json") else {}
             entry["breakdown"] = {k: round(v, 2) for k, v in breakdown.items()}
-        except Exception:
+        except Exception as e:
+            logger.debug(f"Failed to parse signal_breakdown_json for {comp.get('symbol')}: {e}")
             pass
         top_composites.append(entry)
 
@@ -171,8 +174,8 @@ def briefing_summary(data: dict) -> dict:
             try:
                 ld = json.loads(rec["legs_json"]) if isinstance(rec["legs_json"], str) else rec["legs_json"]
                 legs = ld.get("strategy")
-            except Exception:
-                pass
+            except Exception as e:
+                logger.debug(f"Failed to parse legs_json for {rec.get('symbol')}: {e}")
 
         item = {
             "symbol": rec["symbol"],
@@ -245,8 +248,8 @@ def briefing_signals(data: dict) -> dict:
             try:
                 ld = json.loads(rec["legs_json"]) if isinstance(rec["legs_json"], str) else rec["legs_json"]
                 legs = ld.get("strategy")
-            except Exception:
-                pass
+            except Exception as e:
+                logger.debug(f"Failed to parse legs_json for {rec.get('symbol')}: {e}")
 
         item = {
             "symbol": rec["symbol"],
@@ -267,8 +270,8 @@ def briefing_signals(data: dict) -> dict:
         if comp and comp.get("signal_breakdown_json"):
             try:
                 item["breakdown"] = json.loads(comp["signal_breakdown_json"])
-            except Exception:
-                pass
+            except Exception as e:
+                logger.debug(f"Failed to parse signal_breakdown_json for {rec.get('symbol')}: {e}")
 
         out.append(item)
     return {"signals": out, "count": len(recs)}
@@ -351,8 +354,8 @@ def briefing_environment(data: dict) -> dict:
             (stale_threshold,),
         ).fetchone()[0]
         result["active_signals"] = total_active
-    except Exception:
-        pass
+    except Exception as e:
+        logger.debug(f"Stale-signal health check failed: {e}")
 
     # Environment history from template performance + environment snapshots
     try:
@@ -386,7 +389,7 @@ def briefing_environment(data: dict) -> dict:
                     f"win={r['win_pct'] or 0:.0f}% avg_ret={r['avg_ret'] or 0:.4f} (n={r['n']})"
                 )
             result["history"] = "\n".join(lines)[:600]
-    except Exception:
-        pass
+    except Exception as e:
+        logger.debug(f"Environment history query failed: {e}")
 
     return result

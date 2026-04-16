@@ -231,7 +231,7 @@ async def handle_atr(executor, params: dict) -> Any:
             data["resolution"] = resolution
             data["is_realtime"] = True
             data["data_warning"] = None
-            data["timestamp"] = datetime.datetime.utcnow().strftime('%Y-%m-%dT%H:%M:%SZ')
+            data["timestamp"] = datetime.datetime.now(datetime.timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')
             return data
         return {"error": f"No ATR data for {symbol}"}
     except Exception as e:

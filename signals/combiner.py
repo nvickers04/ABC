@@ -39,8 +39,16 @@ def combine_signals(
     {
         "weights": {signal_name: float},
         "n_eff": float,
-        "status": "ok" | "insufficient_data" | "fallback_equal",
+        "status": "ok" | "insufficient_data" | "fallback_equal"
+                  | "circuit_breaker_neff",
     }
+
+    Circuit breaker: if N_eff stays below ``_NEFF_CIRCUIT_THRESHOLD`` for
+    ``_NEFF_CIRCUIT_STREAK`` consecutive successful runs we switch to equal
+    weights (``status = "circuit_breaker_neff"``) — the combination engine
+    has lost its structural advantage and equal weights are safer than
+    weights derived from highly correlated signals.  The streak counter is
+    persisted across process restarts via ``research_config``.
     """
     if signal_names is None:
         signal_names = sorted(SIGNAL_REGISTRY.keys())
@@ -72,8 +80,58 @@ def combine_signals(
         _persist_weights(db_conn, w_dict, n_eff)
         return {"weights": w_dict, "n_eff": n_eff, "status": "fallback_equal"}
 
+    # ── N_eff monitoring + streak-based circuit breaker ─────────
+    if n_eff < 15:
+        logger.warning("N_eff %.1f < 15 — signals more correlated than expected", n_eff)
+    if n_eff < 10:
+        logger.warning("ALERT: N_eff %.1f < 10 — investigate signal independence", n_eff)
+
+    streak = _update_neff_streak(db_conn, n_eff)
+    status = "ok"
+    if streak >= _NEFF_CIRCUIT_STREAK:
+        logger.warning(
+            "Circuit breaker tripped: N_eff < %.1f for %d consecutive rounds — "
+            "falling back to equal weights",
+            _NEFF_CIRCUIT_THRESHOLD, streak,
+        )
+        w_dict = {s: 1.0 / N for s in signal_names}
+        status = "circuit_breaker_neff"
+
     _persist_weights(db_conn, w_dict, n_eff)
-    return {"weights": w_dict, "n_eff": n_eff, "status": "ok"}
+    return {"weights": w_dict, "n_eff": n_eff, "status": status}
+
+
+# ── N_eff circuit-breaker tunables ──────────────────────────────
+# todo Phase 6: "if N_eff < 8 for 3 consecutive rounds: fall back to equal
+# weights and flag for manual review."
+_NEFF_CIRCUIT_THRESHOLD = 8.0
+_NEFF_CIRCUIT_STREAK = 3
+_NEFF_STREAK_KEY = "n_eff_low_streak"
+
+
+def _update_neff_streak(db_conn, n_eff: float) -> int:
+    """Increment / reset the persistent low-N_eff streak counter and return
+    the new value.
+
+    The counter is stored in the ``research_config`` table via the existing
+    ``get_research_config`` / ``set_research_config`` helpers — no schema
+    change required.  Storage failures are non-fatal: the function falls
+    back to in-process tracking so the combiner keeps working.
+    """
+    try:
+        from memory import get_research_config, set_research_config
+        prev = int(get_research_config(_NEFF_STREAK_KEY, 0))
+        new = prev + 1 if n_eff < _NEFF_CIRCUIT_THRESHOLD else 0
+        if new != prev:
+            set_research_config(
+                _NEFF_STREAK_KEY,
+                float(new),
+                reason=f"combiner: n_eff={n_eff:.2f}",
+            )
+        return new
+    except Exception as e:
+        logger.debug("N_eff streak persistence failed: %s", e)
+        return 1 if n_eff < _NEFF_CIRCUIT_THRESHOLD else 0
 
 
 def compute_composite_scores(

@@ -19,7 +19,7 @@ import logging
 import asyncio
 import os
 from typing import Any, Dict, List, Optional
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 
 from core.async_utils import safe_sleep as _safe_sleep
 import httpx
@@ -216,8 +216,10 @@ class MarketDataClient:
         Track request count for observability.
         Resets daily counter at 9:30 AM ET (MDA reset time).
         """
-        now = datetime.utcnow()
-        
+        # ``datetime.utcnow()`` is deprecated in Python 3.12+; use a tz-aware
+        # UTC instant instead.  ``.date()`` comparisons below still work.
+        now = datetime.now(timezone.utc)
+
         # Reset daily counter at midnight UTC
         if self._daily_reset is None or now.date() > self._daily_reset.date():
             self._daily_count = 0

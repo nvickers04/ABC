@@ -810,3 +810,134 @@ class TestSizingRegression:
         from tools.tools_sizing import _cv_adjusted_risk
         with patch("tools.tools_sizing._estimate_cv_edge", return_value=1.0):
             assert _cv_adjusted_risk(1.5) == 0.0
+
+
+# ═════════════════════════════════════════════════════════════════
+# 9. N_eff circuit breaker (todo Phase 6)
+# ═════════════════════════════════════════════════════════════════
+
+class TestNEffCircuitBreaker:
+    """After 3 consecutive rounds with N_eff < 8 the combiner falls back
+    to equal weights with status='circuit_breaker_neff', and the streak
+    resets once N_eff recovers."""
+
+    def _seed_high_corr(self, db, names):
+        # Wipe any prior rows so each "round" sees a fresh return matrix.
+        db.execute("DELETE FROM signal_returns")
+        db.commit()
+        _seed_signal_returns(db, names, n_periods=25, correlation=0.99)
+
+    def _seed_low_corr(self, db, names):
+        db.execute("DELETE FROM signal_returns")
+        db.commit()
+        _seed_signal_returns(db, names, n_periods=30, correlation=0.0)
+
+    def test_three_low_neff_rounds_trip_breaker_then_reset(self, db):
+        from signals.combiner import combine_signals
+        names = ["sig_x", "sig_y", "sig_z", "sig_w"]
+
+        # Rounds 1 & 2: highly correlated → low N_eff but breaker not yet tripped.
+        for _ in range(2):
+            self._seed_high_corr(db, names)
+            r = combine_signals(db, signal_names=names)
+            assert r["n_eff"] < 8.0
+            assert r["status"] == "ok"
+
+        # Round 3: streak hits 3 → breaker trips, equal weights.
+        self._seed_high_corr(db, names)
+        r3 = combine_signals(db, signal_names=names)
+        assert r3["status"] == "circuit_breaker_neff"
+        for w in r3["weights"].values():
+            assert abs(w - 1.0 / len(names)) < 1e-9
+
+        # Recovery: independent returns with enough signals to push N_eff
+        # back above the threshold → streak resets, status ok.
+        recovery_names = [f"ind_{i}" for i in range(12)]
+        self._seed_low_corr(db, recovery_names)
+        r4 = combine_signals(db, signal_names=recovery_names)
+        assert r4["n_eff"] >= 8.0
+        assert r4["status"] == "ok"
+        # Streak should have been reset to 0 in research_config.
+        from memory import get_research_config
+        assert int(get_research_config("n_eff_low_streak", 0)) == 0
+
+
+# ═════════════════════════════════════════════════════════════════
+# 10. IV history percentile helper (todo Phase 5 — hybrid IV rank)
+# ═════════════════════════════════════════════════════════════════
+
+class TestIVHistoryPercentile:
+    """compute_iv_rank_percentile returns None below the min-samples
+    threshold and a correct percentile once enough snapshots exist."""
+
+    def _insert(self, db, symbol, values, day0_ts):
+        for i, v in enumerate(values):
+            db.execute(
+                "INSERT OR REPLACE INTO iv_history (symbol, ts, iv_current, source) "
+                "VALUES (?, ?, ?, ?)",
+                (symbol.upper(), day0_ts + i * 86400, float(v), "test"),
+            )
+        db.commit()
+
+    def test_returns_none_when_insufficient_samples(self, db):
+        from memory import compute_iv_rank_percentile, _IV_HISTORY_MIN_SAMPLES
+        # Only a handful of samples — well below the threshold.
+        self._insert(db, "AAPL", [0.20] * 5, day0_ts=time.time() - 10 * 86400)
+        assert compute_iv_rank_percentile("AAPL", iv_current=0.25) is None
+        assert _IV_HISTORY_MIN_SAMPLES >= 30
+
+    def test_percentile_with_enough_samples(self, db):
+        from memory import compute_iv_rank_percentile
+        # 100 samples uniformly spread over [0, 1).  Recent dates so the
+        # default 252-day lookback covers them all.
+        day0 = time.time() - 100 * 86400
+        values = [i / 100.0 for i in range(100)]  # 0.00, 0.01, ..., 0.99
+        self._insert(db, "MSFT", values, day0)
+
+        # Current IV = 0.50 → exactly half are strictly below → ~50%.
+        pct = compute_iv_rank_percentile("MSFT", iv_current=0.50)
+        assert pct is not None
+        assert 45.0 <= pct <= 55.0
+
+        # Current IV above all samples → ~100.
+        assert compute_iv_rank_percentile("MSFT", iv_current=2.0) >= 99.0
+        # Current IV below all samples → 0.
+        assert compute_iv_rank_percentile("MSFT", iv_current=-1.0) == 0.0
+
+
+# ═════════════════════════════════════════════════════════════════
+# 11. Trade-feedback wiring via template_recommendations
+# ═════════════════════════════════════════════════════════════════
+
+class TestTradeFeedbackMatching:
+    """record_trade should match against template_recommendations and
+    populate trade_feedback.template_name (slot stays NULL — legacy)."""
+
+    def test_match_writes_feedback_row(self, db):
+        import memory
+        symbol = "TSLA"
+        # Insert a recommendation a few seconds ago so it falls within the
+        # ±7-day matching window when record_trade is called.
+        rec_ts = time.time() - 60
+        db.execute(
+            """INSERT INTO template_recommendations
+               (symbol, template_name, ts, direction, entry_price,
+                composite_score)
+               VALUES (?, ?, ?, ?, ?, ?)""",
+            (symbol, "long_call_atm", rec_ts, "long", 100.0, 1.25),
+        )
+        db.commit()
+
+        trade_id = memory.record_trade(symbol, "long", pnl=2.50, held_minutes=15)
+        assert trade_id is not None
+
+        row = db.execute(
+            "SELECT template_name, slot, simulated_return, symbol "
+            "FROM trade_feedback WHERE trade_id = ?",
+            (trade_id,),
+        ).fetchone()
+        assert row is not None, "trade_feedback row was not written"
+        assert row["template_name"] == "long_call_atm"
+        assert row["slot"] is None
+        assert abs(row["simulated_return"] - 1.25) < 1e-9
+        assert row["symbol"] == symbol

@@ -444,18 +444,13 @@ class ToolExecutor:
         }
 
     def _check_pdt(self, side: str):
-        """Block BUY-side orders when PDT restricted. Returns error dict or None."""
-        if side.upper() != 'BUY':
-            return None
-        if not self.gateway:
-            return None
-        if (self.gateway.day_trades_remaining <= 0
-                and self.gateway.net_liquidation < 25_000):
-            return {
-                "error": f"PDT BLOCKED: 0 day trades remaining and account under $25k. "
-                         f"Day trades left: {self.gateway.day_trades_remaining}, "
-                         f"Net liquidation: ${self.gateway.net_liquidation:,.2f}"
-            }
+        """PDT gate — disabled.
+
+        The SEC removed the $25k Pattern Day Trader minimum, so this rule
+        no longer applies.  The function is kept (rather than deleted) so
+        existing call sites in tools_options.py keep working without code
+        changes; it now always returns ``None`` (no block).
+        """
         return None
 
     # Option tools that should never be blocked by cash-only guard

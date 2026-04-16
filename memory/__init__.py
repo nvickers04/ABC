@@ -1,17 +1,18 @@
 """
 Memory Layer — SQLite persistence for research + trading.
 
-Single file (memory/abc.db), WAL mode, three core tables + live_signals.
-Both research and trading agents share this DB with clear ownership:
-  - Research writes: strategies, evaluations, signals, live_signals
-  - Trading writes: trades
-  - Trading reads: strategies, live_signals
-  - Research reads: trades (for future feedback)
+Single file (memory/abc.db), WAL mode. The signal-combination engine owns
+the live tables (signal_scores, signal_weights, composite_scores,
+template_recommendations, template_performance). Execution writes to
+trades + trade_feedback; the trader and research loops both read the
+signal-engine tables. The legacy slot-system tables (live_signals,
+strategies, slot_environment_scores) have been retired and are no
+longer created on fresh DBs.
 """
 
 import sqlite3
 import logging
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
@@ -46,60 +47,8 @@ def init_db() -> sqlite3.Connection:
     conn.execute("PRAGMA wal_autocheckpoint=1000")
 
     conn.executescript("""
-        CREATE TABLE IF NOT EXISTS strategies (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            ts TEXT NOT NULL,
-            slot INTEGER NOT NULL DEFAULT 1,
-            methodology TEXT NOT NULL,
-            parent_id INTEGER,
-            total_signals INTEGER DEFAULT 0,
-            hit_rate REAL,
-            avg_rr REAL,
-            expectancy REAL,
-            kept INTEGER DEFAULT 0,
-            llm_analysis TEXT,
-            FOREIGN KEY (parent_id) REFERENCES strategies(id)
-        );
-
-        CREATE TABLE IF NOT EXISTS evaluations (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            strategy_id INTEGER NOT NULL,
-            ts TEXT NOT NULL,
-            eval_date TEXT NOT NULL,
-            symbols_json TEXT,
-            signals_tested INTEGER DEFAULT 0,
-            hit_rate REAL,
-            expectancy REAL,
-            avg_rr REAL,
-            profit_factor REAL,
-            max_drawdown REAL,
-            FOREIGN KEY (strategy_id) REFERENCES strategies(id)
-        );
-
-        CREATE TABLE IF NOT EXISTS signals (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            strategy_id INTEGER NOT NULL,
-            evaluation_id INTEGER NOT NULL,
-            symbol TEXT NOT NULL,
-            entry_ts TEXT,
-            direction TEXT,
-            order_type TEXT,
-            setup_type TEXT,
-            entry_price REAL,
-            target_price REAL,
-            stop_price REAL,
-            max_hold_bars INTEGER,
-            hit_target INTEGER,
-            hit_stop INTEGER,
-            timed_out INTEGER,
-            exit_ts TEXT,
-            exit_price REAL,
-            return_pct REAL,
-            legs_json TEXT,
-            FOREIGN KEY (strategy_id) REFERENCES strategies(id),
-            FOREIGN KEY (evaluation_id) REFERENCES evaluations(id)
-        );
-
+        -- Closed-trade ledger (the legacy `signals` FK is kept for back-compat;
+        --  the table is no longer created so the FK is unenforced on fresh DBs).
         CREATE TABLE IF NOT EXISTS trades (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             ts TEXT NOT NULL,
@@ -107,25 +56,7 @@ def init_db() -> sqlite3.Connection:
             side TEXT,
             pnl REAL,
             signal_id INTEGER,
-            held_minutes INTEGER,
-            FOREIGN KEY (signal_id) REFERENCES signals(id)
-        );
-
-        CREATE TABLE IF NOT EXISTS live_signals (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            strategy_id INTEGER NOT NULL,
-            slot INTEGER NOT NULL DEFAULT 1,
-            ts TEXT NOT NULL,
-            symbol TEXT NOT NULL,
-            direction TEXT,
-            order_type TEXT,
-            setup_type TEXT,
-            entry_price REAL,
-            target_price REAL,
-            stop_price REAL,
-            max_hold_bars INTEGER,
-            legs_json TEXT,
-            FOREIGN KEY (strategy_id) REFERENCES strategies(id)
+            held_minutes INTEGER
         );
 
         CREATE TABLE IF NOT EXISTS environment_snapshots (
@@ -143,18 +74,6 @@ def init_db() -> sqlite3.Connection:
             raw_snapshot_json TEXT
         );
 
-        CREATE TABLE IF NOT EXISTS slot_environment_scores (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            ts TEXT NOT NULL,
-            slot INTEGER NOT NULL,
-            env_snapshot_id INTEGER NOT NULL,
-            fitness REAL,
-            expectancy REAL,
-            total_signals INTEGER,
-            strategy_type TEXT,
-            FOREIGN KEY (env_snapshot_id) REFERENCES environment_snapshots(id)
-        );
-
         CREATE TABLE IF NOT EXISTS trade_feedback (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             ts TEXT NOT NULL,
@@ -165,24 +84,12 @@ def init_db() -> sqlite3.Connection:
             actual_pnl REAL,
             execution_gap REAL,
             symbol TEXT,
-            FOREIGN KEY (trade_id) REFERENCES trades(id),
-            FOREIGN KEY (signal_id) REFERENCES signals(id)
+            FOREIGN KEY (trade_id) REFERENCES trades(id)
         );
 
-        CREATE INDEX IF NOT EXISTS idx_strategies_kept ON strategies(kept);
-        CREATE INDEX IF NOT EXISTS idx_strategies_slot ON strategies(slot);
-        CREATE INDEX IF NOT EXISTS idx_evaluations_strategy ON evaluations(strategy_id);
-        CREATE INDEX IF NOT EXISTS idx_signals_evaluation ON signals(evaluation_id);
-        CREATE INDEX IF NOT EXISTS idx_live_signals_ts ON live_signals(ts);
-        CREATE INDEX IF NOT EXISTS idx_live_signals_slot ON live_signals(slot);
         CREATE INDEX IF NOT EXISTS idx_env_snapshots_ts ON environment_snapshots(ts);
-        CREATE INDEX IF NOT EXISTS idx_slot_env_scores_slot ON slot_environment_scores(slot);
-        CREATE INDEX IF NOT EXISTS idx_slot_env_scores_env ON slot_environment_scores(env_snapshot_id);
-        CREATE INDEX IF NOT EXISTS idx_trade_feedback_slot ON trade_feedback(slot);
-        CREATE INDEX IF NOT EXISTS idx_trade_feedback_slot_ts ON trade_feedback(slot, ts);
-        CREATE INDEX IF NOT EXISTS idx_signals_strategy_date ON signals(strategy_id, evaluation_id);
-        CREATE INDEX IF NOT EXISTS idx_live_signals_slot_ts ON live_signals(slot, ts);
-        CREATE INDEX IF NOT EXISTS idx_live_signals_symbol ON live_signals(symbol);
+        CREATE INDEX IF NOT EXISTS idx_trade_feedback_ts ON trade_feedback(ts);
+        CREATE INDEX IF NOT EXISTS idx_trade_feedback_symbol_ts ON trade_feedback(symbol, ts);
     """)
 
     # ── New Phase-2+ tables ──────────────────────────────────────
@@ -245,7 +152,6 @@ def init_db() -> sqlite3.Connection:
         CREATE INDEX IF NOT EXISTS idx_replay_episodes_date ON replay_episodes(session_date);
         CREATE INDEX IF NOT EXISTS idx_trader_hyp_status ON trader_hypotheses(status);
         CREATE INDEX IF NOT EXISTS idx_trader_hyp_status_env ON trader_hypotheses(status, env_key);
-        CREATE INDEX IF NOT EXISTS idx_slot_env_scores_slot_env ON slot_environment_scores(slot, env_snapshot_id);
 
         -- Self-tunable research config: key-value store the agent can read + update.
         -- Defaults live in research/config.py; DB overrides take precedence.
@@ -439,16 +345,26 @@ def init_db() -> sqlite3.Connection:
             PRIMARY KEY (symbol, ts)
         );
 
+        -- Daily IV snapshots used to compute trailing-percentile IV rank.
+        CREATE TABLE IF NOT EXISTS iv_history (
+            symbol TEXT NOT NULL,
+            ts REAL NOT NULL,
+            iv_current REAL NOT NULL,
+            source TEXT,
+            PRIMARY KEY (symbol, ts)
+        );
+
         CREATE INDEX IF NOT EXISTS idx_signal_scores_ts ON signal_scores(ts);
         CREATE INDEX IF NOT EXISTS idx_signal_returns_signal ON signal_returns(signal_name, ts);
         CREATE INDEX IF NOT EXISTS idx_composite_scores_ts ON composite_scores(ts);
         CREATE INDEX IF NOT EXISTS idx_template_recs_ts ON template_recommendations(ts);
+        CREATE INDEX IF NOT EXISTS idx_iv_history_symbol_ts ON iv_history(symbol, ts);
     """)
 
     # ── Migrations for existing DBs ─────────────────────────────
-    # Use helper for idempotent column adds (simplified from repeated try/except)
-    _ensure_column(conn, "strategies", "slot", "INTEGER NOT NULL DEFAULT 1")
-    _ensure_column(conn, "live_signals", "slot", "INTEGER NOT NULL DEFAULT 1")
+    # Idempotent column adds. Legacy `live_signals.slot` migration was removed
+    # along with the table itself.
+    _ensure_column(conn, "trade_feedback", "template_name", "TEXT")
 
     # Continuous env metrics
     _env_continuous_cols = [
@@ -509,6 +425,78 @@ def get_all_research_config() -> dict[str, float]:
     """Return all DB-stored tunable config values as {key: value}."""
     rows = get_db().execute("SELECT key, value FROM research_config").fetchall()
     return {r["key"]: float(r["value"]) for r in rows}
+
+
+# ═══════════════════════════════════════════════════════════════
+# IV HISTORY (for trailing-percentile IV rank)
+# ═══════════════════════════════════════════════════════════════
+
+# Minimum number of historical IV snapshots before trailing percentile
+# is considered meaningful.  Below this we return None so callers fall
+# back to the chain-derived approximation.
+_IV_HISTORY_MIN_SAMPLES = 30
+
+
+def record_iv_snapshot(symbol: str, iv_current: float | None, source: str = "marketdata") -> None:
+    """Record one daily IV snapshot for a symbol.
+
+    Idempotent within the same UTC day: a second call on the same day
+    overwrites the prior snapshot via INSERT OR REPLACE on (symbol, ts)
+    where ts is the UTC date as a unix timestamp at midnight.
+    """
+    if iv_current is None:
+        return
+    try:
+        from datetime import datetime, timezone
+        today = datetime.now(timezone.utc).replace(
+            hour=0, minute=0, second=0, microsecond=0
+        )
+        day_ts = today.timestamp()
+        db = get_db()
+        db.execute(
+            "INSERT OR REPLACE INTO iv_history (symbol, ts, iv_current, source) "
+            "VALUES (?, ?, ?, ?)",
+            (symbol.upper(), day_ts, float(iv_current), source),
+        )
+        db.commit()
+    except Exception as e:
+        logger.debug(f"record_iv_snapshot failed for {symbol}: {e}")
+
+
+def compute_iv_rank_percentile(
+    symbol: str,
+    iv_current: float | None = None,
+    lookback_days: int = 252,
+) -> float | None:
+    """Return IV rank as the percentile of `iv_current` versus trailing
+    `lookback_days` of `iv_history` snapshots for `symbol`.
+
+    Returns None when fewer than _IV_HISTORY_MIN_SAMPLES snapshots exist.
+    If `iv_current` is None the most recent snapshot is used.
+    Result is in [0, 100].
+    """
+    try:
+        db = get_db()
+        from datetime import datetime, timezone
+        cutoff_ts = (
+            datetime.now(timezone.utc).timestamp() - lookback_days * 86400
+        )
+        rows = db.execute(
+            "SELECT iv_current FROM iv_history "
+            "WHERE symbol = ? AND ts >= ? ORDER BY ts ASC",
+            (symbol.upper(), cutoff_ts),
+        ).fetchall()
+        if not rows or len(rows) < _IV_HISTORY_MIN_SAMPLES:
+            return None
+        values = [float(r["iv_current"]) for r in rows]
+        if iv_current is None:
+            iv_current = values[-1]
+        # Percentile = % of historical samples strictly below current IV.
+        below = sum(1 for v in values if v < iv_current)
+        return max(0.0, min(100.0, 100.0 * below / len(values)))
+    except Exception as e:
+        logger.debug(f"compute_iv_rank_percentile failed for {symbol}: {e}")
+        return None
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -576,7 +564,7 @@ def record_trade(
     """Record a closed trade into the trades table.
 
     This feeds the feedback loop: _match_trade_to_signal() matches these
-    rows to live_signals by symbol + time proximity, then writes
+    rows to template_recommendations by symbol + time proximity and writes
     trade_feedback rows tracking execution gaps.
 
     Returns the trade row id, or None on failure.
@@ -612,9 +600,11 @@ def record_trade(
 
 
 def _match_trade_to_signal(db, trade_id: int, symbol: str) -> None:
-    """Match a single trade to the closest live_signal by symbol + time proximity.
+    """Match a closed trade to the most recent template_recommendation for the
+    symbol and write a trade_feedback row.
 
-    Writes to trade_feedback table for execution quality tracking.
+    The legacy `live_signals` ⨝ `signals` join was removed when those tables
+    were retired; we now match against the signal-engine's recommendations.
     """
     trade = db.execute(
         "SELECT id, symbol, side, pnl, ts FROM trades WHERE id = ?",
@@ -623,26 +613,34 @@ def _match_trade_to_signal(db, trade_id: int, symbol: str) -> None:
     if not trade:
         return
 
-    signal = db.execute(
-        """SELECT ls.id, ls.slot, ls.direction, ls.entry_price,
-                  s.return_pct as sim_return, s.strategy_id
-           FROM live_signals ls
-           LEFT JOIN signals s ON s.strategy_id = ls.strategy_id
-               AND s.symbol = ls.symbol
-           WHERE ls.symbol = ?
-             AND ABS(julianday(ls.ts) - julianday(?)) < 7.0
-           ORDER BY ABS(julianday(ls.ts) - julianday(?)) ASC
-           LIMIT 1""",
-        (symbol.upper(), trade["ts"], trade["ts"]),
-    ).fetchone()
+    # Convert the trade's ISO timestamp to a unix epoch float so we can
+    # compare against the REAL `ts` column on template_recommendations.
+    try:
+        trade_epoch = datetime.fromisoformat(trade["ts"]).timestamp()
+    except Exception:
+        trade_epoch = None
 
-    if not signal:
-        logger.debug(f"No matching signal for trade {trade_id} ({symbol})")
+    rec = None
+    if trade_epoch is not None:
+        # Within a 7-day window pick the closest recommendation by ts.
+        rec = db.execute(
+            """SELECT rowid AS id, template_name, direction, entry_price,
+                      composite_score, ts
+               FROM template_recommendations
+               WHERE symbol = ?
+                 AND ABS(ts - ?) < 7.0 * 86400
+               ORDER BY ABS(ts - ?) ASC
+               LIMIT 1""",
+            (symbol.upper(), trade_epoch, trade_epoch),
+        ).fetchone()
+
+    if not rec:
+        logger.debug(f"No matching recommendation for trade {trade_id} ({symbol})")
         return
 
-    sim_return = signal["sim_return"] or 0
+    sim_return = rec["composite_score"] or 0.0
     actual_pnl = trade["pnl"] or 0
-    entry_price = signal["entry_price"]
+    entry_price = rec["entry_price"]
 
     if entry_price and entry_price > 0:
         actual_return_pct = (actual_pnl / entry_price) * 100
@@ -653,24 +651,25 @@ def _match_trade_to_signal(db, trade_id: int, symbol: str) -> None:
     db.execute(
         """INSERT INTO trade_feedback
            (ts, trade_id, signal_id, slot, simulated_return,
-            actual_pnl, execution_gap, symbol)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+            actual_pnl, execution_gap, symbol, template_name)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
         (
             datetime.now(timezone.utc).isoformat(),
             trade_id,
-            signal["id"],
-            signal["slot"],
+            rec["id"],
+            None,                  # legacy slot column — unused for new rows
             sim_return,
             actual_pnl,
             execution_gap,
             symbol.upper(),
+            rec["template_name"],
         ),
     )
     db.commit()
     gap_str = f"{execution_gap:.2f}%" if execution_gap is not None else "unknown"
     logger.info(
-        f"Trade feedback: trade {trade_id} -> signal {signal['id']} "
-        f"slot={signal['slot']} gap={gap_str}"
+        f"Trade feedback: trade {trade_id} -> template {rec['template_name']} "
+        f"gap={gap_str}"
     )
 
 

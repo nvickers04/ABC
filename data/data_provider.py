@@ -594,6 +594,31 @@ class DataProvider:
 
         return results
 
+    async def get_quotes_bulk_async(self, symbols: List[str]) -> Dict[str, Quote]:
+        """Async version of get_quotes_bulk — avoids nest_asyncio deadlock.
+
+        Use from async callers sharing the main event loop.
+        """
+        results: Dict[str, Quote] = {}
+        try:
+            raw_quotes = await self._mda_client.get_quotes_bulk(symbols)
+            for symbol, raw in raw_quotes.items():
+                if raw:
+                    results[symbol] = Quote(
+                        symbol=symbol,
+                        last=raw.get('last'),
+                        bid=raw.get('bid'),
+                        ask=raw.get('ask'),
+                        volume=raw.get('volume', 0),
+                        change_pct=raw.get('change_pct'),
+                        source=raw.get('source', 'unknown'),
+                        timestamp=datetime.now(),
+                        source_updated=raw.get('updated'),
+                    )
+        except Exception as e:
+            logger.warning(f"Bulk quote fetch (async) failed: {e}")
+        return results
+
     def get_candles_bulk(self, symbols: List[str]) -> Dict[str, Candles]:
         """
         Get daily candles for multiple symbols in a single API call.
@@ -1099,6 +1124,22 @@ class DataProvider:
                 iv_high = raw.get('iv_high')
                 iv_low = raw.get('iv_low')
                 iv_rank = raw.get('iv_rank')
+
+                # Snapshot today's IV into iv_history (best-effort, idempotent
+                # within a UTC day) so the trailing-percentile path below has
+                # data to work with over time.
+                try:
+                    from memory import record_iv_snapshot, compute_iv_rank_percentile
+                    if iv_current:
+                        record_iv_snapshot(symbol, iv_current,
+                                           source=raw.get('source', 'marketdata'))
+                    # Prefer true trailing percentile once enough history exists.
+                    if iv_rank is None:
+                        pct = compute_iv_rank_percentile(symbol, iv_current)
+                        if pct is not None:
+                            iv_rank = pct
+                except Exception as snap_err:
+                    logger.debug(f"iv_history plumbing failed for {symbol}: {snap_err}")
 
                 # Compute iv_rank from iv_high/iv_low if not provided by API
                 if iv_rank is None and iv_high and iv_low and iv_high != iv_low:

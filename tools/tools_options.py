@@ -1,7 +1,7 @@
 """Options tool handlers (single leg, spreads, management, chain/greeks)."""
 
 import logging
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Any
 
 logger = logging.getLogger(__name__)
@@ -868,7 +868,7 @@ async def handle_option_chain(executor, params: dict) -> Any:
         "is_historical": chain.is_historical,
         "as_of_date": chain.as_of_date,
         "data_warning": None,
-        "timestamp": __import__('datetime').datetime.utcnow().strftime('%Y-%m-%dT%H:%M:%SZ'),
+        "timestamp": datetime.now(timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ'),
     }
 
 

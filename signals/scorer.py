@@ -92,25 +92,42 @@ async def _scoring_round(dp, conn, round_num: int) -> int:
     # ── Universe ────────────────────────────────────────────
     from research.config import RESEARCH_UNIVERSE
     universe = list(RESEARCH_UNIVERSE)
+    logger.info(
+        "Round %d starting: universe=%d, signals=%d",
+        round_num, len(universe), len(SIGNAL_REGISTRY),
+    )
 
     # ── Bulk data fetch (Tier 1 data) ──────────────────────
-    quotes = dp.get_quotes_bulk(universe)
+    # All MDA calls use async siblings to avoid nest_asyncio deadlock on Py3.13.
+    quotes = await dp.get_quotes_bulk_async(universe)
     credits_used += 1
 
-    # Per-symbol 30-day candles — signals need 25-50 bars, bulk only has 1.
+    # Per-symbol candles — run concurrently so blocking serial calls don't
+    # freeze the event loop (which would also stall the agent's LLM cycle).
+    candles_results = await asyncio.gather(
+        *[dp.get_candles_async(sym, days_back=60) for sym in universe],
+        return_exceptions=True,
+    )
     candles_map: dict[str, Any] = {}
-    for sym in universe:
-        c = dp.get_candles(sym, days_back=60)
-        if c:
-            candles_map[sym] = c
+    for sym, res in zip(universe, candles_results):
+        if isinstance(res, Exception):
+            logger.debug("Candles fetch failed for %s: %s", sym, res)
+            continue
+        if res:
+            candles_map[sym] = res
     credits_used += len(universe)
+    logger.info("Round %d: candles fetched for %d/%d symbols", round_num, len(candles_map), len(universe))
 
     # SPY/QQQ for market-level signals
-    spy_candles = dp.get_candles("SPY")
-    qqq_candles = dp.get_candles("QQQ")
+    spy_candles, qqq_candles = await asyncio.gather(
+        dp.get_candles_async("SPY", days_back=60),
+        dp.get_candles_async("QQQ", days_back=60),
+    )
 
     # Environment snapshot
-    env = _get_environment(dp, universe, candles_map)
+    # _get_environment makes sync dp.* calls (nest_asyncio-based) — run
+    # in a worker thread so the main event loop is not blocked/patched.
+    env = await asyncio.to_thread(_get_environment, dp, universe, candles_map)
 
     # ── Tier 1: Score cheap signals (40 signals, full universe) ─
     tier1_signals = {
@@ -118,10 +135,13 @@ async def _scoring_round(dp, conn, round_num: int) -> int:
         if sig.tier == 1
     }
 
-    tier1_scores: dict[str, dict[str, dict]] = {}  # {symbol: {signal_name: result}}
     now = time.time()
 
-    for sym in universe:
+    # Per-symbol Tier 1 work (9+ sync dp.* fundamentals calls each) must
+    # run off-loop; parallelize with a semaphore to avoid credit spikes.
+    t1_sem = asyncio.Semaphore(8)
+
+    def _score_tier1(sym: str) -> tuple[str, dict]:
         sym_data = _build_symbol_data(
             sym, dp, quotes, candles_map,
             spy_candles=spy_candles, qqq_candles=qqq_candles,
@@ -129,9 +149,24 @@ async def _scoring_round(dp, conn, round_num: int) -> int:
         )
         sym_scores = {}
         for sig_name, sig in tier1_signals.items():
-            result = sig.score(sym, sym_data)
-            sym_scores[sig_name] = result
-        tier1_scores[sym] = sym_scores
+            sym_scores[sig_name] = sig.score(sym, sym_data)
+        return sym, sym_scores
+
+    async def _t1_task(sym: str):
+        async with t1_sem:
+            return await asyncio.to_thread(_score_tier1, sym)
+
+    t1_results = await asyncio.gather(
+        *[_t1_task(s) for s in universe], return_exceptions=True,
+    )
+    tier1_scores: dict[str, dict[str, dict]] = {}
+    for item in t1_results:
+        if isinstance(item, Exception):
+            logger.debug("Tier 1 symbol failed: %s", item)
+            continue
+        sym, scores = item
+        tier1_scores[sym] = scores
+    logger.info("Round %d: Tier 1 scored %d/%d symbols", round_num, len(tier1_scores), len(universe))
 
     # Persist Tier 1 scores
     _persist_scores(conn, tier1_scores, now)
@@ -157,9 +192,7 @@ async def _scoring_round(dp, conn, round_num: int) -> int:
         if sig.tier == 2
     }
 
-    tier2_scores: dict[str, dict[str, dict]] = {}
-    for sym in tier2_symbols:
-        # Fetch option chain + IV rank
+    def _score_tier2(sym: str) -> tuple[str, dict]:
         try:
             iv_info = dp.get_iv_info(sym, dte_min=OPTION_CHAIN_DTE_RANGE[0], dte_max=OPTION_CHAIN_DTE_RANGE[1])
         except Exception:
@@ -168,9 +201,6 @@ async def _scoring_round(dp, conn, round_num: int) -> int:
             chain = dp.get_option_chain(sym)
         except Exception:
             chain = None
-
-        credits_used += 2  # chain + IV
-
         sym_data = _build_symbol_data(
             sym, dp, quotes, candles_map,
             spy_candles=spy_candles, qqq_candles=qqq_candles,
@@ -179,13 +209,27 @@ async def _scoring_round(dp, conn, round_num: int) -> int:
         )
         sym_scores = {}
         for sig_name, sig in tier2_signals.items():
-            result = sig.score(sym, sym_data)
-            sym_scores[sig_name] = result
-        tier2_scores[sym] = sym_scores
+            sym_scores[sig_name] = sig.score(sym, sym_data)
+        return sym, sym_scores
 
-        if credits_used >= MAX_CREDITS_PER_ROUND:
-            logger.warning("Credit budget exhausted (%d >= %d)", credits_used, MAX_CREDITS_PER_ROUND)
-            break
+    t2_sem = asyncio.Semaphore(4)
+
+    async def _t2_task(sym: str):
+        async with t2_sem:
+            return await asyncio.to_thread(_score_tier2, sym)
+
+    t2_results = await asyncio.gather(
+        *[_t2_task(s) for s in tier2_symbols], return_exceptions=True,
+    )
+    tier2_scores: dict[str, dict[str, dict]] = {}
+    for item in t2_results:
+        if isinstance(item, Exception):
+            logger.debug("Tier 2 symbol failed: %s", item)
+            continue
+        sym, scores = item
+        tier2_scores[sym] = scores
+    credits_used += 2 * len(tier2_scores)
+    logger.info("Round %d: Tier 2 scored %d/%d symbols", round_num, len(tier2_scores), len(tier2_symbols))
 
     # Persist Tier 2 scores
     _persist_scores(conn, tier2_scores, now)
@@ -202,39 +246,42 @@ async def _scoring_round(dp, conn, round_num: int) -> int:
         full_composites.items(), key=lambda x: abs(x[1]), reverse=True,
     )[:TRADE_REC_TOP_N]
 
-    recommendations = []
-    for sym, comp_score in top_symbols:
+    def _build_rec(sym: str, comp_score: float):
         quote = quotes.get(sym)
         iv_info = None
         try:
             iv_info = dp.get_iv_info(sym, dte_min=7, dte_max=60)
         except Exception:
             pass
-
-        iv_rank = None
-        if iv_info:
-            iv_rank = getattr(iv_info, "iv_rank", None)
-
+        iv_rank = getattr(iv_info, "iv_rank", None) if iv_info else None
         atr_pct = None
         try:
             atr_pct = dp.get_atr_percent(sym)
         except Exception:
             pass
-
         vol_regime = env.get("volatility_regime", "normal") if env else "normal"
-
-        rec = select_template(
+        return select_template(
             conn, sym, comp_score,
             iv_rank=iv_rank, atr_pct=atr_pct,
             vol_regime=vol_regime, quote=quote,
         )
-        if rec:
-            recommendations.append(rec)
+
+    rec_results = await asyncio.gather(
+        *[asyncio.to_thread(_build_rec, sym, cs) for sym, cs in top_symbols],
+        return_exceptions=True,
+    )
+    recommendations = []
+    for item in rec_results:
+        if isinstance(item, Exception):
+            logger.debug("Template selection failed: %s", item)
+            continue
+        if item:
+            recommendations.append(item)
 
     write_recommendations(conn, recommendations)
 
     # ── Forward returns for prior-round scores ─────────────
-    _compute_forward_returns(conn, dp, candles_map, now)
+    await asyncio.to_thread(_compute_forward_returns, conn, dp, candles_map, now)
 
     logger.info(
         "Round %d: N_eff=%.1f, %d composites, %d recs, %d credits",

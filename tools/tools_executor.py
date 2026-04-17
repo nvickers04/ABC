@@ -231,7 +231,6 @@ _ALIASES: dict[str, str] = {
     "fundamentals_extended": "extended_fundamentals",
     "buy_stock": "market_order",
     "sell_stock": "market_order",
-    "close": "close_position",
     "bull_call_spread": "vertical_spread",
     "bear_put_spread": "vertical_spread",
     "bear_call_spread": "vertical_spread",

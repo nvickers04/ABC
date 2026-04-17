@@ -210,8 +210,9 @@ ACCOUNT:   account($), positions($), open_orders($), get_position($), refresh_st
 ORDERS:    bracket_order, market_order, limit_order, stop_order, stop_limit, trailing_stop,
            oca_order, adaptive_order, midprice_order, vwap_order, twap_order, relative_order,
            snap_mid_order, modify_stop, cancel_order, cancel_stops, flatten_limits
-OPTIONS:   option_chain($$$), buy_option, vertical_spread, iron_condor, straddle, strangle,
-           calendar_spread, diagonal_spread, butterfly, collar, protective_put, covered_call,
+OPTIONS:   option_chain($$$), option_quote($), option_greeks($), buy_option, vertical_spread,
+           iron_condor, iron_butterfly, straddle, strangle, calendar_spread, diagonal_spread,
+           butterfly, collar, protective_put, covered_call, cash_secured_put,
            close_option, close_spread, roll_option
 SIZING:    calculate_size($), plan_order($$), enter_option($$), instrument_selector($$)
 

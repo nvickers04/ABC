@@ -37,13 +37,17 @@ TRADE_REC_TOP_N = 8              # Tier 3: top N from Tier 2 get template select
 EVOLUTION_COOLDOWN_MARKET_HOURS = 1800   # 30 min between evolution rounds during market
 EVOLUTION_COOLDOWN_OFF_HOURS = 300       # 5 min between rounds outside market hours
 
-# Per-category forward-return horizons (bars at 5-min resolution)
+# Per-category forward-return horizons IN BARS.  The scorer fetches DAILY
+# candles (resolution='D', days_back=60), so "bars" here = trading days.
+# Horizons must be short enough to resolve inside the 60-day history
+# window, otherwise forward returns never materialise and no edge is
+# ever measured.
 FORWARD_RETURN_HORIZON = {
-    "price": 12,           # ~1 hour at 5min bars (intraday signals resolve fast)
-    "volatility": 60,      # ~5 hours (IV mean-reverts over sessions)
-    "fundamental": 390,    # ~3 trading days (earnings impact plays out over days)
-    "macro": 78,           # ~1 trading day (event reactions unfold in a session)
-    "microstructure": 12,  # ~1 hour (flow signals are short-lived)
+    "price": 1,            # 1 day (intraday/trend signals resolve fast)
+    "volatility": 3,       # 3 days (IV mean-reverts over days, not sessions)
+    "fundamental": 10,     # 10 days (post-earnings drift / fundamental re-rating)
+    "macro": 1,            # 1 day (event reactions unfold within a session)
+    "microstructure": 1,   # 1 day (flow signals are short-lived)
 }
 
 # API budget configuration

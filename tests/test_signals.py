@@ -1014,14 +1014,14 @@ class TestSignalICAttribution:
         from memory import get_research_config, set_research_config
 
         set_research_config("ic_noise_streak:bad_sig", 0.0, reason="test reset")
-        # Noise-level IC with enough obs to be trusted.
+        # Noise-level IC (|ic| < threshold) with enough obs to be trusted.
         ic = {"bad_sig": {
             "ic": _IC_NOISE_THRESHOLD / 2,
             "t": 0.3,
             "n": _IC_MIN_OBS + 5,
         }}
 
-        # Run just under the threshold — no RETIRE_CANDIDATE yet.
+        # Run just under the threshold -- no RETIRE_CANDIDATE yet.
         for _ in range(_IC_RETIRE_STREAK - 1):
             _update_ic_retirement(db, ic)
         assert int(get_research_config("ic_noise_streak:bad_sig", 0)) \

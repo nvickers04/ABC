@@ -10,6 +10,7 @@ Replaces the old slot-based research loop with a three-tier signal pipeline:
 from __future__ import annotations
 
 import asyncio
+import bisect
 import json
 import logging
 import time
@@ -642,6 +643,14 @@ def _compute_forward_returns(conn, dp, candles_map: dict, current_ts: float) -> 
     Compute forward returns for prior-round scores and write R(i,s) to signal_returns.
 
     R(i,s) = score(i,sym,s) × forward_return(sym, s→s+h)
+
+    CRITICAL: the forward return must be measured from the bar AT the score
+    timestamp to `horizon` bars later.  Earlier versions used trailing price
+    windows relative to the current time, which caused label leakage (recent
+    price moves fed back into IC via the same prices used to compute
+    momentum/mean-reversion signals → fabricated IC magnitudes of 0.5+).
+    Rows whose horizon has not yet elapsed are left unrecorded and retried
+    on the next round when fresh candles land.
     """
     # Get prior-round scores that don't yet have forward returns computed
     cur = conn.execute(
@@ -664,26 +673,44 @@ def _compute_forward_returns(conn, dp, candles_map: dict, current_ts: float) -> 
         return
 
     rows = []
+    pending = 0
+    no_candles = 0
+    no_entry = 0
     for row in prior_scores:
         sig_name, sym, score_ts, score = row
         sig = SIGNAL_REGISTRY.get(sig_name)
         if not sig:
             continue
 
-        horizon = FORWARD_RETURN_HORIZON.get(sig.category, 12)
+        horizon = FORWARD_RETURN_HORIZON.get(sig.category, 5)
 
-        # Use per-symbol candles (30-60 day history)
         candles = candles_map.get(sym)
         if not candles:
+            no_candles += 1
             continue
 
-        closes = candles.close  # Candles.close is already a list[float]
-        if len(closes) < 2:
+        closes = candles.close
+        ts_list = candles.timestamps
+        if len(closes) < 2 or not ts_list or len(ts_list) != len(closes):
+            no_candles += 1
             continue
 
-        # Use most recent price as forward price (approximation for live scoring)
-        entry_price = closes[-min(horizon + 1, len(closes))]
-        exit_price = closes[-1]
+        # Locate the bar at or just after score_ts.  bisect_left gives the
+        # first index i where ts_list[i] >= score_ts.
+        i_entry = bisect.bisect_left(ts_list, score_ts)
+        if i_entry >= len(ts_list):
+            # Score is more recent than the newest candle — nothing to do yet.
+            no_entry += 1
+            continue
+
+        i_exit = i_entry + horizon
+        if i_exit >= len(ts_list):
+            # Horizon has not elapsed.  Leave unrecorded; retry next round.
+            pending += 1
+            continue
+
+        entry_price = closes[i_entry]
+        exit_price = closes[i_exit]
 
         if entry_price and entry_price > 0:
             fwd_return = (exit_price - entry_price) / entry_price
@@ -701,4 +728,7 @@ def _compute_forward_returns(conn, dp, candles_map: dict, current_ts: float) -> 
             rows,
         )
         conn.commit()
-        logger.info("Computed %d forward returns for %d prior-round scores", len(rows), len(prior_scores))
+    logger.info(
+        "Forward returns: wrote=%d pending=%d no_entry=%d no_candles=%d (of %d prior scores)",
+        len(rows), pending, no_entry, no_candles, len(prior_scores),
+    )

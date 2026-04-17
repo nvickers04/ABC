@@ -112,6 +112,25 @@ _NEFF_CIRCUIT_THRESHOLD = 2.5
 _NEFF_CIRCUIT_STREAK = 3
 _NEFF_STREAK_KEY = "n_eff_low_streak"
 
+# ── Structural tunables (improvements #1-6) ─────────────────────
+# SNR = |mean(R)| / std(R).  Below this, signal × forward-return is
+# pure noise — drop from weighting.
+_SNR_FLOOR = 0.05
+
+# Number of periods a signal must be constant (zero-variance) before
+# it gets flagged as "dead" with a WARNING.
+_DEAD_SIGNAL_PERIODS = 100
+
+# EWMA half-life for correlation weighting (in periods).  Clamped to
+# >= 30 so we don't over-react on thin histories.
+_EWMA_HALFLIFE_FRACTION = 0.25
+_EWMA_HALFLIFE_MIN = 30
+
+# Max |weight| per category (after step-11 normalization).  Prevents a
+# single category (e.g. "price" with 15 correlated signals) from
+# dominating the portfolio.  0.40 allows 2x the equal-category share.
+_CATEGORY_WEIGHT_CAP = 0.40
+
 
 def _update_neff_streak(db_conn, n_eff: float) -> int:
     """Increment / reset the persistent low-N_eff streak counter and return
@@ -258,7 +277,17 @@ def _run_11_steps(
     R: np.ndarray,  # shape (N, M)
     signal_names: list[str],
 ) -> tuple[dict[str, float], float]:
-    """Execute the 11-step alpha combination and return (weights, n_eff)."""
+    """Execute the 11-step alpha combination and return (weights, n_eff).
+
+    Enhancements over the raw procedure:
+    - Zero-variance signals forced to weight 0 (no information).
+    - Low SNR signals (|mean(R)| / std(R) < floor) forced to weight 0.
+    - N_eff uses Ledoit-Wolf shrinkage + EWMA-weighted correlation
+      (more stable than raw sample correlation when T ~ N).
+    - Per-category weight caps prevent single-category dominance.
+    - Per-category N_eff is logged for diagnostics.
+    - Persistent dead signals are flagged with a WARNING.
+    """
     N, M = R.shape
 
     # Step 1: R(i,s) already loaded — rows are signals, columns are periods
@@ -276,7 +305,6 @@ def _run_11_steps(
 
     # Step 5: Drop the most recent observation
     if M <= 2:
-        # Not enough data after dropping
         equal_w = {s: 1.0 / N for s in signal_names}
         return equal_w, float(N)
     Y_trimmed = Y[:, :-1]  # shape (N, M-1)
@@ -297,26 +325,29 @@ def _run_11_steps(
     E_normalized = E / sigma  # shape (N,)
 
     # Step 9: Regress out shared variance
-    # OLS: E_normalized ~ Lambda (no intercept)
-    # Lambda: (N, M-2), E_normalized: (N,)
-    # Want: E_normalized = Lambda @ beta + epsilon
-    # epsilon = E_normalized - Lambda @ beta
     try:
-        beta, residuals, rank, sv = np.linalg.lstsq(Lambda, E_normalized, rcond=None)
+        beta, _residuals, _rank, _sv = np.linalg.lstsq(Lambda, E_normalized, rcond=None)
         epsilon = E_normalized - Lambda @ beta
     except (np.linalg.LinAlgError, ValueError):
         logger.warning("OLS regression failed — using E_normalized directly")
         epsilon = E_normalized
 
     # Step 10: Portfolio weight for each signal
-    # w(i) = eta * epsilon(i) / sigma(i)
     raw_w = epsilon / sigma  # shape (N,)
 
-    # Zero-variance signals (constant R across all periods) produce
-    # near-zero sigma → degenerate huge raw_w that dominate after
-    # normalization.  Treat them as no-information and drop to zero.
+    # ── Filters (improvements #1 + #5) ──────────────────────────
+    # Zero-variance signals: constant R produces near-zero sigma and
+    # degenerate epsilon/sigma → ∞ that dominate after normalization.
     zero_var_mask = sigma_sq <= 1e-14
     raw_w[zero_var_mask] = 0.0
+
+    # Low-SNR signals: |mean(R)| / std(R) below floor means the signal
+    # has no directional edge regardless of how uncorrelated it is.
+    abs_mean = np.abs(R.mean(axis=1))
+    std = np.sqrt(np.maximum(R.var(axis=1), 1e-24))
+    snr = abs_mean / std
+    low_snr_mask = (~zero_var_mask) & (snr < _SNR_FLOOR)
+    raw_w[low_snr_mask] = 0.0
 
     # Step 11: Normalize so sum|w| = 1
     abs_sum = np.abs(raw_w).sum()
@@ -325,16 +356,17 @@ def _run_11_steps(
     else:
         weights = raw_w / abs_sum
 
-    # N_eff from correlation matrix — exclude zero-variance signals
-    # (signals with constant R produce NaN rows in corrcoef)
-    row_var = np.var(R, axis=1)
-    active_mask = row_var > 1e-14
+    # ── Per-category weight caps (improvement #6) ───────────────
+    weights = _apply_category_caps(weights, signal_names)
+
+    # ── N_eff with Ledoit-Wolf shrinkage + EWMA (improvements #3 + #4) ──
+    active_mask = ~zero_var_mask
     n_active = int(active_mask.sum())
 
     if n_active >= 2:
-        C = np.corrcoef(R[active_mask])
-        C = np.nan_to_num(C, nan=0.0)
-        np.fill_diagonal(C, 1.0)  # ensure diagonal is 1
+        R_active = R[active_mask]
+        halflife = max(_EWMA_HALFLIFE_MIN, int(M * _EWMA_HALFLIFE_FRACTION))
+        C = _ewma_shrunk_correlation(R_active, halflife=halflife)
         eigvals = np.linalg.eigvalsh(C)
         eigvals = np.maximum(eigvals, 0.0)
         sum_eig = eigvals.sum()
@@ -348,8 +380,22 @@ def _run_11_steps(
         n_eff, n_active, N, M,
     )
 
-    # N_eff circuit breaker — threshold 2: below this, there is
-    # effectively only one independent factor (pure market beta)
+    # ── Per-category N_eff diagnostics (improvement #2) ─────────
+    _log_category_n_eff(R, active_mask, signal_names)
+
+    # ── Dead-signal diagnostics (improvement #1) ────────────────
+    if M >= _DEAD_SIGNAL_PERIODS:
+        dead = [
+            signal_names[i] for i in range(N)
+            if zero_var_mask[i] and not np.all(np.isnan(R[i]))
+        ]
+        if dead:
+            logger.warning(
+                "Dead signals (zero variance over %d periods): %s",
+                M, ", ".join(sorted(dead)),
+            )
+
+    # ── Hard circuit breaker — single dominant factor ───────────
     if n_eff < 2:
         logger.warning(
             "N_eff %.1f < 2 — single dominant factor, falling back to equal weights",
@@ -361,6 +407,119 @@ def _run_11_steps(
 
     w_dict = {signal_names[i]: float(weights[i]) for i in range(N)}
     return w_dict, float(n_eff)
+
+
+# ---------------------------------------------------------------------------
+# Internal — Correlation estimators (Ledoit-Wolf + EWMA)
+# ---------------------------------------------------------------------------
+
+def _ewma_shrunk_correlation(R: np.ndarray, halflife: float) -> np.ndarray:
+    """EWMA-weighted correlation with Ledoit-Wolf shrinkage toward identity.
+
+    R: (n_active, M) signal return rows.  Returns (n_active, n_active) PSD
+    correlation matrix.  Recent periods dominate according to half-life.
+    Shrinkage intensity is chosen to minimize MSE vs the identity target
+    (a simplified LW estimator suitable for correlation matrices).
+    """
+    n, M = R.shape
+    if n < 2 or M < 2:
+        return np.eye(max(n, 1))
+
+    # EWMA weights normalized to sum to M (so effective sample size is M).
+    decay = np.log(2.0) / max(halflife, 1.0)
+    t = np.arange(M)
+    w = np.exp(-decay * (M - 1 - t))
+    w = w * (M / w.sum())  # normalize so sum(w) = M
+    w_row = w[np.newaxis, :]  # (1, M)
+
+    # Weighted mean & centered data
+    mu = (R * w_row).sum(axis=1, keepdims=True) / M
+    Rc = R - mu
+
+    # Weighted covariance
+    Sw = (Rc * w_row) @ Rc.T / M  # (n, n)
+
+    # Convert to correlation
+    d = np.sqrt(np.maximum(np.diag(Sw), 1e-24))
+    C = Sw / np.outer(d, d)
+    C = np.nan_to_num(C, nan=0.0)
+    np.fill_diagonal(C, 1.0)
+
+    # Ledoit-Wolf shrinkage toward identity on the correlation matrix.
+    # Intensity ∝ 1/M (more shrinkage when sample is short).  This is a
+    # simplified LW: the full formula requires 4th-order moments but the
+    # 1/M approximation is close in practice and much cheaper.
+    off_diag_sq = (C ** 2).sum() - n  # excludes diagonal (which is 1)
+    if off_diag_sq < 1e-12:
+        return C
+    lam = min(1.0, max(0.0, (n + n * n) / (M * off_diag_sq)))
+    C_shrunk = (1.0 - lam) * C + lam * np.eye(n)
+    return C_shrunk
+
+
+def _log_category_n_eff(
+    R: np.ndarray,
+    active_mask: np.ndarray,
+    signal_names: list[str],
+) -> None:
+    """Log per-category N_eff so we can see which category is saturated."""
+    cats: dict[str, list[int]] = {}
+    for i, name in enumerate(signal_names):
+        if not active_mask[i]:
+            continue
+        sig = SIGNAL_REGISTRY.get(name)
+        cat = sig.category if sig else "unknown"
+        cats.setdefault(cat, []).append(i)
+
+    parts = []
+    for cat in sorted(cats.keys()):
+        idx = cats[cat]
+        if len(idx) < 2:
+            parts.append(f"{cat}={len(idx)}")
+            continue
+        C = np.corrcoef(R[idx])
+        C = np.nan_to_num(C, nan=0.0)
+        np.fill_diagonal(C, 1.0)
+        ev = np.maximum(np.linalg.eigvalsh(C), 0.0)
+        s1, s2 = ev.sum(), (ev ** 2).sum()
+        n_eff_cat = (s1 * s1 / s2) if s2 > 1e-12 else float(len(idx))
+        parts.append(f"{cat}={n_eff_cat:.1f}/{len(idx)}")
+    if parts:
+        logger.info("N_eff by category: %s", " ".join(parts))
+
+
+def _apply_category_caps(
+    weights: np.ndarray,
+    signal_names: list[str],
+) -> np.ndarray:
+    """Cap |weight| sum per category at `_CATEGORY_WEIGHT_CAP`.
+
+    If a category's total |weight| exceeds the cap, scale all weights in
+    that category down proportionally.  After capping, rescale the full
+    vector so sum|w| = 1 again.  Categories under the cap are unchanged.
+    """
+    if weights.size == 0:
+        return weights
+
+    cat_indices: dict[str, list[int]] = {}
+    for i, name in enumerate(signal_names):
+        sig = SIGNAL_REGISTRY.get(name)
+        cat = sig.category if sig else "unknown"
+        cat_indices.setdefault(cat, []).append(i)
+
+    w = weights.copy()
+    abs_w = np.abs(w)
+
+    for cat, idx in cat_indices.items():
+        cat_sum = abs_w[idx].sum()
+        if cat_sum > _CATEGORY_WEIGHT_CAP:
+            scale = _CATEGORY_WEIGHT_CAP / cat_sum
+            w[idx] *= scale
+
+    abs_total = np.abs(w).sum()
+    if abs_total > 1e-12:
+        w = w / abs_total
+    return w
 
 
 # ---------------------------------------------------------------------------

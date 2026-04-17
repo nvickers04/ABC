@@ -1635,23 +1635,43 @@ class DataProvider:
                     recent = txns.head(10)
 
                     for _, row in recent.iterrows():
-                        txn_type = str(row.get('Transaction', ''))
-                        is_buy = 'Buy' in txn_type or 'Purchase' in txn_type
-                        is_sell = 'Sale' in txn_type or 'Sell' in txn_type
+                        # yfinance often returns an empty 'Transaction' column;
+                        # the actual buy/sell classification lives in 'Text'
+                        # (e.g. "Sale at price 69.57 - 70.17 per share." or
+                        # "Purchase at price 12.34 per share.").  Fall back to
+                        # 'Position'/'Ownership' hints only if both are empty.
+                        txn_type = str(row.get('Transaction', '') or '').strip()
+                        text = str(row.get('Text', '') or '').strip()
+                        combined = f"{txn_type} {text}".lower()
+                        is_buy = ('buy' in combined or 'purchase' in combined
+                                  or 'acquired' in combined)
+                        is_sell = ('sale' in combined or 'sell' in combined
+                                   or 'disposed' in combined or 'sold' in combined)
 
-                        if is_buy:
+                        # Guard against nan values from yfinance
+                        raw_value = row.get('Value', 0)
+                        try:
+                            import math
+                            if raw_value is None or (isinstance(raw_value, float) and math.isnan(raw_value)):
+                                raw_value = 0
+                        except Exception:
+                            raw_value = 0
+
+                        if is_buy and not is_sell:
                             buys += 1
-                            buy_value += row.get('Value', 0) or 0
-                        elif is_sell:
+                            buy_value += raw_value or 0
+                        elif is_sell and not is_buy:
                             sells += 1
-                            sell_value += row.get('Value', 0) or 0
+                            sell_value += raw_value or 0
 
                         transactions.append(InsiderTransaction(
                             insider=row.get('Insider', 'Unknown'),
-                            relation=row.get('Relationship'),
-                            transaction_type='Buy' if is_buy else 'Sale' if is_sell else txn_type,
-                            shares=int(row.get('Shares', 0)),
-                            value=row.get('Value'),
+                            relation=row.get('Relationship') or row.get('Position'),
+                            transaction_type='Buy' if is_buy and not is_sell
+                                             else 'Sale' if is_sell and not is_buy
+                                             else (txn_type or 'Unknown'),
+                            shares=int(row.get('Shares', 0) or 0),
+                            value=raw_value if raw_value else None,
                         ))
             except Exception:
                 pass

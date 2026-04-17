@@ -28,7 +28,9 @@ logger = logging.getLogger(__name__)
 
 # API Base URL
 API_BASE = "https://api.marketdata.app/v1"
-_OPTIONS_RETRY_STATUSES = {429, 500, 502, 503, 504}
+# 429 is excluded: it means credits exhausted or per-second throttle — retry
+# just burns more credits. Circuit breaker handles recovery via reset time.
+_OPTIONS_RETRY_STATUSES = {500, 502, 503, 504}
 _OPTIONS_MAX_CONCURRENCY = 3
 _OPTIONS_RETRY_ATTEMPTS = 3
 _MDA_MAX_CONCURRENT = 45  # MDA hard limit is 50; keep 5 headroom
@@ -70,9 +72,33 @@ class MarketDataClient:
         self._credits_limit: Optional[int] = None
         self._credits_reset: Optional[int] = None  # UTC epoch seconds
         self._low_credit_warned: bool = False
+        self._breaker_warned: bool = False
 
         if not self.api_key:
             logger.warning("No Market Data App API key configured")
+
+    def _is_credits_exhausted(self) -> bool:
+        """Circuit breaker: short-circuit requests when MDA credits are depleted.
+
+        Returns True when credits_remaining is known to be <= 0 AND the reset
+        time is still in the future. Prevents burning retry attempts (and
+        further 429-triggered credit deductions) after the quota runs out.
+        """
+        if self._credits_remaining is None or self._credits_remaining > 0:
+            return False
+        # Credits <= 0. If we have a reset time and it has passed, allow through
+        # (next response will refresh the counters).
+        if self._credits_reset is not None:
+            import time
+            if time.time() >= self._credits_reset:
+                return False
+        if not self._breaker_warned:
+            logger.warning(
+                f"MDA circuit breaker OPEN: credits_remaining={self._credits_remaining}, "
+                f"reset_epoch={self._credits_reset}. Suppressing all MDA calls until reset."
+            )
+            self._breaker_warned = True
+        return True
 
     def _get_http_client(self) -> Optional[httpx.AsyncClient]:
         """Get or create HTTP client for the current event loop.
@@ -80,8 +106,13 @@ class MarketDataClient:
         Uses a per-loop cache keyed by id(loop) so that worker threads
         running their own event loops (via asyncio.to_thread → _run_async)
         do not clobber the main loop's client.
+
+        Returns None if credits are exhausted (circuit breaker) or no API
+        key is configured.
         """
         if not self.api_key:
+            return None
+        if self._is_credits_exhausted():
             return None
         try:
             current_loop = asyncio.get_running_loop()
@@ -217,6 +248,14 @@ class MarketDataClient:
                 self._credits_limit = int(limit)
             if reset is not None:
                 self._credits_reset = int(reset)
+            # Fallback: if we got a 429 without headers, force breaker trip
+            if response.status_code == 429 and (
+                self._credits_remaining is None or self._credits_remaining > 0
+            ):
+                self._credits_remaining = 0
+            # Reset breaker-warned flag once credits recover (after reset)
+            if self._credits_remaining is not None and self._credits_remaining > 0:
+                self._breaker_warned = False
             # Warn once when credits drop below 10%
             if self._credits_remaining is not None and self._credits_limit:
                 pct = self._credits_remaining / self._credits_limit

@@ -130,12 +130,13 @@ def combine_signals(
     # ── Estimated IR + gate ─────────────────────────────────────
     # IR ≈ mean(positive IC) × √N_eff  (Fundamental Law of Active Mgmt).
     # Persist snapshot to research_config so the briefing can surface it
-    # to the trading agent as a go/no-go signal.
+    # to the trading agent as an ADVISORY conviction multiplier — not a
+    # binary trade permission.
     estimated_ir, gate_open = _publish_ir_snapshot(db_conn, ic_stats, n_eff)
     if not gate_open:
-        logger.warning(
-            "IR gate CLOSED: estimated_ir=%.4f < %.4f — agent should not "
-            "open new positions this round",
+        logger.info(
+            "Quant edge currently weak (IR=%.4f < %.4f): advisory — "
+            "agent should prefer position management, hedges, and smaller size.",
             estimated_ir, _IR_GATE_MIN,
         )
 

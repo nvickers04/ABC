@@ -48,6 +48,42 @@ from tools.tools_executor import ToolExecutor
 logger = logging.getLogger(__name__)
 
 
+# ── Symbol → sector map for portfolio concentration summary ─────
+# Matches the diversified RESEARCH_UNIVERSE.  Used for cheap in-prompt
+# exposure reporting; no external lookup.  Unknown symbols bucket as
+# "other".
+_SECTOR_MAP: dict[str, str] = {
+    # Mega-cap tech / AI
+    "NVDA": "tech", "META": "tech", "AMD": "tech", "AVGO": "tech",
+    # High-growth software
+    "CRWD": "software", "NET": "software", "PLTR": "software", "APP": "software",
+    # Fintech
+    "SOFI": "fintech", "HOOD": "fintech",
+    # Consumer discretionary
+    "DKNG": "discretionary", "CAVA": "discretionary",
+    # Healthcare
+    "LLY": "healthcare", "UNH": "healthcare", "GILD": "healthcare",
+    # Energy
+    "XOM": "energy", "OXY": "energy",
+    # Traditional financials
+    "JPM": "financials", "GS": "financials",
+    # Industrials
+    "CAT": "industrials", "UPS": "industrials",
+    # Staples
+    "COST": "staples", "WMT": "staples",
+    # Materials
+    "FCX": "materials",
+    # EM / China
+    "BABA": "em",
+    # Common hedges
+    "SPY": "index_hedge", "QQQ": "index_hedge", "IWM": "index_hedge",
+}
+
+
+def _sector_of(symbol: str) -> str:
+    return _SECTOR_MAP.get((symbol or "").upper(), "other")
+
+
 # ── Research Cache Entry ────────────────────────────────────────
 
 _TICKER_SYMBOLS: set[str] = set()
@@ -941,6 +977,29 @@ If no changes warranted: []"""
                     else:
                         conc_str = ", ".join(f"{s}=${v['notional']:,.0f}" for s, v in top_syms)
                     lines.append(f"Concentration (top 3 of NetLiq): {conc_str}")
+
+                # Sector exposure — group per-symbol notional by sector
+                if per_symbol:
+                    sector_totals: dict[str, float] = {}
+                    for sym, v in per_symbol.items():
+                        sector_totals[_sector_of(sym)] = (
+                            sector_totals.get(_sector_of(sym), 0.0) + v["notional"]
+                        )
+                    if sector_totals:
+                        sorted_sectors = sorted(
+                            sector_totals.items(), key=lambda kv: kv[1], reverse=True
+                        )
+                        if net_liq_val > 0:
+                            sec_str = ", ".join(
+                                f"{s}={n / net_liq_val * 100:.1f}%"
+                                for s, n in sorted_sectors if n > 0
+                            )
+                        else:
+                            sec_str = ", ".join(
+                                f"{s}=${n:,.0f}" for s, n in sorted_sectors if n > 0
+                            )
+                        if sec_str:
+                            lines.append(f"Sector exposure: {sec_str}")
         except Exception as e:
             logger.debug(f"Portfolio risk summary failed: {e}")
 

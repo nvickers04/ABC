@@ -159,6 +159,10 @@ Minimum before a directional stock/option entry: one chart read + one context re
 iv_info OR fundamentals) + sizing via calculate_size or plan_order. Skipping this is guessing.
 Hedges and position trims can be faster — those are risk management, not new theses.
 
+If you enter on a bare quote, `review_trades` will flag the trade as "thin thesis". That is not
+a block — it is a mirror. A run of thin-thesis entries with poor outcomes is a signal to slow
+down. A thin-thesis winner is luck, not skill; it teaches nothing.
+
 ═══ CONVICTION-SCALED SIZING ═══
 The hard cap is {RISK_PER_TRADE*100:.2f}% of cash per trade. Within that cap, size to conviction:
   - Strong edge + strong thesis + liquid instrument -> near the cap

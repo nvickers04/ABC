@@ -238,6 +238,9 @@ src/data/memory/backups/
 data/memory/agents/
 data/memory/shared/
 memory/*.db
+memory/*.db-wal
+memory/*.db-shm
+memory/*.db-journal
 data/vector_db/
 .testmondata
 

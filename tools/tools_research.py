@@ -1,6 +1,7 @@
 """Research and market data tool handlers."""
 
 import datetime
+from datetime import date
 import logging
 from dataclasses import asdict
 from typing import Any
@@ -416,17 +417,32 @@ async def handle_budget(executor, params: dict) -> Any:
 
 
 async def handle_economic_calendar(executor, params: dict) -> Any:
-    """Return today's macro events + 3-day look-ahead."""
+    """Return today's macro events + look-ahead. Always surface the next
+    upcoming event so an empty short window is not mistaken for missing data.
+    """
     try:
         from data.economic_calendar import get_todays_events, get_upcoming_events
         today_events = get_todays_events()
-        upcoming = get_upcoming_events(days=3)
-        return {
+        upcoming_3d = get_upcoming_events(days=3)
+        # Look further out to find the next high-impact event if short window is empty.
+        upcoming_14d = get_upcoming_events(days=14)
+        next_event = None
+        for e in upcoming_14d:
+            if e.date > (today_events[0].date if today_events else date.today()):
+                next_event = e.to_dict()
+                break
+        if next_event is None and upcoming_14d:
+            next_event = upcoming_14d[0].to_dict()
+        result = {
             "today": [e.to_dict() for e in today_events],
-            "upcoming_3d": [e.to_dict() for e in upcoming],
+            "upcoming_3d": [e.to_dict() for e in upcoming_3d],
             "count_today": len(today_events),
-            "count_upcoming": len(upcoming),
+            "count_upcoming": len(upcoming_3d),
+            "next_high_impact": next_event,
         }
+        if not today_events and not upcoming_3d:
+            result["note"] = "No high-impact US macro events in the next 3 days."
+        return result
     except Exception as e:
         logger.warning(f"economic_calendar failed: {e}")
         return {"today": [], "upcoming_3d": [], "count_today": 0, "count_upcoming": 0, "warning": str(e)}

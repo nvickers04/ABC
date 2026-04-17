@@ -1006,51 +1006,66 @@ class TestSignalICAttribution:
 
     def test_retirement_streak_increments_and_warns(self, db, caplog):
         from signals.combiner import (
-            _compute_signal_ic,
             _update_ic_retirement,
             _IC_RETIRE_STREAK,
+            _IC_NOISE_THRESHOLD,
             _IC_MIN_OBS,
         )
         from memory import get_research_config, set_research_config
 
-        db.execute("DELETE FROM signal_returns")
-        db.commit()
-        # Negative IC with plenty of obs so it counts toward the streak.
-        self._seed_paired(db, "bad_sig", ic_target=-0.40,
-                          n=max(_IC_MIN_OBS + 5, 40))
-        set_research_config("ic_neg_streak:bad_sig", 0.0, reason="test reset")
-
-        ic = _compute_signal_ic(db, ["bad_sig"], window_days=365)
-        assert ic["bad_sig"]["ic"] < 0
+        set_research_config("ic_noise_streak:bad_sig", 0.0, reason="test reset")
+        # Noise-level IC with enough obs to be trusted.
+        ic = {"bad_sig": {
+            "ic": _IC_NOISE_THRESHOLD / 2,
+            "t": 0.3,
+            "n": _IC_MIN_OBS + 5,
+        }}
 
         # Run just under the threshold — no RETIRE_CANDIDATE yet.
         for _ in range(_IC_RETIRE_STREAK - 1):
             _update_ic_retirement(db, ic)
-        assert int(get_research_config("ic_neg_streak:bad_sig", 0)) \
+        assert int(get_research_config("ic_noise_streak:bad_sig", 0)) \
             == _IC_RETIRE_STREAK - 1
 
         # One more call → streak == threshold → WARNING emitted.
         with caplog.at_level("WARNING", logger="signals.combiner"):
             _update_ic_retirement(db, ic)
-        assert int(get_research_config("ic_neg_streak:bad_sig", 0)) \
+        assert int(get_research_config("ic_noise_streak:bad_sig", 0)) \
             == _IC_RETIRE_STREAK
         assert any("RETIRE_CANDIDATE" in m and "bad_sig" in m
                    for m in caplog.messages)
 
-    def test_positive_ic_resets_streak(self, db):
+    def test_informative_ic_resets_streak(self, db):
+        """Both positive AND negative IC are informative -- only |IC|~0 is noise."""
         from signals.combiner import _compute_signal_ic, _update_ic_retirement
         from memory import get_research_config, set_research_config
 
         db.execute("DELETE FROM signal_returns")
         db.commit()
         self._seed_paired(db, "good_sig", ic_target=0.25, n=60)
-        set_research_config("ic_neg_streak:good_sig", 4.0, reason="test preload")
+        set_research_config("ic_noise_streak:good_sig", 4.0, reason="test preload")
 
         ic = _compute_signal_ic(db, ["good_sig"], window_days=365)
         assert ic["good_sig"]["ic"] > 0
 
         _update_ic_retirement(db, ic)
-        assert int(get_research_config("ic_neg_streak:good_sig", 0)) == 0
+        assert int(get_research_config("ic_noise_streak:good_sig", 0)) == 0
+
+    def test_negative_ic_also_resets_streak(self, db):
+        """Negative IC is informative (inverse signal). Must NOT retire."""
+        from signals.combiner import _compute_signal_ic, _update_ic_retirement
+        from memory import get_research_config, set_research_config
+
+        db.execute("DELETE FROM signal_returns")
+        db.commit()
+        self._seed_paired(db, "inverse_sig", ic_target=-0.40, n=60)
+        set_research_config("ic_noise_streak:inverse_sig", 4.0, reason="test preload")
+
+        ic = _compute_signal_ic(db, ["inverse_sig"], window_days=365)
+        assert ic["inverse_sig"]["ic"] < -0.1  # strongly negative = informative
+
+        _update_ic_retirement(db, ic)
+        assert int(get_research_config("ic_noise_streak:inverse_sig", 0)) == 0
 
     def test_retirement_mask_zeros_weights_and_renormalizes(self, db):
         from signals.combiner import _apply_ic_retirement_mask, _IC_RETIRE_STREAK
@@ -1058,11 +1073,11 @@ class TestSignalICAttribution:
 
         # Pre-mark sig_b as retired.
         set_research_config(
-            "ic_neg_streak:sig_b", float(_IC_RETIRE_STREAK),
+            "ic_noise_streak:sig_b", float(_IC_RETIRE_STREAK),
             reason="test: mark retired",
         )
-        set_research_config("ic_neg_streak:sig_a", 0.0, reason="test reset")
-        set_research_config("ic_neg_streak:sig_c", 0.0, reason="test reset")
+        set_research_config("ic_noise_streak:sig_a", 0.0, reason="test reset")
+        set_research_config("ic_noise_streak:sig_c", 0.0, reason="test reset")
 
         w_in = {"sig_a": 0.4, "sig_b": 0.4, "sig_c": 0.2}
         w_out = _apply_ic_retirement_mask(db, w_in)
@@ -1074,28 +1089,30 @@ class TestSignalICAttribution:
         # Original proportion between a and c preserved (0.4 : 0.2 = 2:1).
         assert abs(w_out["sig_a"] - 2 * w_out["sig_c"]) < 1e-9
 
-    def test_ir_gate_closes_when_no_positive_ic(self, db):
+    def test_ir_gate_closes_when_all_ic_is_noise(self, db):
+        """Only |IC| near zero counts as noise; negative IC is still edge."""
         from signals.combiner import _publish_ir_snapshot, _IR_GATE_MIN
         db.execute("DELETE FROM signal_returns")
         db.commit()
 
-        # All trusted signals have negative IC → mean_positive_ic = 0 → IR = 0.
+        # All trusted signals have |IC| below noise threshold → IR = 0.
         ic_stats = {
-            "neg_a": {"ic": -0.10, "t": -2.0, "n": 100},
-            "neg_b": {"ic": -0.05, "t": -1.2, "n": 100},
+            "noise_a": {"ic": 0.005, "t": 0.2, "n": 100},
+            "noise_b": {"ic": -0.010, "t": -0.4, "n": 100},
         }
         ir, gate = _publish_ir_snapshot(db, ic_stats, n_eff=4.0)
         assert ir == 0.0
         assert gate is False
         assert _IR_GATE_MIN > 0
 
-    def test_ir_gate_opens_when_positive_ic_and_neff(self, db):
+    def test_ir_gate_opens_with_negative_ic_too(self, db):
+        """A strongly-negative IC signal contributes to IR via |IC|."""
         from signals.combiner import _publish_ir_snapshot, _IR_GATE_MIN
 
-        # Two positive ICs averaging 0.10, N_eff=4 → IR = 0.10 * sqrt(4) = 0.20
+        # Two signals with |IC| averaging 0.10, N_eff=4 → IR = 0.10 * sqrt(4) = 0.20
         ic_stats = {
             "pos_a": {"ic": 0.08, "t": 2.5, "n": 100},
-            "pos_b": {"ic": 0.12, "t": 3.1, "n": 100},
+            "inv_b": {"ic": -0.12, "t": -3.1, "n": 100},
         }
         ir, gate = _publish_ir_snapshot(db, ic_stats, n_eff=4.0)
         assert abs(ir - 0.20) < 1e-9

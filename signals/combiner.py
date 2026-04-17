@@ -172,8 +172,12 @@ _IC_WINDOW_DAYS = 60
 # Minimum observations before IC / t-stat are trusted.  Below this we
 # still log the IC but don't count it toward retirement streaks.
 _IC_MIN_OBS = 30
-# Consecutive rounds of IC ≤ 0 (with enough obs) before we emit a
-# RETIRE_CANDIDATE warning.  Each round = one combine_signals() call.
+# A signal whose |IC| falls below this threshold (on a trusted sample)
+# is considered effectively noise. Negative IC is NOT a disqualifier --
+# the weight optimizer can flip the sign. Only |IC| ≈ 0 means no info.
+_IC_NOISE_THRESHOLD = 0.02
+# Consecutive rounds of |IC| < noise threshold (with enough obs) before
+# we emit a RETIRE_CANDIDATE warning.
 _IC_RETIRE_STREAK = 5
 # How many signals to log in top/bottom attribution lists each round.
 _IC_ATTRIBUTION_TOP_K = 5
@@ -669,12 +673,14 @@ def _update_ic_retirement(
     db_conn,
     ic_stats: dict[str, dict[str, float]],
 ) -> None:
-    """Track per-signal streaks of non-positive IC and warn on retirement.
+    """Track per-signal streaks of |IC| near zero and warn on retirement.
 
     Streaks are persisted via ``research_config`` under key
-    ``ic_neg_streak:{signal}``.  A signal with IC ≤ 0 and n >= min-obs
-    for ``_IC_RETIRE_STREAK`` consecutive combiner rounds is logged as a
-    RETIRE_CANDIDATE (WARNING).  Positive IC resets the streak.
+    ``ic_noise_streak:{signal}``.  A signal with |IC| < noise threshold
+    and n >= min-obs for ``_IC_RETIRE_STREAK`` consecutive rounds is
+    logged as a RETIRE_CANDIDATE (WARNING).  Any informative |IC|
+    (positive OR negative -- the weight engine can flip the sign)
+    resets the streak.
 
     Persistence failures are non-fatal.
     """
@@ -687,23 +693,23 @@ def _update_ic_retirement(
     for name, d in ic_stats.items():
         if d["n"] < _IC_MIN_OBS:
             continue
-        key = f"ic_neg_streak:{name}"
+        key = f"ic_noise_streak:{name}"
         prev = int(get_research_config(key, 0))
-        new = prev + 1 if d["ic"] <= 0.0 else 0
+        new = prev + 1 if abs(d["ic"]) < _IC_NOISE_THRESHOLD else 0
         if new != prev:
             try:
                 set_research_config(
                     key,
                     float(new),
-                    reason=f"combiner: ic={d['ic']:+.4f} n={d['n']}",
+                    reason=f"combiner: |ic|={abs(d['ic']):.4f} n={d['n']}",
                 )
             except Exception:
                 pass
         if new >= _IC_RETIRE_STREAK and (new == _IC_RETIRE_STREAK or new % 5 == 0):
             logger.warning(
-                "RETIRE_CANDIDATE %s -- IC <= 0 for %d consecutive rounds "
+                "RETIRE_CANDIDATE %s -- |IC| < %.3f for %d consecutive rounds "
                 "(ic=%+.4f t=%+.2f n=%d)",
-                name, new, d["ic"], d["t"], d["n"],
+                name, _IC_NOISE_THRESHOLD, new, d["ic"], d["t"], d["n"],
             )
 
 
@@ -743,7 +749,7 @@ def _apply_ic_retirement_mask(
     retired: list[str] = []
     for name in weights:
         try:
-            streak = int(get_research_config(f"ic_neg_streak:{name}", 0))
+            streak = int(get_research_config(f"ic_noise_streak:{name}", 0))
         except Exception:
             streak = 0
         if streak >= _IC_RETIRE_STREAK:
@@ -773,10 +779,11 @@ def _publish_ir_snapshot(
 ) -> tuple[float, bool]:
     """Compute estimated IR and publish gate state to research_config.
 
-    estimated_ir = mean(positive IC over trusted signals) * sqrt(N_eff).
-    Only IC values with n >= _IC_MIN_OBS and ic > 0 contribute — this
-    matches the Fundamental Law's assumption of independent *positive*
-    edges.  If no signal clears the bar we report IR = 0.
+    estimated_ir = mean(|IC| over trusted signals) * sqrt(N_eff).
+    Both positive and negative IC values contribute via their absolute
+    value -- a negative-IC signal is informative (the weight optimizer
+    flips its sign). Only |IC| near zero represents noise.
+    If no signal clears the bar we report IR = 0.
 
     Stores three numeric keys for briefing consumption:
       - estimated_ir
@@ -790,17 +797,17 @@ def _publish_ir_snapshot(
     except Exception:
         return 0.0, True  # fail-open so the combiner still works
 
-    trusted_positive = [
-        d["ic"] for d in ic_stats.values()
-        if d["n"] >= _IC_MIN_OBS and d["ic"] > 0.0
+    trusted_abs_ic = [
+        abs(d["ic"]) for d in ic_stats.values()
+        if d["n"] >= _IC_MIN_OBS and abs(d["ic"]) >= _IC_NOISE_THRESHOLD
     ]
-    mean_ic = float(np.mean(trusted_positive)) if trusted_positive else 0.0
+    mean_ic = float(np.mean(trusted_abs_ic)) if trusted_abs_ic else 0.0
     ir = mean_ic * float(np.sqrt(max(n_eff, 0.0)))
     gate_open = ir >= _IR_GATE_MIN
 
     try:
         set_research_config(_IR_ESTIMATE_KEY, ir,
-                            reason=f"mean_pos_ic={mean_ic:.4f} n_eff={n_eff:.2f}")
+                            reason=f"mean_abs_ic={mean_ic:.4f} n_eff={n_eff:.2f}")
         set_research_config(_IR_GATE_OPEN_KEY, 1.0 if gate_open else 0.0,
                             reason=f"ir={ir:.4f} min={_IR_GATE_MIN}")
         set_research_config("ir_snapshot_ts", float(time.time()),
@@ -809,7 +816,7 @@ def _publish_ir_snapshot(
         logger.debug("IR snapshot persistence failed: %s", e)
 
     logger.info(
-        "IR_ESTIMATE ir=%.4f mean_pos_ic=%.4f n_eff=%.2f gate_open=%s",
+        "IR_ESTIMATE ir=%.4f mean_abs_ic=%.4f n_eff=%.2f gate_open=%s",
         ir, mean_ic, n_eff, gate_open,
     )
     return ir, gate_open

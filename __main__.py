@@ -112,12 +112,12 @@ def main():
     parser = argparse.ArgumentParser(description="Grok 4.20 Trader")
     parser.add_argument("--test", action="store_true", help="Test Grok connection")
     parser.add_argument("--verbose", action="store_true", help="Enable DEBUG logging")
-    parser.add_argument("--research", action="store_true",
-                        help="Pre-start the research scorer before the agent boots "
-                             "(default: agent controls it via research_engine tool)")
-    parser.add_argument("--evolution", action="store_true",
-                        help="Pre-start template evolution before the agent boots "
-                             "(default: agent controls it via research_engine tool)")
+    parser.add_argument("--no-research", action="store_true",
+                        help="Don't pre-start the background scorer "
+                             "(agent can still start it via research_engine tool)")
+    parser.add_argument("--no-evolution", action="store_true",
+                        help="Don't pre-start template evolution "
+                             "(agent can still start it via research_engine tool)")
     parser.add_argument(
         "--account",
         choices=["paper", "live"],
@@ -145,16 +145,16 @@ def main():
 
     from core.agent import run_agent
 
-    if args.research:
+    if not args.no_research:
         from signals.scorer import run_research_threaded
-        print("Research scorer pre-started (agent can pause/stop via research_engine tool)\n")
+        print("Research scorer running (agent can pause/stop via research_engine tool)\n")
         run_research_threaded(verbose=args.verbose)
 
     tasks = [run_agent()]
-    if args.evolution:
+    if not args.no_evolution:
         from signals.template_evolution import run_template_evolution
         tasks.append(run_template_evolution())
-        print("Template evolution pre-started (agent can pause/stop via research_engine tool)\n")
+        print("Template evolution running (agent can pause/stop via research_engine tool)\n")
 
     async def _run_all():
         results = await asyncio.gather(*tasks, return_exceptions=True)

@@ -954,8 +954,33 @@ If no changes warranted: []"""
             te_state = "off"
             if _te.is_evolution_running():
                 te_state = "paused" if _te.is_evolution_paused() else "running"
+
+            # IR snapshot freshness — tells the agent whether briefing.edge
+            # is current or stale. Stale edge can still be used but the agent
+            # should discount it.
+            age_str = "unknown"
+            try:
+                from memory import get_research_config
+                import time as _time
+                ts = float(get_research_config("ir_snapshot_ts", 0.0))
+                if ts > 0:
+                    age_s = _time.time() - ts
+                    if age_s < 60:
+                        age_str = f"{age_s:.0f}s ago"
+                    elif age_s < 3600:
+                        age_str = f"{age_s/60:.0f}min ago"
+                    elif age_s < 86400:
+                        age_str = f"{age_s/3600:.1f}h ago (STALE)"
+                    else:
+                        age_str = f"{age_s/86400:.1f}d ago (VERY STALE)"
+            except Exception:
+                pass
+
             lines.append("")
-            lines.append(f"═══ RESEARCH ENGINE ═══ scorer={sc_state}  evolution={te_state}")
+            lines.append(
+                f"═══ RESEARCH ENGINE ═══ scorer={sc_state}  evolution={te_state}  "
+                f"edge_snapshot={age_str}"
+            )
             lines.append("(control via research_engine action=start|pause|resume|stop)")
         except Exception as e:
             logger.debug(f"Engine status failed: {e}")

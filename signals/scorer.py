@@ -15,6 +15,7 @@ import logging
 import time
 from typing import Any
 
+from core.async_utils import safe_sleep
 from research.config import (
     DEEP_SCAN_TOP_N,
     FORWARD_RETURN_HORIZON,
@@ -111,7 +112,7 @@ async def run_research(*, verbose: bool = False) -> None:
             logger.error("Scoring round %d failed: %s", round_num, e, exc_info=True)
 
         try:
-            await asyncio.sleep(ROUND_DELAY_SECS)
+            await safe_sleep(ROUND_DELAY_SECS)
         except asyncio.CancelledError:
             logger.info("Scoring loop cancelled")
             break

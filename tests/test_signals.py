@@ -941,3 +941,113 @@ class TestTradeFeedbackMatching:
         assert row["slot"] is None
         assert abs(row["simulated_return"] - 1.25) < 1e-9
         assert row["symbol"] == symbol
+
+
+# ═════════════════════════════════════════════════════════════════
+# 11. Information Coefficient (IC) attribution
+# ═════════════════════════════════════════════════════════════════
+
+class TestSignalICAttribution:
+    """_compute_signal_ic / _log_ic_attribution / _update_ic_retirement."""
+
+    def _seed_paired(self, db, sig_name, ic_target, n=60):
+        """Seed signal_returns for one signal so corr(score, fwd_ret) ≈ ic_target."""
+        import sqlite3  # noqa: F401
+        rng = np.random.default_rng(123)
+        ts_base = time.time() - n * 3600  # recent → inside default 60-day window
+        # score ~ N(0,1); forward_return = ic*score + sqrt(1-ic^2)*noise
+        score = rng.standard_normal(n)
+        noise = rng.standard_normal(n)
+        fwd = ic_target * score + np.sqrt(max(0.0, 1 - ic_target ** 2)) * noise
+        for j in range(n):
+            db.execute(
+                "INSERT INTO signal_returns (signal_name, symbol, ts, "
+                "score_at_entry, forward_return, r_value, horizon_bars) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?)",
+                (sig_name, "TEST", ts_base + j * 60,
+                 float(score[j]), float(fwd[j]),
+                 float(score[j] * fwd[j]), 1),
+            )
+        db.commit()
+
+    def test_ic_recovers_target_correlation(self, db):
+        from signals.combiner import _compute_signal_ic
+        db.execute("DELETE FROM signal_returns")
+        db.commit()
+        self._seed_paired(db, "sig_pos", ic_target=0.30, n=80)
+        self._seed_paired(db, "sig_neg", ic_target=-0.20, n=80)
+
+        ic = _compute_signal_ic(db, ["sig_pos", "sig_neg"], window_days=365)
+        assert "sig_pos" in ic and "sig_neg" in ic
+        # Sample IC should be within ~0.22 of the target with n=80.
+        assert abs(ic["sig_pos"]["ic"] - 0.30) < 0.22
+        assert abs(ic["sig_neg"]["ic"] - (-0.20)) < 0.22
+        # t-stat sign should match IC sign.
+        assert ic["sig_pos"]["t"] > 0
+        assert ic["sig_neg"]["t"] < 0
+        assert ic["sig_pos"]["n"] == 80
+
+    def test_ic_skips_signals_with_too_few_obs(self, db):
+        from signals.combiner import _compute_signal_ic
+        db.execute("DELETE FROM signal_returns")
+        db.commit()
+        # Only 2 obs — below the hard cutoff of 3 in _compute_signal_ic.
+        for j in range(2):
+            db.execute(
+                "INSERT INTO signal_returns (signal_name, symbol, ts, "
+                "score_at_entry, forward_return, r_value, horizon_bars) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?)",
+                ("thin_sig", "TEST", time.time() - j * 60,
+                 0.5, 0.01, 0.005, 1),
+            )
+        db.commit()
+        ic = _compute_signal_ic(db, ["thin_sig"])
+        assert "thin_sig" not in ic
+
+    def test_retirement_streak_increments_and_warns(self, db, caplog):
+        from signals.combiner import (
+            _compute_signal_ic,
+            _update_ic_retirement,
+            _IC_RETIRE_STREAK,
+            _IC_MIN_OBS,
+        )
+        from memory import get_research_config, set_research_config
+
+        db.execute("DELETE FROM signal_returns")
+        db.commit()
+        # Negative IC with plenty of obs so it counts toward the streak.
+        self._seed_paired(db, "bad_sig", ic_target=-0.40,
+                          n=max(_IC_MIN_OBS + 5, 40))
+        set_research_config("ic_neg_streak:bad_sig", 0.0, reason="test reset")
+
+        ic = _compute_signal_ic(db, ["bad_sig"], window_days=365)
+        assert ic["bad_sig"]["ic"] < 0
+
+        # Run just under the threshold — no RETIRE_CANDIDATE yet.
+        for _ in range(_IC_RETIRE_STREAK - 1):
+            _update_ic_retirement(db, ic)
+        assert int(get_research_config("ic_neg_streak:bad_sig", 0)) \
+            == _IC_RETIRE_STREAK - 1
+
+        # One more call → streak == threshold → WARNING emitted.
+        with caplog.at_level("WARNING", logger="signals.combiner"):
+            _update_ic_retirement(db, ic)
+        assert int(get_research_config("ic_neg_streak:bad_sig", 0)) \
+            == _IC_RETIRE_STREAK
+        assert any("RETIRE_CANDIDATE" in m and "bad_sig" in m
+                   for m in caplog.messages)
+
+    def test_positive_ic_resets_streak(self, db):
+        from signals.combiner import _compute_signal_ic, _update_ic_retirement
+        from memory import get_research_config, set_research_config
+
+        db.execute("DELETE FROM signal_returns")
+        db.commit()
+        self._seed_paired(db, "good_sig", ic_target=0.25, n=60)
+        set_research_config("ic_neg_streak:good_sig", 4.0, reason="test preload")
+
+        ic = _compute_signal_ic(db, ["good_sig"], window_days=365)
+        assert ic["good_sig"]["ic"] > 0
+
+        _update_ic_retirement(db, ic)
+        assert int(get_research_config("ic_neg_streak:good_sig", 0)) == 0

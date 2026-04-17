@@ -101,6 +101,15 @@ def combine_signals(
         status = "circuit_breaker_neff"
 
     _persist_weights(db_conn, w_dict, n_eff)
+
+    # ── Signal attribution: per-signal IC (article Part 1 homework) ──
+    # IC = corr(score_at_entry, forward_return).  Logs top/bottom 5 and
+    # tracks consecutive-round streaks of IC ≤ 0 for retirement review.
+    try:
+        _compute_and_log_ic_attribution(db_conn, signal_names)
+    except Exception as e:  # non-fatal — never break the combiner
+        logger.debug("IC attribution failed: %s", e)
+
     return {"weights": w_dict, "n_eff": n_eff, "status": status}
 
 
@@ -130,6 +139,19 @@ _EWMA_HALFLIFE_MIN = 30
 # single category (e.g. "price" with 15 correlated signals) from
 # dominating the portfolio.  0.40 allows 2x the equal-category share.
 _CATEGORY_WEIGHT_CAP = 0.40
+
+# ── IC attribution tunables ─────────────────────────────────────
+# Rolling window for computing per-signal Information Coefficient
+# (Pearson corr between score_at_entry and forward_return).
+_IC_WINDOW_DAYS = 60
+# Minimum observations before IC / t-stat are trusted.  Below this we
+# still log the IC but don't count it toward retirement streaks.
+_IC_MIN_OBS = 30
+# Consecutive rounds of IC ≤ 0 (with enough obs) before we emit a
+# RETIRE_CANDIDATE warning.  Each round = one combine_signals() call.
+_IC_RETIRE_STREAK = 5
+# How many signals to log in top/bottom attribution lists each round.
+_IC_ATTRIBUTION_TOP_K = 5
 
 
 def _update_neff_streak(db_conn, n_eff: float) -> int:
@@ -520,6 +542,145 @@ def _apply_category_caps(
     if abs_total > 1e-12:
         w = w / abs_total
     return w
+
+
+# ---------------------------------------------------------------------------
+# Internal — Information Coefficient (IC) attribution
+# ---------------------------------------------------------------------------
+
+def _compute_signal_ic(
+    db_conn,
+    signal_names: list[str],
+    window_days: int = _IC_WINDOW_DAYS,
+) -> dict[str, dict[str, float]]:
+    """Per-signal IC = Pearson corr(score_at_entry, forward_return).
+
+    Uses all (symbol, ts) observations in the rolling window.  Also
+    returns the IC t-statistic (two-sided) and observation count.
+
+    Returns: {signal_name: {"ic": float, "t": float, "n": int}}
+    Signals with no data in the window are omitted.
+    """
+    cutoff = time.time() - window_days * 86400.0
+    placeholders = ",".join("?" * len(signal_names))
+    cur = db_conn.execute(
+        f"""
+        SELECT signal_name, score_at_entry, forward_return
+          FROM signal_returns
+         WHERE ts >= ? AND signal_name IN ({placeholders})
+        """,
+        (cutoff, *signal_names),
+    )
+
+    buckets: dict[str, list[tuple[float, float]]] = {}
+    for sig, s, r in cur.fetchall():
+        buckets.setdefault(sig, []).append((float(s), float(r)))
+
+    out: dict[str, dict[str, float]] = {}
+    for sig, pairs in buckets.items():
+        n = len(pairs)
+        if n < 3:
+            continue
+        arr = np.asarray(pairs, dtype=float)
+        s, r = arr[:, 0], arr[:, 1]
+        s_std = float(s.std())
+        r_std = float(r.std())
+        if s_std < 1e-12 or r_std < 1e-12:
+            out[sig] = {"ic": 0.0, "t": 0.0, "n": n}
+            continue
+        ic = float(np.corrcoef(s, r)[0, 1])
+        if not np.isfinite(ic):
+            ic = 0.0
+        # Two-sided t-stat: t = IC * sqrt(n-2) / sqrt(1 - IC^2)
+        denom = max(1e-12, 1.0 - ic * ic)
+        t_stat = float(ic * np.sqrt(max(n - 2, 0)) / np.sqrt(denom))
+        out[sig] = {"ic": ic, "t": t_stat, "n": n}
+    return out
+
+
+def _log_ic_attribution(ic_stats: dict[str, dict[str, float]]) -> None:
+    """Log top-K and bottom-K signals by IC each round.
+
+    Format chosen for easy grep: ``IC_TOP`` / ``IC_BOT`` / ``IC_STAT``.
+    """
+    trusted = [
+        (name, d["ic"], d["t"], d["n"])
+        for name, d in ic_stats.items()
+        if d["n"] >= _IC_MIN_OBS
+    ]
+    if not trusted:
+        logger.info("IC_STAT no_signals_with_min_obs=%d", _IC_MIN_OBS)
+        return
+
+    trusted.sort(key=lambda x: x[1], reverse=True)
+    k = _IC_ATTRIBUTION_TOP_K
+    top = trusted[:k]
+    bot = list(reversed(trusted[-k:]))  # worst first
+
+    ics = np.asarray([x[1] for x in trusted])
+    logger.info(
+        "IC_STAT mean=%.4f median=%.4f std=%.4f n_signals=%d min_obs=%d",
+        float(ics.mean()), float(np.median(ics)), float(ics.std()),
+        len(trusted), _IC_MIN_OBS,
+    )
+    for name, ic, t, n in top:
+        logger.info("IC_TOP %-32s ic=%+.4f t=%+.2f n=%d", name, ic, t, n)
+    for name, ic, t, n in bot:
+        logger.info("IC_BOT %-32s ic=%+.4f t=%+.2f n=%d", name, ic, t, n)
+
+
+def _update_ic_retirement(
+    db_conn,
+    ic_stats: dict[str, dict[str, float]],
+) -> None:
+    """Track per-signal streaks of non-positive IC and warn on retirement.
+
+    Streaks are persisted via ``research_config`` under key
+    ``ic_neg_streak:{signal}``.  A signal with IC ≤ 0 and n >= min-obs
+    for ``_IC_RETIRE_STREAK`` consecutive combiner rounds is logged as a
+    RETIRE_CANDIDATE (WARNING).  Positive IC resets the streak.
+
+    Persistence failures are non-fatal.
+    """
+    try:
+        from memory import get_research_config, set_research_config
+    except Exception as e:
+        logger.debug("IC retirement persistence unavailable: %s", e)
+        return
+
+    for name, d in ic_stats.items():
+        if d["n"] < _IC_MIN_OBS:
+            continue
+        key = f"ic_neg_streak:{name}"
+        prev = int(get_research_config(key, 0))
+        new = prev + 1 if d["ic"] <= 0.0 else 0
+        if new != prev:
+            try:
+                set_research_config(
+                    key,
+                    float(new),
+                    reason=f"combiner: ic={d['ic']:+.4f} n={d['n']}",
+                )
+            except Exception:
+                pass
+        if new >= _IC_RETIRE_STREAK and (new == _IC_RETIRE_STREAK or new % 5 == 0):
+            logger.warning(
+                "RETIRE_CANDIDATE %s — IC ≤ 0 for %d consecutive rounds "
+                "(ic=%+.4f t=%+.2f n=%d)",
+                name, new, d["ic"], d["t"], d["n"],
+            )
+
+
+def _compute_and_log_ic_attribution(
+    db_conn,
+    signal_names: list[str],
+) -> None:
+    """One-shot: compute IC, log top/bottom, update retirement streaks."""
+    ic_stats = _compute_signal_ic(db_conn, signal_names)
+    if not ic_stats:
+        return
+    _log_ic_attribution(ic_stats)
+    _update_ic_retirement(db_conn, ic_stats)
 
 
 # ---------------------------------------------------------------------------

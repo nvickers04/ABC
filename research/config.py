@@ -2,15 +2,34 @@
 Research Configuration — Universe, timing, signal combination, and option schemas.
 """
 
-# ── Medium-cap optionable universe ──────────────────────────────
-# $2B-$15B market cap, options available, avg volume >1M
-# Deliberately avoiding mega-caps to stay away from the crowd.
+# ── Diversified optionable universe ─────────────────────────────
+# 25 names spread across sectors/factors so cross-sectional signals
+# (sector_momentum, beta_adjusted_momentum, relative_strength_market,
+# dividend_carry, etc.) have structure to work with. All liquid,
+# all optionable, tight spreads, ADV >>1M shares.
 RESEARCH_UNIVERSE = [
-    "CRWD", "DKNG", "DASH", "MARA", "SOFI",
-    "HOOD", "RBLX", "PLTR", "NET", "PATH",
-    "AFRM", "ROKU", "SNAP", "PINS", "U",
-    "BILL", "HUBS", "ZS", "CELH", "DUOL",
-    "APP", "CFLT", "IOT", "CAVA", "TOST",
+    # Mega-cap tech / AI (different regime drivers than small-cap growth)
+    "NVDA", "META", "AMD", "AVGO",
+    # High-growth software (kept from prior list)
+    "CRWD", "NET", "PLTR", "APP",
+    # Fintech
+    "SOFI", "HOOD",
+    # Consumer discretionary growth
+    "DKNG", "CAVA",
+    # Healthcare (defensive + biotech beta)
+    "LLY", "UNH", "GILD",
+    # Energy (commodity/rates reaction)
+    "XOM", "OXY",
+    # Traditional financials (rate-sensitive, pays divs)
+    "JPM", "GS",
+    # Industrials / transports (cyclical)
+    "CAT", "UPS",
+    # Staples (defensive, pays divs)
+    "COST", "WMT",
+    # Materials / commodities
+    "FCX",
+    # China / EM proxy (USD reaction)
+    "BABA",
 ]
 
 # ── Evaluation ──────────────────────────────────────────────────
@@ -29,9 +48,9 @@ TEMPLATE_EVOLUTION_TRAIN_PCT = 0.70       # walk-forward train fraction
 TEMPLATE_EVOLUTION_MIN_TRADES = 30        # min trades per template for stable metrics
 
 # Tiered scoring: wide cheap scan → narrow expensive scan → trade recs
-TIER1_UNIVERSE_SIZE = 150        # Wide scan: bulk/cached signals only (no option chains)
-DEEP_SCAN_TOP_N = 20             # Tier 2: top N from Tier 1 get full 50 signals + option chains
-TRADE_REC_TOP_N = 8              # Tier 3: top N from Tier 2 get template selection
+TIER1_UNIVERSE_SIZE = 25         # Wide scan: bulk/cached signals only (no option chains)
+DEEP_SCAN_TOP_N = 10             # Tier 2: top N from Tier 1 get full 50 signals + option chains
+TRADE_REC_TOP_N = 5              # Tier 3: top N from Tier 2 get template selection
 
 # Template evolution scheduling
 EVOLUTION_COOLDOWN_MARKET_HOURS = 1800   # 30 min between evolution rounds during market

@@ -81,10 +81,13 @@ def combine_signals(
         return {"weights": w_dict, "n_eff": n_eff, "status": "fallback_equal"}
 
     # ── N_eff monitoring + streak-based circuit breaker ─────────
-    if n_eff < 15:
-        logger.warning("N_eff %.1f < 15 — signals more correlated than expected", n_eff)
-    if n_eff < 10:
-        logger.warning("ALERT: N_eff %.1f < 10 — investigate signal independence", n_eff)
+    # With 50 signals in 5 categories (price/fundamental/macro/volatility/
+    # microstructure), and categories themselves correlated (e.g. market-
+    # direction dominates both "price" and "macro"), the realistic N_eff
+    # ceiling is ~5-6.  We only warn/trip below ~3 where the combiner has
+    # genuinely lost structural advantage.
+    if n_eff < 3:
+        logger.warning("N_eff %.1f < 3 — very few independent dimensions", n_eff)
 
     streak = _update_neff_streak(db_conn, n_eff)
     status = "ok"
@@ -102,9 +105,10 @@ def combine_signals(
 
 
 # ── N_eff circuit-breaker tunables ──────────────────────────────
-# todo Phase 6: "if N_eff < 8 for 3 consecutive rounds: fall back to equal
-# weights and flag for manual review."
-_NEFF_CIRCUIT_THRESHOLD = 8.0
+# Calibrated for a 50-signal / 5-category universe where the realistic
+# N_eff ceiling is ~5-6 (categories themselves share market-direction
+# variance).  Threshold 2.5 = "single factor drowning out everything".
+_NEFF_CIRCUIT_THRESHOLD = 2.5
 _NEFF_CIRCUIT_STREAK = 3
 _NEFF_STREAK_KEY = "n_eff_low_streak"
 
@@ -308,6 +312,12 @@ def _run_11_steps(
     # w(i) = eta * epsilon(i) / sigma(i)
     raw_w = epsilon / sigma  # shape (N,)
 
+    # Zero-variance signals (constant R across all periods) produce
+    # near-zero sigma → degenerate huge raw_w that dominate after
+    # normalization.  Treat them as no-information and drop to zero.
+    zero_var_mask = sigma_sq <= 1e-14
+    raw_w[zero_var_mask] = 0.0
+
     # Step 11: Normalize so sum|w| = 1
     abs_sum = np.abs(raw_w).sum()
     if abs_sum < 1e-12:
@@ -347,9 +357,7 @@ def _run_11_steps(
         )
         weights = np.ones(N) / N
     elif n_eff < 4:
-        logger.info("N_eff %.1f < 4 — few independent signal dimensions", n_eff)
-    elif n_eff < 8:
-        logger.info("N_eff %.1f < 8 — moderate signal correlation", n_eff)
+        logger.debug("N_eff %.1f < 4 — few independent signal dimensions", n_eff)
 
     w_dict = {signal_names[i]: float(weights[i]) for i in range(N)}
     return w_dict, float(n_eff)

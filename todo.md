@@ -87,6 +87,33 @@ because it never touches `DataProvider`.
   (`Cycle 1 turn 1 → LLM response in 5.4s → tool call → turn 2`) while
   the scorer task is actively running in parallel.
 
+## Follow-up bug found after the to_thread fix
+
+A standalone rerun of `_scoring_round` still hung in Tier 2. Root cause:
+
+`MarketDataClient` kept a **single shared** `_http_client` keyed by a
+single `_loop_id`. When worker threads (spawned by `asyncio.to_thread`)
+invoked `_run_async(...)`, each thread created its own event loop and
+called `_get_http_client()`. Seeing a different loop id, the client
+**closed the main-loop client and recreated its own** — 25 threads
+racing to close/recreate the same shared `httpx.AsyncClient` while the
+main loop still had candle/quote requests in flight. Classic cross-loop
+contamination; the main loop's outstanding requests stalled forever.
+
+Fix (`data/marketdata_client.py`):
+
+- `_http_client` / `_loop_id` / `_global_semaphore` / `_options_semaphore`
+  replaced with per-loop dicts keyed by `id(asyncio.get_running_loop())`:
+  `_http_clients`, `_global_semaphores`, `_options_semaphores`.
+- `_get_http_client` returns `None` when called with no running loop
+  (instead of silently mutating state) and auto-rebuilds if the cached
+  client was closed.
+- `close()` iterates and `aclose()`s every per-loop client.
+
+After this fix a standalone scoring round completes in **~126 s** on the
+25-symbol universe (candles 7 s, Tier 1 82 s, Tier 2 28 s, tail 9 s).
+Full pytest suite: **124 passed**.
+
 ## Secondary notes
 
 - `get_candles_bulk` is backed by MDA's `/stocks/bulkcandles/D/` endpoint

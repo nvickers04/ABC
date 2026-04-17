@@ -53,16 +53,18 @@ class MarketDataClient:
             api_key: API key (uses MARKETDATA_TOKEN env var if not provided)
         """
         self.api_key = api_key or os.environ.get('MARKETDATA_TOKEN') or os.environ.get('MARKETDATA_API_KEY')
-        self._http_client: Optional[httpx.AsyncClient] = None
+        # Per-loop HTTP clients and semaphores keyed by id(loop).
+        # A single shared client bound to one loop is unsafe when worker
+        # threads (asyncio.to_thread) run nested asyncio.run / run_until_complete
+        # with their own loops — they would otherwise race to close and
+        # recreate the main-loop client, corrupting in-flight requests.
+        self._http_clients: Dict[int, httpx.AsyncClient] = {}
+        self._options_semaphores: Dict[int, asyncio.Semaphore] = {}
+        self._global_semaphores: Dict[int, asyncio.Semaphore] = {}
         self._request_count = 0
         self._daily_count = 0
         self._daily_reset: Optional[datetime] = None  # Resets at midnight UTC
         self._last_request_time: Optional[datetime] = None
-        self._loop_id: Optional[int] = None  # Track which event loop the client belongs to
-        self._options_semaphore: Optional[asyncio.Semaphore] = None
-        self._options_semaphore_loop_id: Optional[int] = None
-        self._global_semaphore: Optional[asyncio.Semaphore] = None
-        self._global_semaphore_loop_id: Optional[int] = None
         # Credit tracking from MDA response headers
         self._credits_remaining: Optional[int] = None
         self._credits_limit: Optional[int] = None
@@ -72,64 +74,59 @@ class MarketDataClient:
         if not self.api_key:
             logger.warning("No Market Data App API key configured")
 
-    def _get_http_client(self) -> httpx.AsyncClient:
-        """Get or create HTTP client for the current event loop."""
+    def _get_http_client(self) -> Optional[httpx.AsyncClient]:
+        """Get or create HTTP client for the current event loop.
+
+        Uses a per-loop cache keyed by id(loop) so that worker threads
+        running their own event loops (via asyncio.to_thread → _run_async)
+        do not clobber the main loop's client.
+        """
+        if not self.api_key:
+            return None
         try:
             current_loop = asyncio.get_running_loop()
-            current_loop_id = id(current_loop)
         except RuntimeError:
-            # No running loop - will create new client
-            current_loop_id = None
-        
-        # Create new client if none exists or if we're in a different event loop
-        if self._http_client is None or (current_loop_id and self._loop_id != current_loop_id):
-            if self._http_client is not None:
-                # Old client bound to different loop — close it synchronously
-                # httpx.AsyncClient._transport uses httpcore which supports sync close
-                try:
-                    self._http_client._transport.close()
-                except Exception:
-                    pass
-                self._http_client = None
-            
-            if self.api_key:
-                self._http_client = httpx.AsyncClient(
-                    base_url=API_BASE,
-                    headers={"Authorization": f"Bearer {self.api_key}"},
-                    timeout=30.0,
-                    limits=httpx.Limits(
-                        max_connections=_MDA_MAX_CONCURRENT,
-                        max_keepalive_connections=25,
-                        keepalive_expiry=30,
-                    ),
-                )
-                self._loop_id = current_loop_id
-        
-        return self._http_client
+            # No running loop — cannot create an AsyncClient safely.
+            return None
+        loop_id = id(current_loop)
+        client = self._http_clients.get(loop_id)
+        if client is None or client.is_closed:
+            client = httpx.AsyncClient(
+                base_url=API_BASE,
+                headers={"Authorization": f"Bearer {self.api_key}"},
+                timeout=30.0,
+                limits=httpx.Limits(
+                    max_connections=_MDA_MAX_CONCURRENT,
+                    max_keepalive_connections=25,
+                    keepalive_expiry=30,
+                ),
+            )
+            self._http_clients[loop_id] = client
+        return client
 
     def _get_global_semaphore(self) -> asyncio.Semaphore:
-        """Global semaphore enforcing MDA's 50 concurrent request limit."""
+        """Global semaphore enforcing MDA's 50 concurrent request limit (per loop)."""
         try:
-            current_loop_id = id(asyncio.get_running_loop())
+            loop_id = id(asyncio.get_running_loop())
         except RuntimeError:
-            current_loop_id = None
-
-        if self._global_semaphore is None or self._global_semaphore_loop_id != current_loop_id:
-            self._global_semaphore = asyncio.Semaphore(_MDA_MAX_CONCURRENT)
-            self._global_semaphore_loop_id = current_loop_id
-        return self._global_semaphore
+            loop_id = 0
+        sem = self._global_semaphores.get(loop_id)
+        if sem is None:
+            sem = asyncio.Semaphore(_MDA_MAX_CONCURRENT)
+            self._global_semaphores[loop_id] = sem
+        return sem
 
     def _get_options_semaphore(self) -> asyncio.Semaphore:
-        """Get a per-event-loop semaphore for high-volume option endpoints."""
+        """Per-event-loop semaphore for high-volume option endpoints."""
         try:
-            current_loop_id = id(asyncio.get_running_loop())
+            loop_id = id(asyncio.get_running_loop())
         except RuntimeError:
-            current_loop_id = None
-
-        if self._options_semaphore is None or self._options_semaphore_loop_id != current_loop_id:
-            self._options_semaphore = asyncio.Semaphore(_OPTIONS_MAX_CONCURRENCY)
-            self._options_semaphore_loop_id = current_loop_id
-        return self._options_semaphore
+            loop_id = 0
+        sem = self._options_semaphores.get(loop_id)
+        if sem is None:
+            sem = asyncio.Semaphore(_OPTIONS_MAX_CONCURRENCY)
+            self._options_semaphores[loop_id] = sem
+        return sem
 
     async def _get_with_retries(
         self,
@@ -181,10 +178,14 @@ class MarketDataClient:
         return bool(self.api_key)
 
     async def close(self):
-        """Close the HTTP client."""
-        if self._http_client:
-            await self._http_client.aclose()
-            self._http_client = None
+        """Close all per-loop HTTP clients."""
+        clients = list(self._http_clients.values())
+        self._http_clients.clear()
+        for client in clients:
+            try:
+                await client.aclose()
+            except Exception:
+                pass
 
     def _parse_rate_headers(self, response: httpx.Response) -> None:
         """Extract MDA rate-limit headers and warn when credits run low."""

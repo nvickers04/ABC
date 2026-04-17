@@ -695,11 +695,11 @@ def _compute_forward_returns(conn, dp, candles_map: dict, current_ts: float) -> 
             no_candles += 1
             continue
 
-        # Locate the bar at or just after score_ts.  bisect_left gives the
-        # first index i where ts_list[i] >= score_ts.
-        i_entry = bisect.bisect_left(ts_list, score_ts)
-        if i_entry >= len(ts_list):
-            # Score is more recent than the newest candle — nothing to do yet.
+        # Locate the bar representing price knowledge AS OF score_ts:
+        # the most recent bar with timestamp <= score_ts.
+        i_entry = bisect.bisect_right(ts_list, score_ts) - 1
+        if i_entry < 0:
+            # score_ts precedes all candle history.
             no_entry += 1
             continue
 

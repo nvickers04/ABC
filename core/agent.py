@@ -829,8 +829,10 @@ If no changes warranted: []"""
 
         lines.append("")
         lines.append("═══ POSITIONS (manage first) ═══")
+        _positions_snapshot = []
         try:
             positions = await self.gateway.get_positions()
+            _positions_snapshot = positions or []
             if not positions:
                 lines.append("No open positions.")
             else:
@@ -864,6 +866,83 @@ If no changes warranted: []"""
                         )
         except Exception as e:
             lines.append(f"Position error: {e}")
+
+        # ── Portfolio risk summary (cheap aggregation, no extra calls) ──
+        try:
+            if _positions_snapshot:
+                net_liq_val = 0.0
+                cash_val = 0.0
+                try:
+                    _s = await self.gateway.get_account_summary()
+                    net_liq_val = float(_s.get("netliquidation", 0) or 0)
+                    cash_val = float(_s.get("totalcashvalue", 0) or 0)
+                except Exception:
+                    pass
+
+                long_stock_notional = 0.0
+                short_stock_notional = 0.0
+                opt_long_contracts = 0
+                opt_short_contracts = 0
+                total_unreal = 0.0
+                # sym -> {notional, unreal}
+                per_symbol: dict[str, dict[str, float]] = {}
+
+                for p in _positions_snapshot:
+                    sec = p.get("sec_type", "STK")
+                    sym = p.get("symbol", "?")
+                    qty = float(p.get("quantity", 0) or 0)
+                    mkt = float(p.get("market_price", 0) or 0)
+                    unreal = float(p.get("unrealized_pnl", 0) or 0)
+                    total_unreal += unreal
+                    if sec == "OPT":
+                        # option notional ≈ qty * 100 * mkt (premium paid/received)
+                        notional = abs(qty) * 100.0 * mkt
+                        if qty > 0:
+                            opt_long_contracts += int(qty)
+                        else:
+                            opt_short_contracts += int(-qty)
+                    else:
+                        notional = abs(qty) * mkt
+                        if qty > 0:
+                            long_stock_notional += notional
+                        else:
+                            short_stock_notional += notional
+                    agg = per_symbol.setdefault(sym, {"notional": 0.0, "unreal": 0.0})
+                    agg["notional"] += notional
+                    agg["unreal"] += unreal
+
+                lines.append("")
+                lines.append("═══ PORTFOLIO RISK ═══")
+                if net_liq_val > 0:
+                    pct_long = long_stock_notional / net_liq_val * 100
+                    pct_cash = cash_val / net_liq_val * 100
+                    lines.append(
+                        f"Stock long: ${long_stock_notional:,.0f} ({pct_long:.1f}% of NetLiq)  "
+                        f"| Cash: ${cash_val:,.0f} ({pct_cash:.1f}%)"
+                    )
+                else:
+                    lines.append(f"Stock long: ${long_stock_notional:,.0f}  | Cash: ${cash_val:,.0f}")
+                if opt_long_contracts or opt_short_contracts:
+                    lines.append(
+                        f"Options: {opt_long_contracts} long contracts, {opt_short_contracts} short contracts "
+                        f"(run position_greeks for net delta/vega/theta)"
+                    )
+                lines.append(f"Open unrealized P&L: ${total_unreal:+,.2f}")
+
+                # Concentration: top 3 symbols by notional
+                if per_symbol:
+                    top_syms = sorted(
+                        per_symbol.items(), key=lambda kv: kv[1]["notional"], reverse=True
+                    )[:3]
+                    if net_liq_val > 0:
+                        conc_str = ", ".join(
+                            f"{s}={v['notional'] / net_liq_val * 100:.1f}%" for s, v in top_syms
+                        )
+                    else:
+                        conc_str = ", ".join(f"{s}=${v['notional']:,.0f}" for s, v in top_syms)
+                    lines.append(f"Concentration (top 3 of NetLiq): {conc_str}")
+        except Exception as e:
+            logger.debug(f"Portfolio risk summary failed: {e}")
 
         lines.append("")
         lines.append("═══ OPEN ORDERS ═══")

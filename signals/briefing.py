@@ -254,9 +254,24 @@ def briefing_summary(data: dict) -> dict:
     top_ic = data.get("top_signals_by_ic", [])
     retired = data.get("retired_signals", [])
 
+    # Edge strength is advisory: it tells you the quantitative stack's
+    # measured information ratio. Use it as a conviction multiplier, not
+    # a binary trade permission.
+    if ir is None:
+        edge_strength = "unknown"
+    elif ir >= 0.50:
+        edge_strength = "strong"
+    elif ir >= 0.20:
+        edge_strength = "moderate"
+    elif ir >= ir_min:
+        edge_strength = "weak"
+    else:
+        edge_strength = "marginal"
+
     edge_block: dict[str, Any] = {
         "estimated_ir": round(ir, 4) if ir is not None else None,
-        "gate_min": ir_min,
+        "strength": edge_strength,
+        "gate_min_reference": ir_min,
         "gate_open": bool(gate_open),
     }
     if top_ic:
@@ -267,23 +282,30 @@ def briefing_summary(data: dict) -> dict:
     if retired:
         edge_block["retired_signals"] = [r["name"] for r in retired]
 
-    # Action instruction depends on gate state.
-    if gate_open:
+    # Action instruction is informational. The agent decides.
+    if edge_strength in ("strong", "moderate"):
         action_instruction = (
-            "ADAPT these signals to CURRENT prices — do NOT skip because entry_price is stale. "
-            "The composite gives you direction + conviction. The template gives you structure. "
-            "Build the trade at today's price using the suggested order type. "
-            "Call option_chain(symbol, side='put') or side='call', then EXECUTE."
+            f"Quant edge is {edge_strength} (IR={ir:.3f}). Signals below are candidates — "
+            "adapt to current prices, scale size with your conviction, execute what you believe in. "
+            "The composite gives direction + strategy; option_chain gives the tradeable contract."
+        )
+    elif edge_strength == "weak":
+        action_instruction = (
+            f"Quant edge is weak (IR={ir:.3f}, just above reference {ir_min:.3f}). "
+            "Be selective — take only the highest-conviction recommendations or your own research-backed ideas. "
+            "Reduce size vs. strong-edge days."
+        )
+    elif edge_strength == "marginal":
+        action_instruction = (
+            f"Quant edge is marginal (IR={ir:.3f} < reference {ir_min:.3f}). "
+            "The stacked signals have little measurable information right now. "
+            "Prefer managing existing positions, hedging, or waiting. "
+            "If you still see a clear thesis from research, size small and document your rationale."
         )
     else:
         action_instruction = (
-            f"IR GATE CLOSED — estimated IR {ir:.4f} is below threshold {ir_min:.4f}. "
-            "The signal stack has no measurable edge this round. "
-            "DO NOT open new positions. You may still manage or close existing positions. "
-            "Recheck the briefing on the next round."
-        ) if ir is not None else (
-            "IR GATE CLOSED — insufficient IC history to verify edge. "
-            "DO NOT open new positions until trusted IC observations accumulate."
+            "Insufficient IC history to rate edge yet. "
+            "Use research + your own judgment; prefer small size until the measured edge stabilises."
         )
 
     result = {
@@ -296,7 +318,7 @@ def briefing_summary(data: dict) -> dict:
         },
         "edge": edge_block,
         "top_composites": top_composites,
-        "ACTION_REQUIRED": actionable if gate_open else [],
+        "ACTION_REQUIRED": actionable,
         "instruction": action_instruction,
         "feedback": fb_line,
     }

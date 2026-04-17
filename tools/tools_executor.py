@@ -1743,26 +1743,10 @@ class ToolExecutor:
                     params[key] = val
             action = "plan_order"
 
-        # ── Universe gate ───────────────────────────────────────
-        # Only allow symbol-based tools on RESEARCH_UNIVERSE symbols.
-        # Exempt: position-management actions (need to close/modify any held position),
-        # account tools, meta tools, and anything without a symbol param.
-        _UNIVERSE_EXEMPT = {
-            "close_option", "close_spread", "roll_option", "close_position", "cancel_order",
-            "cancel_stops", "flatten_limits", "modify_stop", "trailing_stop",
-            "stop_order", "stop_limit",  # protective exits on existing positions
-        }
-        _sym_check = (params.get("symbol") or "").upper()
-        if _sym_check and action not in _UNIVERSE_EXEMPT:
-            from research.config import RESEARCH_UNIVERSE
-            _allowed = {s.upper() for s in RESEARCH_UNIVERSE}
-            if _sym_check not in _allowed:
-                return {
-                    "success": False,
-                    "error": f"{_sym_check} is outside the research universe. Only trade researched symbols: {', '.join(sorted(_allowed))}",
-                    "is_realtime": False,
-                    "data_warning": None,
-                }
+        # ── Universe advisory (information only) ────────────────
+        # The research subsystem prioritises a specific set of symbols, but the
+        # agent is free to trade any liquid name. We no longer hard-block trades
+        # outside the research universe — the agent has the context to decide.
 
         # Normalize side: BUY_TO_OPEN/BUY_TO_CLOSE → BUY, SELL_TO_OPEN/SELL_TO_CLOSE → SELL
         _side_raw = params.get("side", "")

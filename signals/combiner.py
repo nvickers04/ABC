@@ -701,7 +701,7 @@ def _update_ic_retirement(
                 pass
         if new >= _IC_RETIRE_STREAK and (new == _IC_RETIRE_STREAK or new % 5 == 0):
             logger.warning(
-                "RETIRE_CANDIDATE %s — IC ≤ 0 for %d consecutive rounds "
+                "RETIRE_CANDIDATE %s -- IC <= 0 for %d consecutive rounds "
                 "(ic=%+.4f t=%+.2f n=%d)",
                 name, new, d["ic"], d["t"], d["n"],
             )

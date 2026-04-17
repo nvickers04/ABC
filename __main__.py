@@ -18,6 +18,14 @@ import sys
 from logging.handlers import TimedRotatingFileHandler
 from pathlib import Path
 
+# Force UTF-8 on stdio so non-ASCII chars in log messages (em-dash, ≤, ≥, ×, √,
+# box-drawing, emoji) don't blow up on Windows cp1252 consoles.
+for _stream in (sys.stdout, sys.stderr):
+    try:
+        _stream.reconfigure(encoding="utf-8", errors="replace")  # type: ignore[attr-defined]
+    except Exception:
+        pass
+
 
 def setup_logging(verbose: bool = False):
     """Configure logging with console + rotating file handler."""

@@ -298,7 +298,15 @@ async def _scoring_round(dp, conn, round_num: int) -> int:
         except Exception:
             iv_info = None
         try:
-            chain = dp.get_option_chain(sym)
+            # CRITICAL: pass DTE range + strike limit.  Without these MDA returns
+            # the ENTIRE chain (all expirations × all strikes × C+P) which costs
+            # 1 credit per contract — easily 2,000-5,000 credits per symbol per
+            # round.  Constants from research.config keep this bounded.
+            chain = dp.get_option_chain(
+                sym,
+                dte_range=OPTION_CHAIN_DTE_RANGE,
+                strike_limit=OPTION_CHAIN_STRIKE_LIMIT,
+            )
         except Exception:
             chain = None
         sym_data = _build_symbol_data(

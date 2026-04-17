@@ -180,7 +180,7 @@ async def _scoring_round(dp, conn, round_num: int) -> int:
 
     # Per-symbol Tier 1 work (9+ sync dp.* fundamentals calls each) must
     # run off-loop; parallelize with a semaphore to avoid credit spikes.
-    t1_sem = asyncio.Semaphore(8)
+    t1_sem = asyncio.Semaphore(16)
 
     def _score_tier1(sym: str) -> tuple[str, dict]:
         sym_data = _build_symbol_data(
@@ -373,7 +373,7 @@ def _build_symbol_data(
         "environment": env,
     }
 
-    # Fundamentals (yfinance, cached ~300s — no credits)
+    # Fundamentals (yfinance, cached ~1h — no credits)
     try:
         basic_fund = dp.get_fundamentals(symbol)
         data["fundamentals"] = basic_fund
@@ -416,6 +416,10 @@ def _build_symbol_data(
         data["news"] = dp.get_news(symbol)
     except Exception:
         pass
+
+    if tier >= 2:
+        data["iv_info"] = iv_info
+        data["option_chain"] = option_chain
 
     if tier >= 2:
         data["iv_info"] = iv_info

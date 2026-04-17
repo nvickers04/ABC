@@ -491,14 +491,17 @@ class DataProvider:
             'option_quote_hist': 3600,
             'option_quote_series': 3600,
             'option_greeks': 30,
-            'fundamentals': 300,   # Sector/PE/earnings date rarely change
-            'earnings': 300,
-            'extended_fundamentals': 300,
-            'analysts': 300,
-            'institutional': 600,  # Quarterly filings
-            'insider': 600,
-            'news': 120,       # Headlines useful for a few minutes
-            'peer_comparison': 300,
+            # Fundamentals rarely change intraday — cache aggressively
+            # so we don't pay yfinance roundtrip costs every scoring round.
+            'fundamentals': 3600,
+            'ext_fundamentals': 3600,
+            'earnings': 3600,
+            'earnings_hist': 3600,
+            'analyst': 1800,
+            'institutional': 3600,  # Quarterly filings
+            'insider': 1800,
+            'news': 300,       # Headlines useful for a few minutes
+            'peer': 900,
             'screen': 60,      # Screens can refresh moderately
         }
         self._default_ttl = 60  # Fallback
@@ -1281,6 +1284,7 @@ class DataProvider:
         except Exception as e:
             logger.warning(f"Failed to get fundamentals for {symbol}: {e}")
             _yf_record_failure(e)
+            self._set_cached(cache_key, None)
             return None
 
     # ==================== EARNINGS (MDA) ====================
@@ -1485,6 +1489,7 @@ class DataProvider:
         except Exception as e:
             logger.warning(f"Failed to get extended fundamentals for {symbol}: {e}")
             _yf_record_failure(e)
+            self._set_cached(cache_key, None)
             return None
 
     def get_analyst_data(self, symbol: str) -> Optional[AnalystData]:
@@ -1543,6 +1548,7 @@ class DataProvider:
         except Exception as e:
             logger.warning(f"Failed to get analyst data for {symbol}: {e}")
             _yf_record_failure(e)
+            self._set_cached(cache_key, None)
             return None
 
     def get_institutional_data(self, symbol: str) -> Optional[InstitutionalData]:
@@ -1599,6 +1605,7 @@ class DataProvider:
         except Exception as e:
             logger.warning(f"Failed to get institutional data for {symbol}: {e}")
             _yf_record_failure(e)
+            self._set_cached(cache_key, None)
             return None
 
     def get_insider_data(self, symbol: str) -> Optional[InsiderData]:
@@ -1666,6 +1673,7 @@ class DataProvider:
         except Exception as e:
             logger.warning(f"Failed to get insider data for {symbol}: {e}")
             _yf_record_failure(e)
+            self._set_cached(cache_key, None)
             return None
 
     def get_news(self, symbol: str) -> Optional[NewsData]:

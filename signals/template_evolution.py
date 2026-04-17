@@ -50,6 +50,51 @@ _MUTATION_DELTA = {
 # Public entry point
 # ---------------------------------------------------------------------------
 
+_evolution_stop_event: bool = False
+_evolution_paused: bool = False
+_evolution_task: "asyncio.Task | None" = None
+
+
+def is_evolution_running() -> bool:
+    return bool(_evolution_task and not _evolution_task.done())
+
+
+def is_evolution_paused() -> bool:
+    return _evolution_paused
+
+
+def pause_evolution() -> bool:
+    global _evolution_paused
+    was = _evolution_paused
+    _evolution_paused = True
+    return not was
+
+
+def resume_evolution() -> bool:
+    global _evolution_paused
+    was = _evolution_paused
+    _evolution_paused = False
+    return was
+
+
+def stop_evolution() -> bool:
+    global _evolution_stop_event
+    if _evolution_stop_event:
+        return False
+    _evolution_stop_event = True
+    return True
+
+
+def start_evolution_task() -> "asyncio.Task":
+    """Schedule run_template_evolution on the current loop. Idempotent."""
+    global _evolution_task, _evolution_stop_event
+    if is_evolution_running():
+        return _evolution_task  # type: ignore[return-value]
+    _evolution_stop_event = False
+    _evolution_task = asyncio.get_event_loop().create_task(run_template_evolution())
+    return _evolution_task
+
+
 async def run_template_evolution() -> None:
     """
     Continuous evolution loop — runs forever alongside agent and scorer.
@@ -62,12 +107,19 @@ async def run_template_evolution() -> None:
       4. Keep mutations that beat current on OOS
       5. Persist winning boundaries + update performance
     """
+    global _evolution_stop_event, _evolution_paused
     logger.info("Template evolution loop started")
     mhp = get_market_hours_provider()
     conn = get_db()
     init_default_boundaries(conn)
 
     while True:
+        if _evolution_stop_event:
+            logger.info("Template evolution stopped by request")
+            break
+        if _evolution_paused:
+            await asyncio.sleep(5)
+            continue
         try:
             # Determine cooldown based on market hours
             is_open = mhp.is_market_open(include_extended=False)

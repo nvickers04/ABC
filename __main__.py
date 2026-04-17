@@ -112,10 +112,12 @@ def main():
     parser = argparse.ArgumentParser(description="Grok 4.20 Trader")
     parser.add_argument("--test", action="store_true", help="Test Grok connection")
     parser.add_argument("--verbose", action="store_true", help="Enable DEBUG logging")
-    parser.add_argument("--no-research", action="store_true",
-                        help="Disable research agent (runs by default)")
-    parser.add_argument("--no-evolution", action="store_true",
-                        help="Disable template evolution (runs by default)")
+    parser.add_argument("--research", action="store_true",
+                        help="Pre-start the research scorer before the agent boots "
+                             "(default: agent controls it via research_engine tool)")
+    parser.add_argument("--evolution", action="store_true",
+                        help="Pre-start template evolution before the agent boots "
+                             "(default: agent controls it via research_engine tool)")
     parser.add_argument(
         "--account",
         choices=["paper", "live"],
@@ -143,32 +145,24 @@ def main():
 
     from core.agent import run_agent
 
-    if not args.no_research:
+    if args.research:
         from signals.scorer import run_research_threaded
-        print("Research scorer running alongside trader\n")
-
-        # Start the scorer in a dedicated daemon thread with its own
-        # event loop. This completely isolates the scorer's MDA traffic
-        # from the main loop's xAI / ib_insync I/O and avoids Windows
-        # ProactorEventLoop quirks with cross-thread future wake-ups.
+        print("Research scorer pre-started (agent can pause/stop via research_engine tool)\n")
         run_research_threaded(verbose=args.verbose)
 
-        tasks = [run_agent()]
+    tasks = [run_agent()]
+    if args.evolution:
+        from signals.template_evolution import run_template_evolution
+        tasks.append(run_template_evolution())
+        print("Template evolution pre-started (agent can pause/stop via research_engine tool)\n")
 
-        if not args.no_evolution:
-            from signals.template_evolution import run_template_evolution
-            tasks.append(run_template_evolution())
-            print("Template evolution running alongside trader\n")
+    async def _run_all():
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+        for r in results:
+            if isinstance(r, Exception):
+                logger.error("Task crashed: %s", r, exc_info=r)
 
-        async def _run_all():
-            results = await asyncio.gather(*tasks, return_exceptions=True)
-            for r in results:
-                if isinstance(r, Exception):
-                    logger.error("Task crashed: %s", r, exc_info=r)
-
-        asyncio.run(_run_all())
-    else:
-        asyncio.run(run_agent())
+    asyncio.run(_run_all())
 
 
 if __name__ == "__main__":

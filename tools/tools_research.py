@@ -741,6 +741,63 @@ async def handle_open_hypotheses(executor, params: dict) -> Any:
         return {"error": str(e)}
 
 
+async def handle_research_engine(params: dict) -> dict:
+    """Agent-controlled background scorer + template evolution.
+
+    params.action in {"status", "start", "pause", "resume", "stop"}.
+    Scope defaults to both subsystems; set scope='scorer' or 'evolution'
+    to control just one.
+    """
+    from signals import scorer as _sc
+    from signals import template_evolution as _te
+
+    action = str(params.get("action", "status")).lower().strip()
+    scope = str(params.get("scope", "both")).lower().strip()
+    want_scorer = scope in ("both", "scorer")
+    want_evo = scope in ("both", "evolution")
+
+    result: dict[str, Any] = {}
+    if action == "status":
+        pass  # fall through to unified status report below
+    elif action == "start":
+        if want_scorer and not _sc.is_scorer_running():
+            _sc.run_research_threaded(verbose=False)
+            result["scorer_started"] = True
+        if want_evo and not _te.is_evolution_running():
+            try:
+                _te.start_evolution_task()
+                result["evolution_started"] = True
+            except Exception as e:
+                result["evolution_error"] = str(e)
+    elif action == "pause":
+        if want_scorer:
+            result["scorer_paused"] = _sc.pause_scorer()
+        if want_evo:
+            result["evolution_paused"] = _te.pause_evolution()
+    elif action == "resume":
+        if want_scorer:
+            result["scorer_resumed"] = _sc.resume_scorer()
+        if want_evo:
+            result["evolution_resumed"] = _te.resume_evolution()
+    elif action == "stop":
+        if want_scorer:
+            result["scorer_stopped"] = _sc.stop_scorer()
+        if want_evo:
+            result["evolution_stopped"] = _te.stop_evolution()
+    else:
+        return {"error": f"unknown action '{action}'. Use: status|start|pause|resume|stop"}
+
+    result["scorer"] = {
+        "running": _sc.is_scorer_running(),
+        "paused": _sc.is_scorer_paused(),
+    }
+    result["evolution"] = {
+        "running": _te.is_evolution_running(),
+        "paused": _te.is_evolution_paused(),
+    }
+    return result
+
+
 HANDLERS = {
     "quote": handle_quote,
     "candles": handle_candles,
@@ -766,4 +823,5 @@ HANDLERS = {
     "execution_status": handle_execution_status,
     "trader_rules": handle_execution_status,
     "open_hypotheses": handle_open_hypotheses,
+    "research_engine": handle_research_engine,
 }

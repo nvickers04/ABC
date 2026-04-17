@@ -37,16 +37,66 @@ logger = logging.getLogger(__name__)
 # Public entry point
 # ---------------------------------------------------------------------------
 
+# Control state for agent-controlled scorer lifecycle.
+_scorer_thread: "threading.Thread | None" = None  # type: ignore[name-defined]
+_scorer_stop_event: "threading.Event | None" = None  # type: ignore[name-defined]
+_scorer_pause_event: "threading.Event | None" = None  # type: ignore[name-defined]
+
+
+def is_scorer_running() -> bool:
+    """True if a scorer thread exists and is alive."""
+    return bool(_scorer_thread and _scorer_thread.is_alive())
+
+
+def is_scorer_paused() -> bool:
+    """True if the scorer is running but currently paused between rounds."""
+    return bool(_scorer_pause_event and _scorer_pause_event.is_set())
+
+
+def pause_scorer() -> bool:
+    """Ask the scorer to stop starting new rounds. Returns prior state."""
+    if _scorer_pause_event is None:
+        return False
+    was = _scorer_pause_event.is_set()
+    _scorer_pause_event.set()
+    return not was
+
+
+def resume_scorer() -> bool:
+    """Allow the scorer to start new rounds again. Returns prior state."""
+    if _scorer_pause_event is None:
+        return False
+    was = _scorer_pause_event.is_set()
+    _scorer_pause_event.clear()
+    return was
+
+
+def stop_scorer() -> bool:
+    """Signal the scorer thread to exit after its current round."""
+    global _scorer_thread, _scorer_stop_event, _scorer_pause_event
+    if _scorer_stop_event is None:
+        return False
+    _scorer_stop_event.set()
+    if _scorer_pause_event is not None:
+        _scorer_pause_event.clear()
+    return True
+
+
 def run_research_threaded(*, verbose: bool = False) -> None:
     """Start `run_research` on a dedicated daemon thread with its own
     asyncio event loop. Returns immediately.
 
-    This isolates the scorer completely from the main process loop
-    (which runs the trading agent + xAI + ib_insync). No cross-loop
-    futures or `call_soon_threadsafe` interactions — each loop is
-    self-contained, so Windows ProactorEventLoop quirks don't apply.
+    Idempotent: if the scorer is already running this is a no-op.
     """
     import threading
+
+    global _scorer_thread, _scorer_stop_event, _scorer_pause_event
+
+    if is_scorer_running():
+        return
+
+    _scorer_stop_event = threading.Event()
+    _scorer_pause_event = threading.Event()
 
     def _thread_target() -> None:
         loop = asyncio.new_event_loop()
@@ -61,8 +111,8 @@ def run_research_threaded(*, verbose: bool = False) -> None:
             except Exception:
                 pass
 
-    t = threading.Thread(target=_thread_target, name="scorer", daemon=True)
-    t.start()
+    _scorer_thread = threading.Thread(target=_thread_target, name="scorer", daemon=True)
+    _scorer_thread.start()
 
 
 async def run_research(*, verbose: bool = False) -> None:
@@ -88,6 +138,13 @@ async def run_research(*, verbose: bool = False) -> None:
 
     round_num = 0
     while True:
+        # Honour stop/pause controls between rounds.
+        if _scorer_stop_event is not None and _scorer_stop_event.is_set():
+            logger.info("Scoring loop stopped by request after %d rounds", round_num)
+            break
+        if _scorer_pause_event is not None and _scorer_pause_event.is_set():
+            await asyncio.sleep(5)
+            continue
         round_num += 1
         try:
             t0 = time.time()

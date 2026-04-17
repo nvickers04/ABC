@@ -944,6 +944,22 @@ If no changes warranted: []"""
         except Exception as e:
             logger.debug(f"Portfolio risk summary failed: {e}")
 
+        # ── Research engine status (scorer + template evolution) ──
+        try:
+            from signals import scorer as _sc
+            from signals import template_evolution as _te
+            sc_state = "off"
+            if _sc.is_scorer_running():
+                sc_state = "paused" if _sc.is_scorer_paused() else "running"
+            te_state = "off"
+            if _te.is_evolution_running():
+                te_state = "paused" if _te.is_evolution_paused() else "running"
+            lines.append("")
+            lines.append(f"═══ RESEARCH ENGINE ═══ scorer={sc_state}  evolution={te_state}")
+            lines.append("(control via research_engine action=start|pause|resume|stop)")
+        except Exception as e:
+            logger.debug(f"Engine status failed: {e}")
+
         lines.append("")
         lines.append("═══ OPEN ORDERS ═══")
         try:

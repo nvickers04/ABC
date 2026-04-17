@@ -652,7 +652,10 @@ def _compute_forward_returns(conn, dp, candles_map: dict, current_ts: float) -> 
     Rows whose horizon has not yet elapsed are left unrecorded and retried
     on the next round when fresh candles land.
     """
-    # Get prior-round scores that don't yet have forward returns computed
+    # Get prior-round scores that don't yet have forward returns computed.
+    # Order by ts ASC so the OLDEST scores (most likely to have their horizon
+    # already elapsed) are processed first.  LIMIT is a per-round budget, not
+    # a hard ceiling on the total backlog; subsequent rounds drain the rest.
     cur = conn.execute(
         """SELECT ss.signal_name, ss.symbol, ss.ts, ss.score
            FROM signal_scores ss
@@ -663,7 +666,7 @@ def _compute_forward_returns(conn, dp, candles_map: dict, current_ts: float) -> 
                  AND sr.symbol = ss.symbol
                  AND sr.ts = ss.ts
              )
-           ORDER BY ss.ts DESC
+           ORDER BY ss.ts ASC
            LIMIT 5000""",
         (current_ts,),
     )

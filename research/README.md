@@ -11,4 +11,3 @@ Configuration, simulation, and market-environment classification for the signal 
 ## Related Packages
 
 - `signals/`: 50 base signal generators, combiner, templates, template evolution, scorer, and briefing
-- Top-level `program.md`: human-edited research brief

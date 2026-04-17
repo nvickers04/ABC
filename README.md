@@ -100,7 +100,7 @@ TRADING_MODE=live python __main__.py
 | Min R:R | 1.5:1 | 2:1 | 2.5:1 |
 | Min confidence | 50% | 65% | 70% |
 | IBKR port | 7497 (paper) | 7497 (paper) | 7496 (live) |
-| Complex options | Forced on every edge | Normal | Conservative |
+| Complex options | Preferred when gate open | Normal | Conservative |
 | Auto-suggest spreads | Yes | No | No |
 | Tickers evaluated | 3–5 per cycle | 1–2 | 1 |
 | 42-symbol scan | Every cycle | Every cycle | Every cycle |

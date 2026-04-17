@@ -7,8 +7,6 @@ Configuration, simulation, and market-environment classification for the signal 
 - `config.py`: research universe, signal combination parameters, option schemas, and API budget settings
 - `environment.py`: market-regime classification from shared candle data
 - `simulator.py`: mechanical trade simulation and aggregate scoring
-- `promoter.py`: options promotion repricing pipeline
-- `replay.py`: deterministic replay for strategy validation
 
 ## Related Packages
 

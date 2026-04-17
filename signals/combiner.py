@@ -100,17 +100,42 @@ def combine_signals(
         w_dict = {s: 1.0 / N for s in signal_names}
         status = "circuit_breaker_neff"
 
-    _persist_weights(db_conn, w_dict, n_eff)
-
     # ── Signal attribution: per-signal IC (article Part 1 homework) ──
-    # IC = corr(score_at_entry, forward_return).  Logs top/bottom 5 and
-    # tracks consecutive-round streaks of IC ≤ 0 for retirement review.
+    # Computed BEFORE persisting weights so retired signals can be zeroed
+    # and estimated IR can be published to the briefing in the same round.
+    ic_stats: dict[str, dict[str, float]] = {}
     try:
-        _compute_and_log_ic_attribution(db_conn, signal_names)
+        ic_stats = _compute_and_log_ic_attribution(db_conn, signal_names)
     except Exception as e:  # non-fatal — never break the combiner
         logger.debug("IC attribution failed: %s", e)
 
-    return {"weights": w_dict, "n_eff": n_eff, "status": status}
+    # ── Auto-zero RETIRE_CANDIDATE signals ──────────────────────
+    # Any signal whose `ic_neg_streak:{name}` >= _IC_RETIRE_STREAK has
+    # demonstrated IC ≤ 0 for several consecutive rounds on a trusted
+    # sample size — we stop giving it weight until its IC recovers.
+    if status == "ok":
+        w_dict = _apply_ic_retirement_mask(db_conn, w_dict)
+
+    # ── Estimated IR + gate ─────────────────────────────────────
+    # IR ≈ mean(positive IC) × √N_eff  (Fundamental Law of Active Mgmt).
+    # Persist snapshot to research_config so the briefing can surface it
+    # to the trading agent as a go/no-go signal.
+    estimated_ir, gate_open = _publish_ir_snapshot(db_conn, ic_stats, n_eff)
+    if not gate_open:
+        logger.warning(
+            "IR gate CLOSED: estimated_ir=%.4f < %.4f — agent should not "
+            "open new positions this round",
+            estimated_ir, _IR_GATE_MIN,
+        )
+
+    _persist_weights(db_conn, w_dict, n_eff)
+    return {
+        "weights": w_dict,
+        "n_eff": n_eff,
+        "status": status,
+        "estimated_ir": estimated_ir,
+        "ir_gate_open": gate_open,
+    }
 
 
 # ── N_eff circuit-breaker tunables ──────────────────────────────
@@ -152,6 +177,17 @@ _IC_MIN_OBS = 30
 _IC_RETIRE_STREAK = 5
 # How many signals to log in top/bottom attribution lists each round.
 _IC_ATTRIBUTION_TOP_K = 5
+
+# ── IR gate tunables ────────────────────────────────────────────
+# Minimum estimated IR = mean(positive IC) * sqrt(N_eff) before we
+# consider the signal stack "live".  Below this the briefing exposes
+# ir_gate_open=False and the agent is instructed not to open new
+# positions (existing positions are unaffected).  0.05 matches the
+# article's institutional baseline IC floor.
+_IR_GATE_MIN = 0.05
+# Config keys for briefing consumption.
+_IR_ESTIMATE_KEY = "estimated_ir"
+_IR_GATE_OPEN_KEY = "ir_gate_open"
 
 
 def _update_neff_streak(db_conn, n_eff: float) -> int:
@@ -674,13 +710,109 @@ def _update_ic_retirement(
 def _compute_and_log_ic_attribution(
     db_conn,
     signal_names: list[str],
-) -> None:
-    """One-shot: compute IC, log top/bottom, update retirement streaks."""
+) -> dict[str, dict[str, float]]:
+    """One-shot: compute IC, log top/bottom, update retirement streaks.
+
+    Returns the full ic_stats dict so callers can reuse it for IR
+    estimation without a second DB scan.
+    """
     ic_stats = _compute_signal_ic(db_conn, signal_names)
     if not ic_stats:
-        return
+        return {}
     _log_ic_attribution(ic_stats)
     _update_ic_retirement(db_conn, ic_stats)
+    return ic_stats
+
+
+def _apply_ic_retirement_mask(
+    db_conn,
+    weights: dict[str, float],
+) -> dict[str, float]:
+    """Zero any signal whose ic_neg_streak has reached the retirement
+    threshold, then re-normalize so sum|w| = 1.
+
+    Retirement flags are read from ``research_config`` (written by
+    ``_update_ic_retirement``).  If no signals are retired the input is
+    returned unchanged.  Persistence failures are non-fatal.
+    """
+    try:
+        from memory import get_research_config
+    except Exception:
+        return weights
+
+    retired: list[str] = []
+    for name in weights:
+        try:
+            streak = int(get_research_config(f"ic_neg_streak:{name}", 0))
+        except Exception:
+            streak = 0
+        if streak >= _IC_RETIRE_STREAK:
+            retired.append(name)
+
+    if not retired:
+        return weights
+
+    logger.info(
+        "IC_RETIRE zeroing %d signal(s) with ic_neg_streak >= %d: %s",
+        len(retired), _IC_RETIRE_STREAK, ", ".join(sorted(retired)),
+    )
+    new_w = dict(weights)
+    for name in retired:
+        new_w[name] = 0.0
+
+    abs_sum = sum(abs(v) for v in new_w.values())
+    if abs_sum > 1e-12:
+        new_w = {k: v / abs_sum for k, v in new_w.items()}
+    return new_w
+
+
+def _publish_ir_snapshot(
+    db_conn,
+    ic_stats: dict[str, dict[str, float]],
+    n_eff: float,
+) -> tuple[float, bool]:
+    """Compute estimated IR and publish gate state to research_config.
+
+    estimated_ir = mean(positive IC over trusted signals) * sqrt(N_eff).
+    Only IC values with n >= _IC_MIN_OBS and ic > 0 contribute — this
+    matches the Fundamental Law's assumption of independent *positive*
+    edges.  If no signal clears the bar we report IR = 0.
+
+    Stores three numeric keys for briefing consumption:
+      - estimated_ir
+      - ir_gate_open (1.0 / 0.0)
+      - ir_snapshot_ts
+
+    Returns (estimated_ir, gate_open).
+    """
+    try:
+        from memory import set_research_config
+    except Exception:
+        return 0.0, True  # fail-open so the combiner still works
+
+    trusted_positive = [
+        d["ic"] for d in ic_stats.values()
+        if d["n"] >= _IC_MIN_OBS and d["ic"] > 0.0
+    ]
+    mean_ic = float(np.mean(trusted_positive)) if trusted_positive else 0.0
+    ir = mean_ic * float(np.sqrt(max(n_eff, 0.0)))
+    gate_open = ir >= _IR_GATE_MIN
+
+    try:
+        set_research_config(_IR_ESTIMATE_KEY, ir,
+                            reason=f"mean_pos_ic={mean_ic:.4f} n_eff={n_eff:.2f}")
+        set_research_config(_IR_GATE_OPEN_KEY, 1.0 if gate_open else 0.0,
+                            reason=f"ir={ir:.4f} min={_IR_GATE_MIN}")
+        set_research_config("ir_snapshot_ts", float(time.time()),
+                            reason="combiner round complete")
+    except Exception as e:
+        logger.debug("IR snapshot persistence failed: %s", e)
+
+    logger.info(
+        "IR_ESTIMATE ir=%.4f mean_pos_ic=%.4f n_eff=%.2f gate_open=%s",
+        ir, mean_ic, n_eff, gate_open,
+    )
+    return ir, gate_open
 
 
 # ---------------------------------------------------------------------------

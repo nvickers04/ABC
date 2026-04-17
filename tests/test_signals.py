@@ -1051,3 +1051,53 @@ class TestSignalICAttribution:
 
         _update_ic_retirement(db, ic)
         assert int(get_research_config("ic_neg_streak:good_sig", 0)) == 0
+
+    def test_retirement_mask_zeros_weights_and_renormalizes(self, db):
+        from signals.combiner import _apply_ic_retirement_mask, _IC_RETIRE_STREAK
+        from memory import set_research_config
+
+        # Pre-mark sig_b as retired.
+        set_research_config(
+            "ic_neg_streak:sig_b", float(_IC_RETIRE_STREAK),
+            reason="test: mark retired",
+        )
+        set_research_config("ic_neg_streak:sig_a", 0.0, reason="test reset")
+        set_research_config("ic_neg_streak:sig_c", 0.0, reason="test reset")
+
+        w_in = {"sig_a": 0.4, "sig_b": 0.4, "sig_c": 0.2}
+        w_out = _apply_ic_retirement_mask(db, w_in)
+
+        assert w_out["sig_b"] == 0.0
+        # Remaining two should sum to 1.0 in absolute value.
+        total = sum(abs(v) for v in w_out.values())
+        assert abs(total - 1.0) < 1e-9
+        # Original proportion between a and c preserved (0.4 : 0.2 = 2:1).
+        assert abs(w_out["sig_a"] - 2 * w_out["sig_c"]) < 1e-9
+
+    def test_ir_gate_closes_when_no_positive_ic(self, db):
+        from signals.combiner import _publish_ir_snapshot, _IR_GATE_MIN
+        db.execute("DELETE FROM signal_returns")
+        db.commit()
+
+        # All trusted signals have negative IC → mean_positive_ic = 0 → IR = 0.
+        ic_stats = {
+            "neg_a": {"ic": -0.10, "t": -2.0, "n": 100},
+            "neg_b": {"ic": -0.05, "t": -1.2, "n": 100},
+        }
+        ir, gate = _publish_ir_snapshot(db, ic_stats, n_eff=4.0)
+        assert ir == 0.0
+        assert gate is False
+        assert _IR_GATE_MIN > 0
+
+    def test_ir_gate_opens_when_positive_ic_and_neff(self, db):
+        from signals.combiner import _publish_ir_snapshot, _IR_GATE_MIN
+
+        # Two positive ICs averaging 0.10, N_eff=4 → IR = 0.10 * sqrt(4) = 0.20
+        ic_stats = {
+            "pos_a": {"ic": 0.08, "t": 2.5, "n": 100},
+            "pos_b": {"ic": 0.12, "t": 3.1, "n": 100},
+        }
+        ir, gate = _publish_ir_snapshot(db, ic_stats, n_eff=4.0)
+        assert abs(ir - 0.20) < 1e-9
+        assert gate is True
+        assert ir >= _IR_GATE_MIN

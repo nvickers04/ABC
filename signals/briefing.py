@@ -51,6 +51,56 @@ def query_briefing_data() -> dict:
     except Exception:
         pass
 
+    # ── IR gate + IC attribution (Fundamental Law of Active Mgmt) ──
+    # estimated_ir = mean(positive IC) * sqrt(N_eff).  If gate is closed
+    # the agent should NOT open new positions — the signal stack has
+    # lost its measurable edge this round.
+    try:
+        from memory import get_research_config
+        ir = float(get_research_config("estimated_ir", 0.0))
+        gate_open = bool(int(get_research_config("ir_gate_open", 1)))
+        result["estimated_ir"] = ir
+        result["ir_gate_open"] = gate_open
+        result["ir_gate_min"] = 0.05  # keep in sync with combiner._IR_GATE_MIN
+
+        # Top signals by IC over rolling window — surfaces which signals
+        # are actually driving the edge this round.
+        try:
+            from signals.combiner import (
+                _compute_signal_ic,
+                _IC_MIN_OBS,
+                _IC_ATTRIBUTION_TOP_K,
+            )
+            sig_names = [SIG for SIG in SIGNAL_REGISTRY.keys()]
+            ic_stats = _compute_signal_ic(db, sig_names)
+            trusted = sorted(
+                (
+                    {"name": n, "ic": d["ic"], "t": d["t"], "n": d["n"]}
+                    for n, d in ic_stats.items()
+                    if d["n"] >= _IC_MIN_OBS
+                ),
+                key=lambda r: r["ic"],
+                reverse=True,
+            )
+            if trusted:
+                result["top_signals_by_ic"] = trusted[:_IC_ATTRIBUTION_TOP_K]
+        except Exception:
+            pass
+
+        # Retired signals (IC ≤ 0 for several consecutive rounds).
+        retired = []
+        for name in SIGNAL_REGISTRY.keys():
+            try:
+                streak = int(get_research_config(f"ic_neg_streak:{name}", 0))
+            except Exception:
+                streak = 0
+            if streak >= 5:  # == combiner._IC_RETIRE_STREAK
+                retired.append({"name": name, "streak": streak})
+        if retired:
+            result["retired_signals"] = retired
+    except Exception:
+        pass
+
     # ── Composite scores (latest round) ─────────────────────
     try:
         latest_ts = db.execute(
@@ -197,6 +247,45 @@ def briefing_summary(data: dict) -> dict:
         avg_pnl = sum(r.get("actual_pnl") or 0 for r in feedback) / len(feedback)
         fb_line = f"{len(feedback)} trades, avg P&L ${avg_pnl:.2f}"
 
+    # ── IR gate + IC attribution (Fundamental Law) ──────────
+    ir = data.get("estimated_ir")
+    gate_open = data.get("ir_gate_open", True)
+    ir_min = data.get("ir_gate_min", 0.05)
+    top_ic = data.get("top_signals_by_ic", [])
+    retired = data.get("retired_signals", [])
+
+    edge_block: dict[str, Any] = {
+        "estimated_ir": round(ir, 4) if ir is not None else None,
+        "gate_min": ir_min,
+        "gate_open": bool(gate_open),
+    }
+    if top_ic:
+        edge_block["driving_signals"] = [
+            {"name": s["name"], "ic": round(s["ic"], 4), "t": round(s["t"], 2), "n": s["n"]}
+            for s in top_ic
+        ]
+    if retired:
+        edge_block["retired_signals"] = [r["name"] for r in retired]
+
+    # Action instruction depends on gate state.
+    if gate_open:
+        action_instruction = (
+            "ADAPT these signals to CURRENT prices — do NOT skip because entry_price is stale. "
+            "The composite gives you direction + conviction. The template gives you structure. "
+            "Build the trade at today's price using the suggested order type. "
+            "Call option_chain(symbol, side='put') or side='call', then EXECUTE."
+        )
+    else:
+        action_instruction = (
+            f"IR GATE CLOSED — estimated IR {ir:.4f} is below threshold {ir_min:.4f}. "
+            "The signal stack has no measurable edge this round. "
+            "DO NOT open new positions. You may still manage or close existing positions. "
+            "Recheck the briefing on the next round."
+        ) if ir is not None else (
+            "IR GATE CLOSED — insufficient IC history to verify edge. "
+            "DO NOT open new positions until trusted IC observations accumulate."
+        )
+
     result = {
         "regime": regime,
         "signal_quality": {
@@ -205,14 +294,10 @@ def briefing_summary(data: dict) -> dict:
             "independence_ratio": round(n_eff / max(total_signals, 1) * 100, 1) if n_eff else None,
             "weight_leaders": weight_leaders,
         },
+        "edge": edge_block,
         "top_composites": top_composites,
-        "ACTION_REQUIRED": actionable,
-        "instruction": (
-            "ADAPT these signals to CURRENT prices — do NOT skip because entry_price is stale. "
-            "The composite gives you direction + conviction. The template gives you structure. "
-            "Build the trade at today's price using the suggested order type. "
-            "Call option_chain(symbol, side='put') or side='call', then EXECUTE."
-        ),
+        "ACTION_REQUIRED": actionable if gate_open else [],
+        "instruction": action_instruction,
         "feedback": fb_line,
     }
     return result

@@ -66,7 +66,18 @@ def combine_signals(
             "Insufficient shared periods (%d < %d) — using equal weights",
             M, MIN_SHARED_PERIODS_FOR_COMBINATION,
         )
+        # Per-signal IC does NOT need shared periods across signals
+        # (each signal is its own Pearson correlation against its own
+        # score/return pairs), so emit attribution + IR snapshot even on
+        # the equal-weights path.  Otherwise the agent never sees IC/IR
+        # until the cross-signal matrix fills in, which for 50 signals of
+        # mixed horizons can take many sessions.
         weights = {s: 1.0 / N for s in signal_names}
+        try:
+            ic_stats = _compute_and_log_ic_attribution(db_conn, signal_names)
+            _publish_ir_snapshot(db_conn, ic_stats, n_eff=float(N))
+        except Exception as e:
+            logger.debug("IC attribution failed on insufficient-data path: %s", e)
         _persist_weights(db_conn, weights, n_eff=float(N))
         return {"weights": weights, "n_eff": float(N), "status": "insufficient_data"}
 

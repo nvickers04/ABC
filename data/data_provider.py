@@ -448,17 +448,27 @@ def _yf_record_failure(err: Exception) -> None:
     import time as _t
     msg = str(err).lower()
     # Only count network-level failures toward the breaker — symbol-not-found
-    # or shape errors shouldn't trip it.
-    if not any(k in msg for k in ("curl", "connect", "timeout", "ssl", "resolve", "network")):
+    # or shape errors shouldn't trip it.  Rate-limit (429 / "too many
+    # requests") counts: yfinance returns YFRateLimitError when throttled and
+    # hammering through a rate-limit just prolongs the problem.
+    network_markers = ("curl", "connect", "timeout", "ssl", "resolve", "network")
+    ratelimit_markers = ("429", "too many requests", "rate limit", "ratelimit", "yfratelimiterror")
+    if not any(k in msg for k in network_markers + ratelimit_markers):
         return
+    # Rate-limit failures get a longer cooldown (5 min -> 15 min) because
+    # yfinance rate-limit windows are typically 10-15 min wide.
+    is_ratelimit = any(k in msg for k in ratelimit_markers)
+    cooldown_secs = _YF_COOLDOWN_SECS * 3 if is_ratelimit else _YF_COOLDOWN_SECS
     with _YF_LOCK:
         _YF_CONSECUTIVE_FAILURES += 1
         if _YF_CONSECUTIVE_FAILURES >= _YF_FAIL_THRESHOLD and _YF_COOLDOWN_UNTIL < _t.time():
-            _YF_COOLDOWN_UNTIL = _t.time() + _YF_COOLDOWN_SECS
+            _YF_COOLDOWN_UNTIL = _t.time() + cooldown_secs
             logger.warning(
-                "yfinance appears unreachable (%d consecutive failures) — "
-                "disabling yf calls for %ds",
-                _YF_CONSECUTIVE_FAILURES, _YF_COOLDOWN_SECS,
+                "yfinance appears unreachable (%d consecutive failures, "
+                "reason=%s) — disabling yf calls for %ds",
+                _YF_CONSECUTIVE_FAILURES,
+                "rate-limit" if is_ratelimit else "network",
+                cooldown_secs,
             )
 
 
@@ -484,8 +494,8 @@ class DataProvider:
             'quote': 15,       # Prices move constantly
             'candles': 30,     # Bars update within the bar interval
             'atr': 60,         # Derived from candles, changes slowly
-            'iv_info': 60,     # IV updates with options flow
-            'option_chain': 30, # Chains shift with underlying
+            'iv_info': 120,    # IV shifts slowly; 2-min cache covers ~4 rounds
+            'option_chain': 180, # 3-min cache: Tier 2 reads share across rounds
             'option_chain_hist': 3600,
             'option_quote': 30,
             'option_quote_hist': 3600,

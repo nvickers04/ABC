@@ -136,10 +136,16 @@ def main():
     from core.agent import run_agent
 
     if not args.no_research:
-        from signals.scorer import run_research
+        from signals.scorer import run_research_threaded
         print("Research scorer running alongside trader\n")
 
-        tasks = [run_agent(), run_research(verbose=args.verbose)]
+        # Start the scorer in a dedicated daemon thread with its own
+        # event loop. This completely isolates the scorer's MDA traffic
+        # from the main loop's xAI / ib_insync I/O and avoids Windows
+        # ProactorEventLoop quirks with cross-thread future wake-ups.
+        run_research_threaded(verbose=args.verbose)
+
+        tasks = [run_agent()]
 
         if not args.no_evolution:
             from signals.template_evolution import run_template_evolution

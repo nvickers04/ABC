@@ -178,7 +178,25 @@ class MarketDataClient:
         return bool(self.api_key)
 
     async def close(self):
-        """Close all per-loop HTTP clients."""
+        """Close the HTTP client bound to the current event loop.
+
+        Safe to call from any loop; only touches the cached client for
+        the running loop. Use `close_all()` to close every cached client
+        (must be invoked on each loop that owns one).
+        """
+        try:
+            loop_id = id(asyncio.get_running_loop())
+        except RuntimeError:
+            return
+        client = self._http_clients.pop(loop_id, None)
+        if client is not None:
+            try:
+                await client.aclose()
+            except Exception:
+                pass
+
+    async def close_all(self):
+        """Close every cached HTTP client; caller must run on each loop."""
         clients = list(self._http_clients.values())
         self._http_clients.clear()
         for client in clients:

@@ -36,6 +36,34 @@ logger = logging.getLogger(__name__)
 # Public entry point
 # ---------------------------------------------------------------------------
 
+def run_research_threaded(*, verbose: bool = False) -> None:
+    """Start `run_research` on a dedicated daemon thread with its own
+    asyncio event loop. Returns immediately.
+
+    This isolates the scorer completely from the main process loop
+    (which runs the trading agent + xAI + ib_insync). No cross-loop
+    futures or `call_soon_threadsafe` interactions — each loop is
+    self-contained, so Windows ProactorEventLoop quirks don't apply.
+    """
+    import threading
+
+    def _thread_target() -> None:
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        try:
+            loop.run_until_complete(run_research(verbose=verbose))
+        except Exception:
+            logger.exception("Scorer thread crashed")
+        finally:
+            try:
+                loop.close()
+            except Exception:
+                pass
+
+    t = threading.Thread(target=_thread_target, name="scorer", daemon=True)
+    t.start()
+
+
 async def run_research(*, verbose: bool = False) -> None:
     """
     Main research scoring loop — replaces old slot-based research agent.
@@ -62,6 +90,14 @@ async def run_research(*, verbose: bool = False) -> None:
         round_num += 1
         try:
             t0 = time.time()
+            # Run the round directly on the main loop. The per-loop
+            # httpx client cache in MarketDataClient ensures we don't
+            # collide with any other event loop. Running inline avoids
+            # a Windows ProactorEventLoop quirk where
+            # `call_soon_threadsafe` callbacks from a ThreadPoolExecutor
+            # future were not waking the main loop promptly when it
+            # was concurrently serving long-running xAI / ib_insync
+            # coroutines.
             credits_used = await _scoring_round(dp, conn, round_num)
             elapsed = time.time() - t0
             logger.info(
@@ -74,11 +110,11 @@ async def run_research(*, verbose: bool = False) -> None:
         except Exception as e:
             logger.error("Scoring round %d failed: %s", round_num, e, exc_info=True)
 
-        # Use sync sleep — Python 3.13 has a known asyncio bug
-        # (IndexError: pop from empty deque) that crashes the event loop
-        # during asyncio.sleep.  Sync sleep is safe since no concurrent
-        # async work is needed during the delay.
-        time.sleep(ROUND_DELAY_SECS)
+        try:
+            await asyncio.sleep(ROUND_DELAY_SECS)
+        except asyncio.CancelledError:
+            logger.info("Scoring loop cancelled")
+            break
 
 
 # ---------------------------------------------------------------------------
@@ -99,11 +135,16 @@ async def _scoring_round(dp, conn, round_num: int) -> int:
 
     # ── Bulk data fetch (Tier 1 data) ──────────────────────
     # All MDA calls use async siblings to avoid nest_asyncio deadlock on Py3.13.
+    logger.info("Round %d: fetching bulk quotes...", round_num)
+    t_qs = time.time()
     quotes = await dp.get_quotes_bulk_async(universe)
+    logger.info("Round %d: bulk quotes in %.1fs (%d)", round_num, time.time() - t_qs, len(quotes))
     credits_used += 1
 
     # Per-symbol candles — run concurrently so blocking serial calls don't
     # freeze the event loop (which would also stall the agent's LLM cycle).
+    logger.info("Round %d: fetching candles for %d symbols...", round_num, len(universe))
+    t_c = time.time()
     candles_results = await asyncio.gather(
         *[dp.get_candles_async(sym, days_back=60) for sym in universe],
         return_exceptions=True,
@@ -116,7 +157,7 @@ async def _scoring_round(dp, conn, round_num: int) -> int:
         if res:
             candles_map[sym] = res
     credits_used += len(universe)
-    logger.info("Round %d: candles fetched for %d/%d symbols", round_num, len(candles_map), len(universe))
+    logger.info("Round %d: candles fetched for %d/%d symbols in %.1fs", round_num, len(candles_map), len(universe), time.time() - t_c)
 
     # SPY/QQQ for market-level signals
     spy_candles, qqq_candles = await asyncio.gather(

@@ -413,6 +413,55 @@ class DataProviderProtocol(Protocol):
 _CACHE_MISS = object()  # Sentinel for "not in cache"
 
 
+# ------------------------------------------------------------
+# yfinance health circuit breaker
+# ------------------------------------------------------------
+# When Yahoo's finance endpoints are unreachable, each yfinance call
+# blocks for ~7s on DNS/TCP timeout. Since the scorer invokes 9+ yf
+# calls per symbol across the universe, this turns Tier 1 into a
+# 10-minute stall. Track consecutive failures and skip yf calls when
+# the service looks dead.
+import threading
+_YF_LOCK = threading.Lock()
+_YF_CONSECUTIVE_FAILURES = 0
+_YF_COOLDOWN_UNTIL = 0.0  # unix ts; yf calls skipped until this time
+_YF_FAIL_THRESHOLD = 5    # trip breaker after this many consecutive fails
+_YF_COOLDOWN_SECS = 300   # skip yf calls for 5 minutes after tripping
+
+
+def _yf_is_disabled() -> bool:
+    """Return True when yfinance is in cooldown due to prior failures."""
+    import time as _t
+    with _YF_LOCK:
+        return _t.time() < _YF_COOLDOWN_UNTIL
+
+
+def _yf_record_success() -> None:
+    global _YF_CONSECUTIVE_FAILURES, _YF_COOLDOWN_UNTIL
+    with _YF_LOCK:
+        _YF_CONSECUTIVE_FAILURES = 0
+        _YF_COOLDOWN_UNTIL = 0.0
+
+
+def _yf_record_failure(err: Exception) -> None:
+    global _YF_CONSECUTIVE_FAILURES, _YF_COOLDOWN_UNTIL
+    import time as _t
+    msg = str(err).lower()
+    # Only count network-level failures toward the breaker — symbol-not-found
+    # or shape errors shouldn't trip it.
+    if not any(k in msg for k in ("curl", "connect", "timeout", "ssl", "resolve", "network")):
+        return
+    with _YF_LOCK:
+        _YF_CONSECUTIVE_FAILURES += 1
+        if _YF_CONSECUTIVE_FAILURES >= _YF_FAIL_THRESHOLD and _YF_COOLDOWN_UNTIL < _t.time():
+            _YF_COOLDOWN_UNTIL = _t.time() + _YF_COOLDOWN_SECS
+            logger.warning(
+                "yfinance appears unreachable (%d consecutive failures) — "
+                "disabling yf calls for %ds",
+                _YF_CONSECUTIVE_FAILURES, _YF_COOLDOWN_SECS,
+            )
+
+
 class DataProvider:
     """
     Unified data provider wrapping MarketDataClient (official SDK).
@@ -1205,6 +1254,9 @@ class DataProvider:
         if cached is not _CACHE_MISS:
             return cached
 
+        if _yf_is_disabled():
+            return None
+
         try:
             ticker = yf.Ticker(symbol)
             info = ticker.info
@@ -1223,10 +1275,12 @@ class DataProvider:
                 source='yfinance'
             )
             self._set_cached(cache_key, result)
+            _yf_record_success()
             return result
 
         except Exception as e:
             logger.warning(f"Failed to get fundamentals for {symbol}: {e}")
+            _yf_record_failure(e)
             return None
 
     # ==================== EARNINGS (MDA) ====================
@@ -1394,6 +1448,9 @@ class DataProvider:
         if cached is not _CACHE_MISS:
             return cached
 
+        if _yf_is_disabled():
+            return None
+
         try:
             ticker = yf.Ticker(symbol)
             info = ticker.info
@@ -1427,6 +1484,7 @@ class DataProvider:
 
         except Exception as e:
             logger.warning(f"Failed to get extended fundamentals for {symbol}: {e}")
+            _yf_record_failure(e)
             return None
 
     def get_analyst_data(self, symbol: str) -> Optional[AnalystData]:
@@ -1437,6 +1495,9 @@ class DataProvider:
         cached = self._get_cached(cache_key)
         if cached is not _CACHE_MISS:
             return cached
+
+        if _yf_is_disabled():
+            return None
 
         try:
             ticker = yf.Ticker(symbol)
@@ -1481,6 +1542,7 @@ class DataProvider:
 
         except Exception as e:
             logger.warning(f"Failed to get analyst data for {symbol}: {e}")
+            _yf_record_failure(e)
             return None
 
     def get_institutional_data(self, symbol: str) -> Optional[InstitutionalData]:
@@ -1491,6 +1553,9 @@ class DataProvider:
         cached = self._get_cached(cache_key)
         if cached is not _CACHE_MISS:
             return cached
+
+        if _yf_is_disabled():
+            return None
 
         try:
             ticker = yf.Ticker(symbol)
@@ -1533,6 +1598,7 @@ class DataProvider:
 
         except Exception as e:
             logger.warning(f"Failed to get institutional data for {symbol}: {e}")
+            _yf_record_failure(e)
             return None
 
     def get_insider_data(self, symbol: str) -> Optional[InsiderData]:
@@ -1543,6 +1609,9 @@ class DataProvider:
         cached = self._get_cached(cache_key)
         if cached is not _CACHE_MISS:
             return cached
+
+        if _yf_is_disabled():
+            return None
 
         try:
             ticker = yf.Ticker(symbol)
@@ -1596,6 +1665,7 @@ class DataProvider:
 
         except Exception as e:
             logger.warning(f"Failed to get insider data for {symbol}: {e}")
+            _yf_record_failure(e)
             return None
 
     def get_news(self, symbol: str) -> Optional[NewsData]:

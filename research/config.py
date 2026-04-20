@@ -61,12 +61,12 @@ EVOLUTION_COOLDOWN_OFF_HOURS = 300       # 5 min between rounds outside market h
 # `return_lookback_days`.  Per-category defaults live in
 # signals/base.py CATEGORY_FORWARD_DEFAULTS.)
 
-# API budget configuration
+# ── API budget (per scoring round) ─────────────────────────────
 MAX_CREDITS_PER_ROUND = 200         # Circuit breaker
 OPTION_CHAIN_DTE_RANGE = (7, 60)    # Limit DTE to reduce response size
 OPTION_CHAIN_STRIKE_LIMIT = 20      # Max strikes per expiration (server-side filter)
 
-# ── Canonical legs_json field contracts per strategy ────────────
+# ── Options structure schemas ──────────────────────────────────
 # These are the REQUIRED fields for each options structure.
 # The simulator and promotion engine use these for deterministic contract
 # reconstruction from historical chains.  Any signal that omits required

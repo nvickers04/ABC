@@ -19,7 +19,6 @@ from typing import Any
 from core.async_utils import safe_sleep
 from research.config import (
     DEEP_SCAN_TOP_N,
-    MAX_CREDITS_PER_ROUND,
     OPTION_CHAIN_DTE_RANGE,
     OPTION_CHAIN_STRIKE_LIMIT,
     ROUND_DELAY_SECS,
@@ -217,6 +216,42 @@ async def _scoring_round(dp, conn, round_num: int) -> int:
     credits_used += len(universe)
     logger.info("Round %d: candles fetched for %d/%d symbols in %.1fs", round_num, len(candles_map), len(universe), time.time() - t_c)
 
+    # ── Multi-resolution fetch for forward-return measurement ──────
+    # Each signal declares its own (return_resolution, return_lookback_days)
+    # for IC computation.  Fetch one bundle per (resolution, days_back)
+    # combination for the universe; daily already fetched above and is
+    # reused.  Sub-daily resolutions add MDA cost but unlock honest
+    # microstructure/intraday IC.  Failures are non-fatal — those signals
+    # simply skip forward-return computation that round.
+    candles_by_res: dict[str, dict[str, Any]] = {"D": candles_map}
+    needed_res: dict[str, int] = {}
+    for sig in SIGNAL_REGISTRY.values():
+        res = getattr(sig, "return_resolution", "D")
+        if res == "D":
+            continue
+        lb = int(getattr(sig, "return_lookback_days", 30))
+        needed_res[res] = max(needed_res.get(res, 0), lb)
+
+    for res, lb_days in needed_res.items():
+        t_r = time.time()
+        bundle = await asyncio.gather(
+            *[dp.get_candles_async(sym, resolution=res, days_back=lb_days) for sym in universe],
+            return_exceptions=True,
+        )
+        cmap: dict[str, Any] = {}
+        for sym, raw in zip(universe, bundle):
+            if isinstance(raw, Exception):
+                logger.debug("Candles[%s] fetch failed for %s: %s", res, sym, raw)
+                continue
+            if raw:
+                cmap[sym] = raw
+        candles_by_res[res] = cmap
+        credits_used += len(universe)
+        logger.info(
+            "Round %d: candles[%s] fetched for %d/%d symbols in %.1fs (lb=%dd)",
+            round_num, res, len(cmap), len(universe), time.time() - t_r, lb_days,
+        )
+
     # SPY/QQQ for market-level signals
     spy_candles, qqq_candles = await asyncio.gather(
         dp.get_candles_async("SPY", days_back=60),
@@ -388,7 +423,7 @@ async def _scoring_round(dp, conn, round_num: int) -> int:
     write_recommendations(conn, recommendations)
 
     # ── Forward returns for prior-round scores ─────────────
-    await asyncio.to_thread(_compute_forward_returns, conn, dp, candles_map, now)
+    await asyncio.to_thread(_compute_forward_returns, conn, dp, candles_by_res, now)
 
     logger.info(
         "Round %d: N_eff=%.1f, %d composites, %d recs, %d credits",
@@ -645,125 +680,163 @@ def _persist_scores(conn, scores: dict[str, dict[str, dict]], ts: float) -> None
         conn.commit()
 
 
-def _compute_forward_returns(conn, dp, candles_map: dict, current_ts: float) -> None:
+def _compute_forward_returns(
+    conn,
+    dp,
+    candles_by_res: dict[str, dict],
+    current_ts: float,
+) -> None:
     """
     Compute forward returns for prior-round scores and write R(i,s) to signal_returns.
 
-    R(i,s) = score(i,sym,s) × forward_return(sym, s→s+h)
+    R(i,s) = score(i, sym, s) × forward_return(sym, entry_bar → entry_bar + h)
 
-    CRITICAL: the forward return must be measured from the bar AT the score
-    timestamp to `horizon` bars later.  Earlier versions used trailing price
-    windows relative to the current time, which caused label leakage (recent
-    price moves fed back into IC via the same prices used to compute
-    momentum/mean-reversion signals → fabricated IC magnitudes of 0.5+).
-    Rows whose horizon has not yet elapsed are left unrecorded and retried
-    on the next round when fresh candles land.
+    Each signal declares its own (return_resolution, return_horizon) on the
+    Signal subclass.  Bars are looked up in ``candles_by_res[res][sym]``.
+    Rows are keyed by ``(signal, symbol, entry_bar_ts)`` — multiple intraday
+    score rounds that resolve to the same bar collapse via INSERT OR REPLACE,
+    keeping the most recent score for that bar.  This is the correct dedup
+    because each signal has its OWN bar grid (a 1-min signal has 390 bars/day,
+    a daily signal has 1).
+
+    Backlog drains with a per-resolution budget (shortest-resolution first
+    so the freshest microstructure data lands in IC fastest).  Scores too
+    old to ever mature (no candles for the symbol at the signal's resolution)
+    are deleted at the top of the function.
     """
-    # Prune scores for symbols no longer in the current universe.  Without
-    # this, a universe change leaves orphan rows that can never be matured
-    # (we won't fetch their candles again) — they then dominate the LIMIT
-    # 5000 ORDER BY ts ASC budget below and starve the new universe of IC.
-    if candles_map:
-        live_symbols = tuple(candles_map.keys())
-        if live_symbols:
-            placeholders = ",".join("?" * len(live_symbols))
-            n = conn.execute(
-                f"DELETE FROM signal_scores WHERE symbol NOT IN ({placeholders})",
-                live_symbols,
-            ).rowcount
-            if n > 0:
-                conn.commit()
-                logger.info("Pruned %d orphan signal_scores (symbol no longer in universe)", n)
+    # ── Prune scores that can never mature ─────────────────────────
+    # Symbols absent from EVERY resolution's candle map are universe drift —
+    # we'll never re-fetch them.  Drop them so they don't dominate the
+    # per-resolution LIMIT budget below.
+    live_symbols: set[str] = set()
+    for cmap in candles_by_res.values():
+        live_symbols.update(cmap.keys())
+    if live_symbols:
+        placeholders = ",".join("?" * len(live_symbols))
+        n = conn.execute(
+            f"DELETE FROM signal_scores WHERE symbol NOT IN ({placeholders})",
+            tuple(live_symbols),
+        ).rowcount
+        if n > 0:
+            conn.commit()
+            logger.info("Pruned %d orphan signal_scores (symbol no longer in any universe)", n)
 
-    # Get prior-round scores that don't yet have forward returns computed.
-    # Order by ts ASC so the OLDEST scores (most likely to have their horizon
-    # already elapsed) are processed first.  LIMIT is a per-round budget, not
-    # a hard ceiling on the total backlog; subsequent rounds drain the rest.
-    cur = conn.execute(
-        """SELECT ss.signal_name, ss.symbol, ss.ts, ss.score
-           FROM signal_scores ss
-           WHERE ss.ts < ?
-             AND NOT EXISTS (
-               SELECT 1 FROM signal_returns sr
-               WHERE sr.signal_name = ss.signal_name
-                 AND sr.symbol = ss.symbol
-                 AND sr.ts = ss.ts
-             )
-           ORDER BY ss.ts ASC
-           LIMIT 5000""",
-        (current_ts,),
-    )
-    prior_scores = cur.fetchall()
+    # TTL purge: anything older than 30 days is past every signal's horizon
+    # (longest horizon today = 10 trading days ≈ 14 calendar).  Without
+    # this, ancient unmatured scores eat the per-round LIMIT forever.
+    ttl_cutoff = current_ts - 30 * 86400
+    n_ttl = conn.execute(
+        "DELETE FROM signal_scores WHERE ts < ?", (ttl_cutoff,)
+    ).rowcount
+    if n_ttl > 0:
+        conn.commit()
+        logger.info("Pruned %d stale signal_scores (older than 30d)", n_ttl)
 
-    if not prior_scores:
-        return
+    # ── Group signals by resolution; drain shortest first ──────────
+    sigs_by_res: dict[str, list[str]] = {}
+    for name, sig in SIGNAL_REGISTRY.items():
+        res = getattr(sig, "return_resolution", "D")
+        sigs_by_res.setdefault(res, []).append(name)
 
-    rows = []
-    pending = 0
-    no_candles = 0
-    no_entry = 0
-    for row in prior_scores:
-        sig_name, sym, score_ts, score = row
-        sig = SIGNAL_REGISTRY.get(sig_name)
-        if not sig:
+    # Per-resolution backlog budget.  Sub-daily resolutions can produce
+    # thousands of bars per symbol per day; daily produces 1.  Caps keep
+    # any single resolution from monopolising the round's wall time.
+    BUDGET_BY_RES = {
+        "1min": 2000,
+        "5min": 1500,
+        "15min": 1000,
+        "1h":   800,
+        "D":    500,
+    }
+    # Sort by typical bar size (fastest first) so freshest data lands first.
+    res_order = ["1min", "5min", "15min", "1h", "D"]
+
+    totals = {"wrote": 0, "pending": 0, "no_entry": 0, "no_candles": 0, "scanned": 0}
+    per_res_log: list[str] = []
+
+    for res in res_order:
+        sig_names = sigs_by_res.get(res)
+        if not sig_names:
             continue
+        cmap = candles_by_res.get(res, {})
+        budget = BUDGET_BY_RES.get(res, 500)
 
-        # Per-signal horizon (in bars of sig.return_resolution).  Phase D
-        # will replace this whole function with multi-resolution candle
-        # lookup; today we still use the round's daily candles_map, so for
-        # signals that declare sub-daily resolution we fall back to a
-        # 1-bar (1-day) horizon to avoid misreading sub-daily horizons as
-        # days.
-        if getattr(sig, "return_resolution", "D") == "D":
+        placeholders = ",".join("?" * len(sig_names))
+        cur = conn.execute(
+            f"""SELECT ss.signal_name, ss.symbol, ss.ts, ss.score
+                  FROM signal_scores ss
+                 WHERE ss.ts < ?
+                   AND ss.signal_name IN ({placeholders})
+                 ORDER BY ss.ts ASC
+                 LIMIT ?""",
+            (current_ts, *sig_names, budget),
+        )
+        prior_scores = cur.fetchall()
+        totals["scanned"] += len(prior_scores)
+
+        rows = []
+        wrote = pending = no_entry = no_candles = 0
+
+        for sig_name, sym, score_ts, score in prior_scores:
+            sig = SIGNAL_REGISTRY.get(sig_name)
+            if not sig:
+                continue
             horizon = int(getattr(sig, "return_horizon", 5))
-        else:
-            horizon = 1  # interim until Phase D wires sub-daily candles
 
-        candles = candles_map.get(sym)
-        if not candles:
-            no_candles += 1
-            continue
+            candles = cmap.get(sym)
+            if not candles:
+                no_candles += 1
+                continue
+            closes = candles.close
+            ts_list = candles.timestamps
+            if len(closes) < 2 or not ts_list or len(ts_list) != len(closes):
+                no_candles += 1
+                continue
 
-        closes = candles.close
-        ts_list = candles.timestamps
-        if len(closes) < 2 or not ts_list or len(ts_list) != len(closes):
-            no_candles += 1
-            continue
+            # Most recent bar with ts <= score_ts.
+            i_entry = bisect.bisect_right(ts_list, score_ts) - 1
+            if i_entry < 0:
+                no_entry += 1
+                continue
+            i_exit = i_entry + horizon
+            if i_exit >= len(ts_list):
+                pending += 1
+                continue
 
-        # Locate the bar representing price knowledge AS OF score_ts:
-        # the most recent bar with timestamp <= score_ts.
-        i_entry = bisect.bisect_right(ts_list, score_ts) - 1
-        if i_entry < 0:
-            # score_ts precedes all candle history.
-            no_entry += 1
-            continue
+            entry_price = closes[i_entry]
+            exit_price = closes[i_exit]
+            if not (entry_price and entry_price > 0):
+                continue
 
-        i_exit = i_entry + horizon
-        if i_exit >= len(ts_list):
-            # Horizon has not elapsed.  Leave unrecorded; retry next round.
-            pending += 1
-            continue
-
-        entry_price = closes[i_entry]
-        exit_price = closes[i_exit]
-
-        if entry_price and entry_price > 0:
             fwd_return = (exit_price - entry_price) / entry_price
             r_value = float(score) * fwd_return
+            entry_bar_ts = float(ts_list[i_entry])
             rows.append((
-                sig_name, sym, score_ts,
+                sig_name, sym, entry_bar_ts,
                 float(score), fwd_return, r_value, horizon,
             ))
+            wrote += 1
 
-    if rows:
-        conn.executemany(
-            "INSERT OR REPLACE INTO signal_returns "
-            "(signal_name, symbol, ts, score_at_entry, forward_return, r_value, horizon_bars) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?)",
-            rows,
+        if rows:
+            conn.executemany(
+                "INSERT OR REPLACE INTO signal_returns "
+                "(signal_name, symbol, ts, score_at_entry, forward_return, r_value, horizon_bars) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?)",
+                rows,
+            )
+            conn.commit()
+
+        totals["wrote"] += wrote
+        totals["pending"] += pending
+        totals["no_entry"] += no_entry
+        totals["no_candles"] += no_candles
+        per_res_log.append(
+            f"{res}:wrote={wrote},pending={pending},no_candles={no_candles}"
         )
-        conn.commit()
+
     logger.info(
-        "Forward returns: wrote=%d pending=%d no_entry=%d no_candles=%d (of %d prior scores)",
-        len(rows), pending, no_entry, no_candles, len(prior_scores),
+        "Forward returns: wrote=%d pending=%d no_entry=%d no_candles=%d "
+        "(scanned %d) [%s]",
+        totals["wrote"], totals["pending"], totals["no_entry"],
+        totals["no_candles"], totals["scanned"], " ".join(per_res_log),
     )

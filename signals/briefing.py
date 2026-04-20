@@ -254,10 +254,26 @@ def briefing_summary(data: dict) -> dict:
     top_ic = data.get("top_signals_by_ic", [])
     retired = data.get("retired_signals", [])
 
+    # Distinguish "no realized history yet" from "history exists, edge is weak"
+    # so the agent doesn't sit on cash for days while the DB warms up.
+    history_rows = 0
+    try:
+        from memory import get_db as _get_db
+        history_rows = int(
+            _get_db().execute(
+                "SELECT COUNT(*) FROM signal_returns WHERE forward_return IS NOT NULL"
+            ).fetchone()[0]
+        )
+    except Exception:
+        pass
+    history_warming = history_rows < 50  # combiner needs ~30+ for a stable IC
+
     # Edge strength is advisory: it tells you the quantitative stack's
     # measured information ratio. Use it as a conviction multiplier, not
     # a binary trade permission.
-    if ir is None:
+    if history_warming:
+        edge_strength = "warming"
+    elif ir is None:
         edge_strength = "unknown"
     elif ir >= 0.50:
         edge_strength = "strong"
@@ -273,6 +289,7 @@ def briefing_summary(data: dict) -> dict:
         "strength": edge_strength,
         "gate_min_reference": ir_min,
         "gate_open": bool(gate_open),
+        "history_rows": history_rows,
     }
     if top_ic:
         edge_block["driving_signals"] = [
@@ -283,7 +300,17 @@ def briefing_summary(data: dict) -> dict:
         edge_block["retired_signals"] = [r["name"] for r in retired]
 
     # Action instruction is informational. The agent decides.
-    if edge_strength in ("strong", "moderate"):
+    if edge_strength == "warming":
+        action_instruction = (
+            f"IC history is warming up ({history_rows} realized return rows; need ~50 for stable IC). "
+            "The composites and ACTION_REQUIRED list below are still valid signal output — they "
+            "are ranked from the 50-signal stack regardless of IC history. Treat them as candidates "
+            "worth concrete evaluation (chart + news/iv), not as 'wait until IR ratifies them.' "
+            "Most evaluations will reasonably PASS — that is correct discipline, not laziness. "
+            "Only TAKE when the evaluation produces real conviction; idle cash is not a reason "
+            "to enter a weak setup."
+        )
+    elif edge_strength in ("strong", "moderate"):
         action_instruction = (
             f"Quant edge is {edge_strength} (IR={ir:.3f}). Signals below are candidates — "
             "adapt to current prices, scale size with your conviction, execute what you believe in. "
@@ -292,20 +319,24 @@ def briefing_summary(data: dict) -> dict:
     elif edge_strength == "weak":
         action_instruction = (
             f"Quant edge is weak (IR={ir:.3f}, just above reference {ir_min:.3f}). "
-            "Be selective — take only the highest-conviction recommendations or your own research-backed ideas. "
-            "Reduce size vs. strong-edge days."
+            "Be selective — take only the highest-conviction recommendations or your own "
+            "research-backed ideas. Half size vs. strong-edge days. Sitting in cash all day "
+            "without evaluating any candidate is also a choice — make it deliberately."
         )
     elif edge_strength == "marginal":
         action_instruction = (
             f"Quant edge is marginal (IR={ir:.3f} < reference {ir_min:.3f}). "
             "The stacked signals have little measurable information right now. "
-            "Prefer managing existing positions, hedging, or waiting. "
-            "If you still see a clear thesis from research, size small and document your rationale."
+            "Lean toward managing existing positions and hedging — but the top composites are "
+            "still the best-ranked names from a 50-signal stack; if your independent research "
+            "finds a clear thesis on one, take it small with documented rationale. Do not "
+            "default to 'hold everything, do nothing' — that has its own opportunity cost."
         )
     else:
         action_instruction = (
             "Insufficient IC history to rate edge yet. "
-            "Use research + your own judgment; prefer small size until the measured edge stabilises."
+            "Use research + your own judgment; size moderately. The composites below are still "
+            "valid candidates — evaluate the top one with chart/news/iv_info before defaulting to skip."
         )
 
     result = {

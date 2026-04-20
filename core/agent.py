@@ -967,6 +967,19 @@ If no changes warranted: []"""
                         f"Stock long: ${long_stock_notional:,.0f} ({pct_long:.1f}% of NetLiq)  "
                         f"| Cash: ${cash_val:,.0f} ({pct_cash:.1f}%)"
                     )
+                    # Idle-cash flag: if more than 30% of NetLiq is in cash,
+                    # the agent has slack and should actively evaluate top
+                    # candidates instead of defaulting to skip.
+                    if pct_cash > 30:
+                        lines.append(
+                            f"  ⚠ IDLE CASH: {pct_cash:.0f}% of NetLiq is uninvested. "
+                            "Required this cycle: evaluate the top composite from briefing() "
+                            "that is not already held — chart_intraday + one context tool "
+                            "(news OR iv_info), then verdict TAKE or PASS with reason. "
+                            "PASS is fully valid (most evals should pass on marginal/warming "
+                            "edge days). Do NOT enter a weak setup just because cash is idle. "
+                            "What's not allowed is ending the cycle with NO evaluation."
+                        )
                 else:
                     lines.append(f"Stock long: ${long_stock_notional:,.0f}  | Cash: ${cash_val:,.0f}")
                 if opt_long_contracts or opt_short_contracts:

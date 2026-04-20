@@ -379,10 +379,69 @@ def init_db() -> sqlite3.Connection:
     for col_name, col_type in _env_continuous_cols:
         _ensure_column(conn, "environment_snapshots", col_name, col_type)
 
+    # ── Schema-version migrations ────────────────────────────────
+    # Any change that invalidates historical data (not just column adds)
+    # should be expressed as a migration below, bumping SCHEMA_VERSION.
+    # Existing DBs run the missing migrations in order on next start-up,
+    # so every live run always works on data that matches the code.
+    _apply_schema_migrations(conn)
+
     conn.commit()
     _connection = conn
     logger.info(f"Memory DB initialized: {_DB_PATH}")
     return conn
+
+
+# ── Schema migrations ────────────────────────────────────────────
+# Bump SCHEMA_VERSION when you add an entry to _MIGRATIONS.  Each
+# migration is a ``(version, description, fn)`` triple where ``fn``
+# takes a connection and does whatever work is needed.  Migrations run
+# inside the init_db transaction so a failure leaves the DB unchanged.
+
+SCHEMA_VERSION = 2
+
+
+def _migration_v2_reset_forward_return_pipeline(conn: sqlite3.Connection) -> None:
+    """Phase D (2026-04-20) changed signal_returns keying from score_ts
+    to entry_bar_ts.  Existing rows mix the two semantics and re-inflate
+    IC; drop them.  Also drop signal_scores so the 30d TTL doesn't have
+    to grind through pre-fix timestamps.  composite_scores is derived
+    and safe to clear."""
+    for tbl in ("signal_returns", "signal_scores", "composite_scores"):
+        try:
+            conn.execute(f"DELETE FROM {tbl}")
+        except sqlite3.OperationalError:
+            pass  # table may not exist on very old DBs
+
+
+_MIGRATIONS: list[tuple[int, str, callable]] = [
+    (2, "reset forward-return pipeline for per-signal entry_bar_ts keying",
+     _migration_v2_reset_forward_return_pipeline),
+]
+
+
+def _apply_schema_migrations(conn: sqlite3.Connection) -> None:
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS schema_version ("
+        "version INTEGER PRIMARY KEY, applied_ts REAL NOT NULL, description TEXT)"
+    )
+    row = conn.execute("SELECT MAX(version) FROM schema_version").fetchone()
+    current = int(row[0]) if row and row[0] is not None else 1  # legacy DBs start at 1
+
+    if current >= SCHEMA_VERSION:
+        return
+
+    import time as _time
+    for version, desc, fn in _MIGRATIONS:
+        if version <= current:
+            continue
+        logger.warning("Applying schema migration v%d: %s", version, desc)
+        fn(conn)
+        conn.execute(
+            "INSERT INTO schema_version (version, applied_ts, description) VALUES (?, ?, ?)",
+            (version, _time.time(), desc),
+        )
+    logger.info("Schema at version %d (was %d)", SCHEMA_VERSION, current)
 
 
 def get_db() -> sqlite3.Connection:

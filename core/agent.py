@@ -14,6 +14,7 @@ import asyncio
 import json
 import logging
 import re
+import time
 from datetime import datetime, timezone, timedelta
 from typing import Any, Optional
 
@@ -239,6 +240,8 @@ class TradingAgent:
 
         # Session state
         self._cycle_id = 0
+        self._last_step = "init"
+        self._last_step_ts = time.time()
         self._last_cycle_summary = ""
         self._halted = False
         self._start_of_day_cash: Optional[float] = None
@@ -1100,6 +1103,9 @@ If no changes warranted: []"""
         """
         self._cycle_failures = 0
         self._cycle_id += 1
+        self._last_step = "detect_session"
+        self._last_step_ts = time.time()
+        logger.info("CYCLE %d step=detect_session", self._cycle_id)
 
         # Detect current market session and prune stale research
         try:
@@ -1179,6 +1185,9 @@ If no changes warranted: []"""
                 pass
 
         # Build state context from broker
+        self._last_step = "build_state_context"
+        self._last_step_ts = time.time()
+        logger.info("CYCLE %d step=build_state_context", self._cycle_id)
         state_text = await self._build_state_context()
 
         # Check daily loss
@@ -1244,6 +1253,9 @@ Time: {_et_now.strftime('%Y-%m-%d %H:%M:%S')} ET
 Account state above. Start by calling briefing() to assess research status."""
 
         # ── Build xAI SDK chat instance ─────────────────────────
+        self._last_step = "chat_create"
+        self._last_step_ts = time.time()
+        logger.info("CYCLE %d step=chat_create", self._cycle_id)
         chat = self.grok.client.chat.create(
             model=self.grok.model,
             messages=[

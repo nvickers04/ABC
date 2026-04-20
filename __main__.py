@@ -156,8 +156,58 @@ def main():
         tasks.append(run_template_evolution())
         print("Template evolution running (agent can pause/stop via research_engine tool)\n")
 
+    async def _heartbeat():
+        """Log a heartbeat every 60s with each known component's last activity.
+
+        Surfaces silent stalls — if the agent is hung in build_state_context
+        or chat.sample(), nothing else logs from core.agent and the operator
+        cannot tell whether the trader is alive.  Heartbeat keeps that visible.
+        """
+        import time as _time
+        from core.agent import TradingAgent  # type: ignore  # noqa
+        hb_logger = logging.getLogger("heartbeat")
+        # Find the agent instance by walking gc — cheap; runs once a minute.
+        import gc
+        STALL_THRESHOLD = 300  # seconds
+        while True:
+            try:
+                agent_obj = next(
+                    (o for o in gc.get_objects()
+                     if type(o).__name__ == "TradingAgent"),
+                    None,
+                )
+                if agent_obj is not None:
+                    last_step = getattr(agent_obj, "_last_step", "?")
+                    last_ts = getattr(agent_obj, "_last_step_ts", _time.time())
+                    age = _time.time() - last_ts
+                    cycle = getattr(agent_obj, "_cycle_id", 0)
+                    session = getattr(agent_obj, "_current_session", "?")
+                    if age > STALL_THRESHOLD:
+                        hb_logger.warning(
+                            "STALL_DETECTED cycle=%d session=%s step=%s age=%.0fs",
+                            cycle, session, last_step, age,
+                        )
+                    else:
+                        hb_logger.info(
+                            "HEARTBEAT cycle=%d session=%s step=%s age=%.0fs",
+                            cycle, session, last_step, age,
+                        )
+                else:
+                    hb_logger.info("HEARTBEAT no_agent_yet")
+            except Exception as e:
+                hb_logger.debug("heartbeat error: %s", e)
+            await asyncio.sleep(60)
+
+    def _loop_exception_handler(loop, context):
+        msg = context.get("message", "unknown")
+        exc = context.get("exception")
+        logger.error("ASYNC_LOOP_EXCEPTION: %s", msg, exc_info=exc)
+
     async def _run_all():
-        results = await asyncio.gather(*tasks, return_exceptions=True)
+        loop = asyncio.get_running_loop()
+        loop.set_exception_handler(_loop_exception_handler)
+        all_tasks = tasks + [_heartbeat()]
+        results = await asyncio.gather(*all_tasks, return_exceptions=True)
         for r in results:
             if isinstance(r, Exception):
                 logger.error("Task crashed: %s", r, exc_info=r)

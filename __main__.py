@@ -152,8 +152,8 @@ def main():
 
     tasks = [run_agent()]
     if not args.no_evolution:
-        from signals.template_evolution import run_template_evolution
-        tasks.append(run_template_evolution())
+        from signals.template_evolution import run_template_evolution_threaded
+        run_template_evolution_threaded()
         print("Template evolution running (agent can pause/stop via research_engine tool)\n")
 
     async def _heartbeat():

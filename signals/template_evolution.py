@@ -17,7 +17,6 @@ from typing import Any
 
 import numpy as np
 
-from core.async_utils import safe_sleep
 from data.market_hours import get_market_hours_provider
 from memory import get_db
 from research.config import (
@@ -96,6 +95,42 @@ def start_evolution_task() -> "asyncio.Task":
     return _evolution_task
 
 
+_evolution_thread = None  # type: ignore[var-annotated]
+
+
+def run_template_evolution_threaded() -> None:
+    """Run run_template_evolution on a dedicated daemon thread with its own
+    asyncio event loop. Returns immediately.
+
+    Isolates the long sync `time.sleep(cooldown)` (workaround for the
+    Python 3.13 asyncio deque bug) from the main event loop so the agent,
+    scorer, and heartbeat keep ticking.
+    """
+    import threading
+
+    global _evolution_thread
+    if _evolution_thread is not None and _evolution_thread.is_alive():
+        return
+
+    def _thread_target() -> None:
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        try:
+            loop.run_until_complete(run_template_evolution())
+        except Exception:
+            logger.exception("Template evolution thread crashed")
+        finally:
+            try:
+                loop.close()
+            except Exception:
+                pass
+
+    _evolution_thread = threading.Thread(
+        target=_thread_target, name="template_evolution", daemon=True
+    )
+    _evolution_thread.start()
+
+
 async def run_template_evolution() -> None:
     """
     Continuous evolution loop — runs forever alongside agent and scorer.
@@ -132,14 +167,16 @@ async def run_template_evolution() -> None:
 
             await _evolution_round(conn)
 
-            # safe_sleep guards against Python 3.13 asyncio deque bug.
-            await safe_sleep(cooldown)
+            # Sync sleep — Python 3.13 asyncio deque bug crashes event loop
+            # on long awaits. This loop runs in its own thread (see
+            # run_template_evolution_threaded) so blocking is local.
+            time.sleep(cooldown)
         except asyncio.CancelledError:
             logger.info("Template evolution cancelled")
             break
         except Exception as e:
             logger.error("Template evolution error: %s", e, exc_info=True)
-            await safe_sleep(60)
+            time.sleep(60)
 
 
 # ---------------------------------------------------------------------------

@@ -17,6 +17,7 @@ from typing import Any
 
 import numpy as np
 
+from core.async_utils import safe_sleep
 from data.market_hours import get_market_hours_provider
 from memory import get_db
 from research.config import (
@@ -131,14 +132,14 @@ async def run_template_evolution() -> None:
 
             await _evolution_round(conn)
 
-            # Sync sleep — Python 3.13 asyncio deque bug crashes event loop.
-            time.sleep(cooldown)
+            # safe_sleep guards against Python 3.13 asyncio deque bug.
+            await safe_sleep(cooldown)
         except asyncio.CancelledError:
             logger.info("Template evolution cancelled")
             break
         except Exception as e:
             logger.error("Template evolution error: %s", e, exc_info=True)
-            time.sleep(60)
+            await safe_sleep(60)
 
 
 # ---------------------------------------------------------------------------

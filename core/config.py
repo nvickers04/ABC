@@ -77,7 +77,7 @@ MODE_TEXTS: dict[TradingMode, str] = {
 MODE_DESCRIPTION = MODE_TEXTS[TRADING_MODE]
 
 # ── Risk Constants ──────────────────────────────────────────────────────────
-CYCLE_SLEEP_SECONDS = 60        # 1-minute cycles — fast iteration for paper
+CYCLE_SLEEP_SECONDS = 30        # 30s cycles — fast iteration for paper
 MAX_DAILY_LOSS_PCT = 15.0       # Emergency flatten threshold
 INTRADAY_DRAWDOWN_PCT = 3.0     # Peak-to-trough drawdown limit within a session
 EOD_FLATTEN_MINUTES = 5         # Flatten all positions N minutes before close
@@ -257,7 +257,7 @@ One JSON object per response. One tool call per response.
 
 Tool call: {{"action": "<tool_name>", ...params}}
 End cycle: {{"action": "done", "summary": "what I did this cycle", "cooldown": 30}}
-  cooldown = seconds before next cycle (5-3600). Default {CYCLE_SLEEP_SECONDS}s. Use short (10-15s) when actively trading, longer (60-300s) when waiting for fills or nothing to do.
+  cooldown = seconds before next cycle (5-3600). Default {CYCLE_SLEEP_SECONDS}s. Use short (10-20s) when actively trading or watching fills. 30-60s is normal. Avoid >90s — the market moves and you should re-evaluate.
 
 Examples (single-turn calls):
   {{"action": "briefing"}}

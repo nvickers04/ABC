@@ -742,8 +742,15 @@ def _compute_forward_returns(conn, dp, candles_map: dict, current_ts: float) -> 
         if entry_price and entry_price > 0:
             fwd_return = (exit_price - entry_price) / entry_price
             r_value = float(score) * fwd_return
+            # Key the row on the entry-bar timestamp, NOT score_ts.  Multiple
+            # intraday scoring rounds resolve to the same daily bar; without
+            # this dedup, each round writes a separate row with an identical
+            # fwd_return, inflating effective n and falsely amplifying IC
+            # t-statistics.  PK (signal, symbol, ts) collapses duplicates via
+            # INSERT OR REPLACE, keeping the most recent score for that bar.
+            entry_bar_ts = float(ts_list[i_entry])
             rows.append((
-                sig_name, sym, score_ts,
+                sig_name, sym, entry_bar_ts,
                 float(score), fwd_return, r_value, horizon,
             ))
 

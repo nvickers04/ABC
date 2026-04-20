@@ -702,8 +702,25 @@ def _update_ic_retirement(
         logger.debug("IC retirement persistence unavailable: %s", e)
         return
 
+    # Cross-sectional IC is undefined for signals that produce the same
+    # value across all symbols at a given timestamp (macro/environment
+    # signals).  Skip retirement tracking for them — their |IC| will
+    # always be ~0 and we'd flood the log with spurious RETIRE_CANDIDATE
+    # warnings.  These signals contribute via their time-series weight
+    # in the regime layer, not the per-symbol IC layer.
+    try:
+        from signals.base import SIGNAL_REGISTRY
+        _macro_signals = {
+            n for n, s in SIGNAL_REGISTRY.items()
+            if getattr(s, "category", "") == "macro"
+        }
+    except Exception:
+        _macro_signals = set()
+
     for name, d in ic_stats.items():
         if d["n"] < _IC_MIN_OBS:
+            continue
+        if name in _macro_signals:
             continue
         key = f"ic_noise_streak:{name}"
         prev = int(get_research_config(key, 0))

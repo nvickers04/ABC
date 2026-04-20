@@ -10,6 +10,10 @@ class EarningsSignal(Signal):
     data_source = "yfinance"
     refresh_rate = "5min"
     tier = 1
+    # Post-earnings drift literature: 1–3 weeks horizon.
+    return_resolution = "D"
+    return_horizon = 10
+    return_lookback_days = 120
 
     def compute(self, symbol: str, data: dict) -> SignalResult:
         earnings_info = data.get("earnings_info")

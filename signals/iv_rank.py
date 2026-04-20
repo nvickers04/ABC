@@ -10,6 +10,10 @@ class IVRankSignal(Signal):
     data_source = "mda_options"
     refresh_rate = "every_round"
     tier = 2
+    # IV percentile changes meaningfully over days, not hours.
+    return_resolution = "D"
+    return_horizon = 3
+    return_lookback_days = 60
 
     def compute(self, symbol: str, data: dict) -> SignalResult:
         iv_info = data.get("iv_info")

@@ -10,6 +10,10 @@ class SpreadDynamicsSignal(Signal):
     data_source = "mda_quotes"
     refresh_rate = "every_round"
     tier = 1
+    # True tick-level: 1-min bars, 30 bars (=30 min) ahead, 2 days history.
+    return_resolution = "1min"
+    return_horizon = 30
+    return_lookback_days = 2
 
     def compute(self, symbol: str, data: dict) -> SignalResult:
         quote = data.get("quote")

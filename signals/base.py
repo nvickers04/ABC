@@ -38,6 +38,32 @@ def _clamp(value: float, lo: float, hi: float) -> float:
     return max(lo, min(hi, value))
 
 
+# ── Per-category forward-return defaults ─────────────────────────────
+# (resolution, horizon_in_bars, lookback_days).  These define the
+# "natural cadence" at which a category of signal is expected to
+# manifest its edge in realised forward returns:
+#
+#   microstructure: 5-min bars, 6 bars ahead = 30 min, 5 days history
+#                   → flow/quote signals decay within minutes, IC accumulates fast
+#   price:          1-hour bars, 4 bars ahead = 4 hours, 30 days history
+#                   → intraday momentum/breakout resolve within a session
+#   volatility:     1-hour bars, 24 bars ahead = ~1 day, 30 days history
+#                   → IV mean-reverts over a session+
+#   macro:          daily bars, 1 day ahead, 60 days history
+#                   → regime/breadth shifts unfold day-over-day
+#   fundamental:    daily bars, 5 days ahead, 90 days history
+#                   → earnings drift / re-rating takes a week+
+#
+# Individual signals may override any of these on the subclass.
+CATEGORY_FORWARD_DEFAULTS: dict[str, dict[str, Any]] = {
+    "microstructure": {"return_resolution": "5min", "return_horizon": 6,  "return_lookback_days": 5},
+    "price":          {"return_resolution": "1h",   "return_horizon": 4,  "return_lookback_days": 30},
+    "volatility":     {"return_resolution": "1h",   "return_horizon": 24, "return_lookback_days": 30},
+    "macro":          {"return_resolution": "D",    "return_horizon": 1,  "return_lookback_days": 60},
+    "fundamental":    {"return_resolution": "D",    "return_horizon": 5,  "return_lookback_days": 90},
+}
+
+
 class Signal(ABC):
     """Base class for all scoring signals."""
 
@@ -49,8 +75,31 @@ class Signal(ABC):
     # Tier: 1 = cheap (no option chains), 2 = expensive (needs option chains)
     tier: int = 1
 
+    # ── Forward-return measurement attributes ─────────────────────────
+    # Each signal declares the candle resolution and horizon (in bars of
+    # that resolution) used to compute its realised forward return for
+    # IC attribution.  Signals with naturally short horizons (microstructure,
+    # short-term price) sample fast and produce many independent
+    # observations per day; longer-horizon signals (fundamentals, macro)
+    # produce fewer observations.  This per-signal cadence is the basis
+    # of the IC pipeline — it MUST match the timeframe at which the
+    # signal's edge would manifest.  Defaults below are the per-category
+    # baselines from CATEGORY_FORWARD_DEFAULTS; subclasses may override.
+    return_resolution: str = "D"
+    return_horizon: int = 5
+    return_lookback_days: int = 60
+
     def __init_subclass__(cls, **kwargs):
         super().__init_subclass__(**kwargs)
+        # Apply per-category forward-return defaults if subclass didn't
+        # explicitly override them.  Looks at the subclass's __dict__ —
+        # if return_resolution / return_horizon / return_lookback_days
+        # aren't set on the subclass itself, inherit from category.
+        cat_defaults = CATEGORY_FORWARD_DEFAULTS.get(cls.category)
+        if cat_defaults:
+            for attr, default_val in cat_defaults.items():
+                if attr not in cls.__dict__:
+                    setattr(cls, attr, default_val)
         if cls.name:
             SIGNAL_REGISTRY[cls.name] = cls()
 

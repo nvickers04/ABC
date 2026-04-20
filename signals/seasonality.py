@@ -11,6 +11,10 @@ class SeasonalitySignal(Signal):
     data_source = "environment"
     refresh_rate = "every_round"
     tier = 1
+    # Day-of-week / OPEX patterns play out over multi-day horizons.
+    return_resolution = "D"
+    return_horizon = 10
+    return_lookback_days = 90
 
     # Historical day-of-week biases (slight, from academic research)
     # Monday: slight negative, Tuesday-Thursday: neutral-positive, Friday: mixed

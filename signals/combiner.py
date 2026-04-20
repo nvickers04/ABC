@@ -15,7 +15,6 @@ from typing import Any
 import numpy as np
 
 from research.config import (
-    FORWARD_RETURN_HORIZON,
     MIN_SHARED_PERIODS_FOR_COMBINATION,
     SIGNAL_WEIGHT_LOOKBACK_DAYS,
 )

@@ -19,7 +19,6 @@ from typing import Any
 from core.async_utils import safe_sleep
 from research.config import (
     DEEP_SCAN_TOP_N,
-    FORWARD_RETURN_HORIZON,
     MAX_CREDITS_PER_ROUND,
     OPTION_CHAIN_DTE_RANGE,
     OPTION_CHAIN_STRIKE_LIMIT,
@@ -709,7 +708,16 @@ def _compute_forward_returns(conn, dp, candles_map: dict, current_ts: float) -> 
         if not sig:
             continue
 
-        horizon = FORWARD_RETURN_HORIZON.get(sig.category, 5)
+        # Per-signal horizon (in bars of sig.return_resolution).  Phase D
+        # will replace this whole function with multi-resolution candle
+        # lookup; today we still use the round's daily candles_map, so for
+        # signals that declare sub-daily resolution we fall back to a
+        # 1-bar (1-day) horizon to avoid misreading sub-daily horizons as
+        # days.
+        if getattr(sig, "return_resolution", "D") == "D":
+            horizon = int(getattr(sig, "return_horizon", 5))
+        else:
+            horizon = 1  # interim until Phase D wires sub-daily candles
 
         candles = candles_map.get(sym)
         if not candles:

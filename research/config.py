@@ -56,18 +56,10 @@ TRADE_REC_TOP_N = 5              # Tier 3: top N from Tier 2 get template select
 EVOLUTION_COOLDOWN_MARKET_HOURS = 1800   # 30 min between evolution rounds during market
 EVOLUTION_COOLDOWN_OFF_HOURS = 300       # 5 min between rounds outside market hours
 
-# Per-category forward-return horizons IN BARS.  The scorer fetches DAILY
-# candles (resolution='D', days_back=60), so "bars" here = trading days.
-# Horizons must be short enough to resolve inside the 60-day history
-# window, otherwise forward returns never materialise and no edge is
-# ever measured.
-FORWARD_RETURN_HORIZON = {
-    "price": 1,            # 1 day (intraday/trend signals resolve fast)
-    "volatility": 3,       # 3 days (IV mean-reverts over days, not sessions)
-    "fundamental": 10,     # 10 days (post-earnings drift / fundamental re-rating)
-    "macro": 1,            # 1 day (event reactions unfold within a session)
-    "microstructure": 1,   # 1 day (flow signals are short-lived)
-}
+# (Forward-return horizon and resolution are now per-signal attributes
+# on the Signal subclass: `return_resolution`, `return_horizon`,
+# `return_lookback_days`.  Per-category defaults live in
+# signals/base.py CATEGORY_FORWARD_DEFAULTS.)
 
 # API budget configuration
 MAX_CREDITS_PER_ROUND = 200         # Circuit breaker

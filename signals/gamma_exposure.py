@@ -10,6 +10,10 @@ class GammaExposureSignal(Signal):
     data_source = "mda_options"
     refresh_rate = "every_round"
     tier = 2
+    # Option-chain refresh dictates daily cadence; gamma effects play out over days.
+    return_resolution = "D"
+    return_horizon = 3
+    return_lookback_days = 60
 
     def compute(self, symbol: str, data: dict) -> SignalResult:
         option_chain = data.get("option_chain")

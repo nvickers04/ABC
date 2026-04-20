@@ -400,6 +400,12 @@ class IBKRConnector(IBKROrdersMixin, IBKROptionsMixin, IBKRQueriesMixin):
 
             logger.info(f"Execution captured: {execution.side} {execution.shares} {symbol} @ ${execution.price:.2f}")
 
+            try:
+                from core.wake_events import wake_bus
+                wake_bus.signal(f"fill:{symbol} {execution.side} {int(execution.shares)}@{float(execution.price):.2f}")
+            except Exception:
+                pass
+
         except Exception as e:
             logger.error(f"Failed to process execution event: {e}", exc_info=True)
 
@@ -423,6 +429,11 @@ class IBKRConnector(IBKROrdersMixin, IBKROptionsMixin, IBKRQueriesMixin):
                 logger.info(f"[OK] Order FILLED: {order_type} {symbol}")
             elif status == 'Cancelled':
                 logger.info(f"[X] Order CANCELLED: {order_type} {symbol}")
+                try:
+                    from core.wake_events import wake_bus
+                    wake_bus.signal(f"cancel:{symbol} {order_type}")
+                except Exception:
+                    pass
 
             for listener in list(self._order_status_listeners):
                 try:

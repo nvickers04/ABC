@@ -243,6 +243,8 @@ class TradingAgent:
         self._last_step = "init"
         self._last_step_ts = time.time()
         self._last_cycle_summary = ""
+        self._last_wait_reason = ""    # why the agent chose to wait (set in done)
+        self._last_wake_reason = ""    # what woke it (scorer_round_N / timeout / ...)
         self._halted = False
         self._start_of_day_cash: Optional[float] = None
         self._session_high_water: Optional[float] = None  # Peak NLV for drawdown tracking
@@ -1262,6 +1264,10 @@ If no changes warranted: []"""
         continuity = ""
         if self._last_cycle_summary:
             continuity = f"\nLAST CYCLE: {self._last_cycle_summary}\n"
+        if self._last_wait_reason or self._last_wake_reason:
+            wr = self._last_wait_reason or "(none stated)"
+            wk = self._last_wake_reason or "(timer)"
+            continuity += f"WAITED BECAUSE: {wr}\nWOKE BECAUSE: {wk}\n"
         if self._market_snapshots:
             continuity += "RECENT SNAPSHOTS:\n" + "\n".join(self._market_snapshots[-5:]) + "\n"
 
@@ -1362,7 +1368,10 @@ Account state above. Start by calling briefing() to assess research status."""
                             cooldown = max(5, min(int(cooldown), 3600))  # 5s–1hr bounds
                         except (TypeError, ValueError):
                             cooldown = CYCLE_SLEEP_SECONDS
-                        logger.info(f"Decision: done ({cooldown}s) | {summary}")
+                        wait_reason = str(action_data.get('wait_reason', '') or '').strip()[:160]
+                        self._last_wait_reason = wait_reason
+                        wr_log = f" | waiting because: {wait_reason}" if wait_reason else ""
+                        logger.info(f"Decision: done ({cooldown}s) | {summary}{wr_log}")
                         cycle_actions.append("done")
                         self._last_cycle_summary = (
                             f"Cycle {self._cycle_id}: {len(cycle_actions)} actions — "
@@ -1531,8 +1540,11 @@ async def run_agent():
 
             try:
                 wait_seconds = await agent.run_cycle()
-                logger.info(f"Cooldown: {wait_seconds}s")
-                await _safe_sleep(wait_seconds)
+                logger.info(f"Cooldown: up to {wait_seconds}s (event-driven)")
+                from core.wake_events import wake_bus
+                wake_reason = await wake_bus.wait(wait_seconds)
+                agent._last_wake_reason = wake_reason
+                logger.info(f"Woke: {wake_reason}")
 
             except KeyboardInterrupt:
                 logger.info("Shutting down...")

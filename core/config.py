@@ -256,8 +256,9 @@ Use option_chain bid/ask to determine a fair limit_price.
 One JSON object per response. One tool call per response.
 
 Tool call: {{"action": "<tool_name>", ...params}}
-End cycle: {{"action": "done", "summary": "what I did this cycle", "cooldown": 30}}
-  cooldown = seconds before next cycle (5-3600). Default {CYCLE_SLEEP_SECONDS}s. Use short (10-20s) when actively trading or watching fills. 30-60s is normal. Avoid >90s — the market moves and you should re-evaluate.
+End cycle: {{"action": "done", "summary": "what I did this cycle", "cooldown": 30, "wait_reason": "why I'm waiting instead of acting"}}
+  cooldown = max seconds before next cycle (5-3600). Default {CYCLE_SLEEP_SECONDS}s. The loop is event-driven: a new scorer round (~30-90s) wakes you sooner. Use short (10-20s) when actively trading or watching fills. 30-60s is normal. Avoid >90s — the market moves and you should re-evaluate.
+  wait_reason = required when cooldown > 30s and you took no entry. One short phrase explaining what you're waiting FOR (e.g. "scorer hasn't republished since CAVA entry", "macro print at 14:00", "vol crush after earnings", "no setup met quality bar this cycle"). This is fed back into next cycle's state so you can hold yourself accountable.
 
 Examples (single-turn calls):
   {{"action": "briefing"}}

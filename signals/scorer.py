@@ -161,6 +161,11 @@ async def run_research(*, verbose: bool = False) -> None:
                 "Scoring round %d complete: %.1fs, ~%d credits",
                 round_num, elapsed, credits_used,
             )
+            try:
+                from core.wake_events import wake_bus
+                wake_bus.signal(f"scorer_round_{round_num}")
+            except Exception:
+                pass
         except asyncio.CancelledError:
             logger.info("Scoring loop cancelled")
             break

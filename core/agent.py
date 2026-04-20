@@ -867,7 +867,7 @@ If no changes warranted: []"""
             lines.append(f"Account error: {e}")
 
         lines.append("")
-        lines.append("═══ POSITIONS (manage first) ═══")
+        lines.append("═══ POSITIONS (verdict required for each before cycle ends) ═══")
         _positions_snapshot = []
         try:
             positions = await self.gateway.get_positions()
@@ -875,6 +875,14 @@ If no changes warranted: []"""
             if not positions:
                 lines.append("No open positions.")
             else:
+                lines.append(
+                    "  Each position needs a verdict this cycle: "
+                    "HOLD (one-line reason) | TRIM | CLOSE | ROLL | TIGHTEN_STOP | HEDGE."
+                )
+                lines.append(
+                    "  \"Brackets exist\" is not a verdict. Ask: is the original thesis intact, "
+                    "and is this still the best use of this capital?"
+                )
                 for p in positions:
                     sym = p.get("symbol", "?")
                     qty = p.get("quantity", 0)

@@ -68,7 +68,7 @@ def query_briefing_data() -> dict:
         try:
             from signals.combiner import (
                 _compute_signal_ic,
-                _IC_MIN_OBS,
+                _min_obs_for,
                 _IC_ATTRIBUTION_TOP_K,
             )
             sig_names = [SIG for SIG in SIGNAL_REGISTRY.keys()]
@@ -77,7 +77,7 @@ def query_briefing_data() -> dict:
                 (
                     {"name": n, "ic": d["ic"], "t": d["t"], "n": d["n"]}
                     for n, d in ic_stats.items()
-                    if d["n"] >= _IC_MIN_OBS
+                    if d["n"] >= _min_obs_for(SIGNAL_REGISTRY.get(n))
                 ),
                 key=lambda r: r["ic"],
                 reverse=True,

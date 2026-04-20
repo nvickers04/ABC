@@ -182,7 +182,24 @@ _CATEGORY_WEIGHT_CAP = 0.40
 _IC_WINDOW_DAYS = 60
 # Minimum observations before IC / t-stat are trusted.  Below this we
 # still log the IC but don't count it toward retirement streaks.
+# DEFAULT for daily-cadence signals; sub-daily signals need more rows
+# because their bars are more autocorrelated -- see _min_obs_for(sig).
 _IC_MIN_OBS = 30
+# Per-resolution minimum observations.  Sub-daily bars are tightly
+# autocorrelated so |IC| stabilises only after far more rows.
+_MIN_OBS_BY_RES = {
+    "1min": 200,
+    "5min": 100,
+    "15min": 75,
+    "1h":   50,
+    "D":    30,
+}
+
+
+def _min_obs_for(sig) -> int:
+    """Cadence-aware IC minimum-observation threshold for a signal."""
+    res = getattr(sig, "return_resolution", "D")
+    return _MIN_OBS_BY_RES.get(res, _IC_MIN_OBS)
 # A signal whose |IC| falls below this threshold (on a trusted sample)
 # is considered effectively noise. Negative IC is NOT a disqualifier --
 # the weight optimizer can flip the sign. Only |IC| ≈ 0 means no info.
@@ -657,10 +674,10 @@ def _log_ic_attribution(ic_stats: dict[str, dict[str, float]]) -> None:
     trusted = [
         (name, d["ic"], d["t"], d["n"])
         for name, d in ic_stats.items()
-        if d["n"] >= _IC_MIN_OBS
+        if d["n"] >= _min_obs_for(SIGNAL_REGISTRY.get(name))
     ]
     if not trusted:
-        logger.info("IC_STAT no_signals_with_min_obs=%d", _IC_MIN_OBS)
+        logger.info("IC_STAT no_signals_with_min_obs")
         return
 
     trusted.sort(key=lambda x: x[1], reverse=True)
@@ -670,9 +687,9 @@ def _log_ic_attribution(ic_stats: dict[str, dict[str, float]]) -> None:
 
     ics = np.asarray([x[1] for x in trusted])
     logger.info(
-        "IC_STAT mean=%.4f median=%.4f std=%.4f n_signals=%d min_obs=%d",
+        "IC_STAT mean=%.4f median=%.4f std=%.4f n_signals=%d",
         float(ics.mean()), float(np.median(ics)), float(ics.std()),
-        len(trusted), _IC_MIN_OBS,
+        len(trusted),
     )
     for name, ic, t, n in top:
         logger.info("IC_TOP %-32s ic=%+.4f t=%+.2f n=%d", name, ic, t, n)
@@ -717,7 +734,8 @@ def _update_ic_retirement(
         _macro_signals = set()
 
     for name, d in ic_stats.items():
-        if d["n"] < _IC_MIN_OBS:
+        sig = SIGNAL_REGISTRY.get(name)
+        if d["n"] < _min_obs_for(sig):
             continue
         if name in _macro_signals:
             continue
@@ -826,8 +844,9 @@ def _publish_ir_snapshot(
         return 0.0, True  # fail-open so the combiner still works
 
     trusted_abs_ic = [
-        abs(d["ic"]) for d in ic_stats.values()
-        if d["n"] >= _IC_MIN_OBS and abs(d["ic"]) >= _IC_NOISE_THRESHOLD
+        abs(d["ic"]) for name, d in ic_stats.items()
+        if d["n"] >= _min_obs_for(SIGNAL_REGISTRY.get(name))
+        and abs(d["ic"]) >= _IC_NOISE_THRESHOLD
     ]
     mean_ic = float(np.mean(trusted_abs_ic)) if trusted_abs_ic else 0.0
     ir = mean_ic * float(np.sqrt(max(n_eff, 0.0)))

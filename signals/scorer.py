@@ -660,6 +660,22 @@ def _compute_forward_returns(conn, dp, candles_map: dict, current_ts: float) -> 
     Rows whose horizon has not yet elapsed are left unrecorded and retried
     on the next round when fresh candles land.
     """
+    # Prune scores for symbols no longer in the current universe.  Without
+    # this, a universe change leaves orphan rows that can never be matured
+    # (we won't fetch their candles again) — they then dominate the LIMIT
+    # 5000 ORDER BY ts ASC budget below and starve the new universe of IC.
+    if candles_map:
+        live_symbols = tuple(candles_map.keys())
+        if live_symbols:
+            placeholders = ",".join("?" * len(live_symbols))
+            n = conn.execute(
+                f"DELETE FROM signal_scores WHERE symbol NOT IN ({placeholders})",
+                live_symbols,
+            ).rowcount
+            if n > 0:
+                conn.commit()
+                logger.info("Pruned %d orphan signal_scores (symbol no longer in universe)", n)
+
     # Get prior-round scores that don't yet have forward returns computed.
     # Order by ts ASC so the OLDEST scores (most likely to have their horizon
     # already elapsed) are processed first.  LIMIT is a per-round budget, not

@@ -1,0 +1,24 @@
+---
+description: Force cross-module impact review and plain-English explanations
+alwaysApply: true
+---
+
+# Cohesion and Impact Review Rule
+
+For any non-trivial request (planning, coding, refactor, review):
+
+1. Read and follow:
+   - `docs/stabilization-pr-checklist.md`
+   - `docs/change-impact-map.md`
+   - `docs/plain-english-glossary.md`
+2. Before proposing edits, list:
+   - target subsystem
+   - likely adjacent subsystems impacted
+   - verification tests/steps
+   - rollback approach
+3. Explain jargon in plain English when used (example: boundary extraction, state builder, diff).
+4. For hotspot files (`core/agent.py`, `signals/scorer.py`, `signals/combiner.py`, `core/config.py`, `__main__.py`):
+   - keep changes minimal
+   - require explicit risk note
+   - require regression or characterization test coverage
+5. Prefer safe, reviewable slices over large multi-purpose edits.

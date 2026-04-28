@@ -22,7 +22,7 @@ from ib_insync import Order, TagValue
 from ib_insync.contract import Stock
 
 # Memory integration for autoresearch snapshots
-from memory import insert_execution_snapshot, _pending_order_context
+from memory import insert_execution_snapshot, get_pending_order_context
 
 logger = logging.getLogger(__name__)
 
@@ -428,7 +428,7 @@ class IBKROrdersMixin:
                     pass
                 # Consume pending order context for atr_pct (set by _plan_order)
                 _bracket_atr_pct = None
-                _bctx = _pending_order_context.get(symbol, {})
+                _bctx = get_pending_order_context(symbol)
                 _bracket_atr_pct = _bctx.get('atr_pct')
                 _bracket_snap_id = insert_execution_snapshot(
                     symbol=symbol, side=entry_action, quantity=quantity,

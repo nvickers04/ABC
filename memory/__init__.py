@@ -708,6 +708,34 @@ _pending_graduated_params: dict[str, int] = {}
 _pending_order_context: dict[str, dict] = {}
 
 
+# ── Accessors for the pending* dicts ────────────────────────────
+# These exist so callers (tools/tools_executor.py, execution/ibkr_orders.py,
+# tests) don't reach into private module-level dicts.  The dicts remain
+# private; new code should go through these functions exclusively.
+
+
+def set_pending_graduated_param(symbol: str, param_id: int) -> None:
+    """Record a graduated_param_id for a symbol, to be consumed at the next
+    ``insert_execution_snapshot(symbol)`` call."""
+    _pending_graduated_params[symbol] = param_id
+
+
+def get_pending_graduated_param(symbol: str) -> int | None:
+    """Peek at the pending graduated_param_id without consuming it."""
+    return _pending_graduated_params.get(symbol)
+
+
+def set_pending_order_context(symbol: str, context: dict) -> None:
+    """Record plan-time context (intent, atr_pct, ...) for a symbol, to be
+    consumed at the next ``insert_execution_snapshot(symbol)`` call."""
+    _pending_order_context[symbol] = context
+
+
+def get_pending_order_context(symbol: str) -> dict:
+    """Peek at the pending order context (returns ``{}`` if absent)."""
+    return _pending_order_context.get(symbol, {})
+
+
 def reset_state(db_path=None) -> None:
     """Reset all module-level mutable state — primarily for tests.
 

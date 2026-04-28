@@ -133,7 +133,7 @@ from core.async_utils import safe_sleep as _safe_sleep
 from core.config import TRADING_MODE, PAPER_AGGRESSIVE
 from memory import (
     get_graduated_params, _time_bucket, _atr_bucket,
-    _pending_graduated_params, _pending_order_context,
+    set_pending_graduated_param, set_pending_order_context,
     get_execution_cost,
 )
 
@@ -712,13 +712,13 @@ class ToolExecutor:
         # Store graduated_param_id for snapshot linkage when order is placed
         if graduated_param_id is not None:
             try:
-                _pending_graduated_params[symbol] = graduated_param_id
+                set_pending_graduated_param(symbol, graduated_param_id)
             except Exception as e:
                 logger.warning(f"Failed to store pending graduated param for {symbol}: {e}")
 
         # Store order context (intent, atr_pct) for snapshot capture
         try:
-            _pending_order_context[symbol] = {"intent": intent, "atr_pct": atr_pct}
+            set_pending_order_context(symbol, {"intent": intent, "atr_pct": atr_pct})
         except Exception as e:
             logger.warning(f"Failed to store pending order context for {symbol}: {e}")
 

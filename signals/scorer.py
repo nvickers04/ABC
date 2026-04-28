@@ -737,6 +737,27 @@ def _compute_forward_returns(
         conn.commit()
         logger.info("Pruned %d stale signal_scores (older than 30d)", n_ttl)
 
+    # Registry-orphan prune: scores for signals removed from the registry
+    # never appear in the per-resolution scan below (the SQL filters
+    # signal_name IN (registered_names)), so they would sit in the table
+    # until the 30-day TTL fires.  Drop them now.
+    live_signals = list(SIGNAL_REGISTRY.keys())
+    if live_signals:
+        placeholders = ",".join("?" * len(live_signals))
+        n_reg = conn.execute(
+            f"DELETE FROM signal_scores WHERE signal_name NOT IN ({placeholders})",
+            tuple(live_signals),
+        ).rowcount
+        if n_reg > 0:
+            conn.commit()
+            logger.info("Pruned %d orphan signal_scores (signal not in registry)", n_reg)
+    else:
+        # Empty registry — every row is an orphan.
+        n_reg = conn.execute("DELETE FROM signal_scores").rowcount
+        if n_reg > 0:
+            conn.commit()
+            logger.info("Pruned %d orphan signal_scores (registry empty)", n_reg)
+
     # ── Group signals by resolution; drain shortest first ──────────
     sigs_by_res: dict[str, list[str]] = {}
     for name, sig in SIGNAL_REGISTRY.items():
@@ -756,7 +777,7 @@ def _compute_forward_returns(
     # Sort by typical bar size (fastest first) so freshest data lands first.
     res_order = ["1min", "5min", "15min", "1h", "D"]
 
-    totals = {"wrote": 0, "pending": 0, "no_entry": 0, "no_candles": 0, "scanned": 0}
+    totals = {"wrote": 0, "pending": 0, "no_entry": 0, "no_candles": 0, "scanned": 0, "zombies": 0}
     per_res_log: list[str] = []
 
     for res in res_order:
@@ -780,11 +801,19 @@ def _compute_forward_returns(
         totals["scanned"] += len(prior_scores)
 
         rows = []
-        wrote = pending = no_entry = no_candles = 0
+        matured_keys: list[tuple[str, str, float]] = []
+        # Zombie rows: scores that can never mature in the current state.
+        # We delete these alongside matured rows so they stop dominating
+        # the LIMIT 2000 ORDER BY ts ASC scan on subsequent rounds.
+        zombie_keys: list[tuple[str, str, float]] = []
+        wrote = pending = no_entry = no_candles = zombies = 0
 
         for sig_name, sym, score_ts, score in prior_scores:
             sig = SIGNAL_REGISTRY.get(sig_name)
             if not sig:
+                # Signal retired from registry — score can never resolve.
+                zombie_keys.append((sig_name, sym, float(score_ts)))
+                zombies += 1
                 continue
             horizon = int(getattr(sig, "return_horizon", 5))
 
@@ -801,7 +830,12 @@ def _compute_forward_returns(
             # Most recent bar with ts <= score_ts.
             i_entry = bisect.bisect_right(ts_list, score_ts) - 1
             if i_entry < 0:
+                # ``score_ts`` predates every candle in the current window.
+                # The candle window slides forward over time, so this score
+                # can never resolve — purge it.
+                zombie_keys.append((sig_name, sym, float(score_ts)))
                 no_entry += 1
+                zombies += 1
                 continue
             i_exit = i_entry + horizon
             if i_exit >= len(ts_list):
@@ -811,6 +845,9 @@ def _compute_forward_returns(
             entry_price = closes[i_entry]
             exit_price = closes[i_exit]
             if not (entry_price and entry_price > 0):
+                # Bad/zero entry price for the matched bar — unrecoverable.
+                zombie_keys.append((sig_name, sym, float(score_ts)))
+                zombies += 1
                 continue
 
             fwd_return = (exit_price - entry_price) / entry_price
@@ -820,6 +857,7 @@ def _compute_forward_returns(
                 sig_name, sym, entry_bar_ts,
                 float(score), fwd_return, r_value, horizon,
             ))
+            matured_keys.append((sig_name, sym, float(score_ts)))
             wrote += 1
 
         if rows:
@@ -829,19 +867,34 @@ def _compute_forward_returns(
                 "VALUES (?, ?, ?, ?, ?, ?, ?)",
                 rows,
             )
+        # Delete matured + zombie rows from signal_scores so they don't
+        # dominate the ORDER BY ts ASC LIMIT queue on subsequent rounds.
+        # Without this, ancient matured/unmaturable scores would starve
+        # fresh ones until the 30-day TTL purge fires.  The R(i,s) row in
+        # signal_returns is the durable record; signal_scores is a
+        # maturation queue.
+        cleanup_keys = matured_keys + zombie_keys
+        if cleanup_keys:
+            conn.executemany(
+                "DELETE FROM signal_scores "
+                "WHERE signal_name = ? AND symbol = ? AND ts = ?",
+                cleanup_keys,
+            )
             conn.commit()
 
         totals["wrote"] += wrote
         totals["pending"] += pending
         totals["no_entry"] += no_entry
         totals["no_candles"] += no_candles
+        totals["zombies"] += zombies
         per_res_log.append(
-            f"{res}:wrote={wrote},pending={pending},no_candles={no_candles}"
+            f"{res}:wrote={wrote},pending={pending},no_candles={no_candles},zombies={zombies}"
         )
 
     logger.info(
         "Forward returns: wrote=%d pending=%d no_entry=%d no_candles=%d "
-        "(scanned %d) [%s]",
+        "zombies=%d (scanned %d) [%s]",
         totals["wrote"], totals["pending"], totals["no_entry"],
-        totals["no_candles"], totals["scanned"], " ".join(per_res_log),
+        totals["no_candles"], totals["zombies"], totals["scanned"],
+        " ".join(per_res_log),
     )

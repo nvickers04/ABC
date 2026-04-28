@@ -290,3 +290,117 @@ Shorter chain is fine for obvious management actions (closing a losing spread, t
 flattening into EOD). Longer chain is appropriate for size-up entries.
 
 Keep responses compact. Call tools directly — no ceremony needed."""
+
+
+# ── Startup validation ─────────────────────────────────────────────────────
+
+
+class ConfigError(ValueError):
+    """Raised when ``core.config`` is misconfigured at startup.
+
+    Distinct from generic ``ValueError`` so callers (``__main__.py``)
+    can present a clear actionable message instead of a stack trace.
+    """
+
+
+def validate_config() -> list[str]:
+    """Validate config invariants. Returns a list of error strings.
+
+    Empty list means config is valid. Caller is responsible for deciding
+    whether to ``sys.exit`` or raise. This is a pure function over the
+    *current* module-level constants — calling it twice without changing
+    the env returns the same result.
+
+    Invariants checked:
+      * ``TRADING_MODE`` is one of the supported literals.
+      * ``RISK_PER_TRADE`` is in (0, 0.5] (0% < risk <= 50%).
+      * ``MIN_RR_RATIO`` is positive.
+      * ``MAX_DAILY_LOSS_PCT`` is in (0, 100].
+      * ``INTRADAY_DRAWDOWN_PCT`` is in (0, 100].
+      * ``EOD_FLATTEN_MINUTES`` is positive.
+      * ``OPEN_GAP_GUARD_PCT`` is non-negative.
+      * ``OPEN_GUARD_DELAY_MINUTES`` is non-negative.
+      * ``MAX_DAILY_LLM_COST`` is positive.
+      * ``CYCLE_SLEEP_SECONDS`` is positive.
+      * ``LLM_TEMPERATURE`` is in [0, 2].
+      * ``LLM_MAX_TOKENS`` is positive.
+      * Live-mode safety: live trading must use risk <= 2% per trade.
+    """
+    errors: list[str] = []
+
+    if TRADING_MODE not in ("aggressive_paper", "paper", "live"):
+        errors.append(
+            f"TRADING_MODE={TRADING_MODE!r} is not one of "
+            f"('aggressive_paper','paper','live')"
+        )
+
+    if not (0.0 < RISK_PER_TRADE <= 0.5):
+        errors.append(
+            f"RISK_PER_TRADE={RISK_PER_TRADE} must be in (0, 0.5] "
+            f"(i.e. >0% and ≤50%)"
+        )
+
+    if MIN_RR_RATIO <= 0:
+        errors.append(f"MIN_RR={MIN_RR_RATIO} must be positive")
+
+    if not (0.0 < MAX_DAILY_LOSS_PCT <= 100.0):
+        errors.append(
+            f"MAX_DAILY_LOSS_PCT={MAX_DAILY_LOSS_PCT} must be in (0, 100]"
+        )
+
+    if not (0.0 < INTRADAY_DRAWDOWN_PCT <= 100.0):
+        errors.append(
+            f"INTRADAY_DRAWDOWN_PCT={INTRADAY_DRAWDOWN_PCT} must be in (0, 100]"
+        )
+
+    if EOD_FLATTEN_MINUTES <= 0:
+        errors.append(
+            f"EOD_FLATTEN_MINUTES={EOD_FLATTEN_MINUTES} must be positive"
+        )
+
+    if OPEN_GAP_GUARD_PCT < 0:
+        errors.append(
+            f"OPEN_GAP_GUARD_PCT={OPEN_GAP_GUARD_PCT} must be non-negative"
+        )
+
+    if OPEN_GUARD_DELAY_MINUTES < 0:
+        errors.append(
+            f"OPEN_GUARD_DELAY_MINUTES={OPEN_GUARD_DELAY_MINUTES} must be non-negative"
+        )
+
+    if MAX_DAILY_LLM_COST <= 0:
+        errors.append(
+            f"MAX_DAILY_LLM_COST={MAX_DAILY_LLM_COST} must be positive"
+        )
+
+    if CYCLE_SLEEP_SECONDS <= 0:
+        errors.append(
+            f"CYCLE_SLEEP_SECONDS={CYCLE_SLEEP_SECONDS} must be positive"
+        )
+
+    if not (0.0 <= LLM_TEMPERATURE <= 2.0):
+        errors.append(
+            f"LLM_TEMPERATURE={LLM_TEMPERATURE} must be in [0, 2]"
+        )
+
+    if LLM_MAX_TOKENS <= 0:
+        errors.append(f"LLM_MAX_TOKENS={LLM_MAX_TOKENS} must be positive")
+
+    # Live-mode safety guard: prevent operator from running live with the
+    # aggressive_paper risk default by mistake.
+    if TRADING_MODE == "live" and RISK_PER_TRADE > 0.02:
+        errors.append(
+            f"TRADING_MODE=live but RISK_PER_TRADE={RISK_PER_TRADE} > 2%; "
+            f"live trading with >2% per-trade risk is not permitted"
+        )
+
+    return errors
+
+
+def assert_config_valid() -> None:
+    """Validate config; raise :class:`ConfigError` if invalid."""
+    errors = validate_config()
+    if errors:
+        raise ConfigError(
+            "Invalid configuration:\n  - " + "\n  - ".join(errors)
+        )

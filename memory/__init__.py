@@ -428,6 +428,18 @@ def _apply_schema_migrations(conn: sqlite3.Connection) -> None:
     row = conn.execute("SELECT MAX(version) FROM schema_version").fetchone()
     current = int(row[0]) if row and row[0] is not None else 1  # legacy DBs start at 1
 
+    # Forward-compatibility guard: a DB stamped with a NEWER schema than
+    # this build understands almost certainly means the user rolled back
+    # the code without rolling back the DB.  Fail fast with a clear path
+    # forward instead of silently running with the wrong assumptions.
+    if current > SCHEMA_VERSION:
+        raise RuntimeError(
+            f"Database schema version {current} is newer than this build "
+            f"supports (max={SCHEMA_VERSION}). The DB at {_DB_PATH} was "
+            f"likely written by a newer build of the bot. Either upgrade "
+            f"the code or restore a DB backup that matches this version."
+        )
+
     if current >= SCHEMA_VERSION:
         return
 
@@ -451,75 +463,53 @@ def get_db() -> sqlite3.Connection:
     return _connection
 
 
+def get_schema_version(conn: sqlite3.Connection | None = None) -> int:
+    """Return the current schema version stamped in the DB (1 for legacy)."""
+    db = conn if conn is not None else get_db()
+    try:
+        row = db.execute("SELECT MAX(version) FROM schema_version").fetchone()
+    except sqlite3.OperationalError:
+        return 1
+    return int(row[0]) if row and row[0] is not None else 1
+
+
 # ═══════════════════════════════════════════════════════════════
 # SELF-TUNABLE RESEARCH CONFIG
 # ═══════════════════════════════════════════════════════════════
+# Implementations live in memory.repos.config_repo (PR12 split).
+# Thin shims preserved for back-compat with `from memory import ...`.
 
 def get_research_config(key: str, default: float) -> float:
-    """Read a tunable config value.  Returns DB override if set, else default."""
-    row = get_db().execute(
-        "SELECT value FROM research_config WHERE key = ?", (key,)
-    ).fetchone()
-    return float(row["value"]) if row else default
+    from memory.repos.config_repo import get_research_config as _impl
+    return _impl(key, default)
 
 
 def set_research_config(key: str, value: float, reason: str = "") -> None:
-    """Write (upsert) a tunable config value with an audit trail."""
-    from datetime import datetime, timezone
-    ts = datetime.now(timezone.utc).isoformat()
-    get_db().execute(
-        """INSERT INTO research_config (key, value, updated_ts, reason)
-           VALUES (?, ?, ?, ?)
-           ON CONFLICT(key) DO UPDATE
-             SET value = excluded.value,
-                 updated_ts = excluded.updated_ts,
-                 reason = excluded.reason""",
-        (key, value, ts, reason),
-    )
-    get_db().commit()
-    logger.info(f"research_config[{key}] = {value}  ({reason})")
+    from memory.repos.config_repo import set_research_config as _impl
+    return _impl(key, value, reason)
 
 
 def get_all_research_config() -> dict[str, float]:
-    """Return all DB-stored tunable config values as {key: value}."""
-    rows = get_db().execute("SELECT key, value FROM research_config").fetchall()
-    return {r["key"]: float(r["value"]) for r in rows}
+    from memory.repos.config_repo import get_all_research_config as _impl
+    return _impl()
 
 
 # ═══════════════════════════════════════════════════════════════
 # IV HISTORY (for trailing-percentile IV rank)
 # ═══════════════════════════════════════════════════════════════
+# Implementations live in memory.repos.execution_repo (PR13 split).
+# `_IV_HISTORY_MIN_SAMPLES` is re-exported for back-compat with
+# tests that import it directly from `memory`. The actual import is
+# deferred to the bottom of this module so the writer functions
+# (insert_execution_snapshot, etc.) that execution_repo re-exports
+# back from memory have already been defined.
 
-# Minimum number of historical IV snapshots before trailing percentile
-# is considered meaningful.  Below this we return None so callers fall
-# back to the chain-derived approximation.
-_IV_HISTORY_MIN_SAMPLES = 30
 
-
-def record_iv_snapshot(symbol: str, iv_current: float | None, source: str = "marketdata") -> None:
-    """Record one daily IV snapshot for a symbol.
-
-    Idempotent within the same UTC day: a second call on the same day
-    overwrites the prior snapshot via INSERT OR REPLACE on (symbol, ts)
-    where ts is the UTC date as a unix timestamp at midnight.
-    """
-    if iv_current is None:
-        return
-    try:
-        from datetime import datetime, timezone
-        today = datetime.now(timezone.utc).replace(
-            hour=0, minute=0, second=0, microsecond=0
-        )
-        day_ts = today.timestamp()
-        db = get_db()
-        db.execute(
-            "INSERT OR REPLACE INTO iv_history (symbol, ts, iv_current, source) "
-            "VALUES (?, ?, ?, ?)",
-            (symbol.upper(), day_ts, float(iv_current), source),
-        )
-        db.commit()
-    except Exception as e:
-        logger.debug(f"record_iv_snapshot failed for {symbol}: {e}")
+def record_iv_snapshot(
+    symbol: str, iv_current: float | None, source: str = "marketdata"
+) -> None:
+    from memory.repos.execution_repo import record_iv_snapshot as _impl
+    return _impl(symbol, iv_current, source)
 
 
 def compute_iv_rank_percentile(
@@ -527,35 +517,8 @@ def compute_iv_rank_percentile(
     iv_current: float | None = None,
     lookback_days: int = 252,
 ) -> float | None:
-    """Return IV rank as the percentile of `iv_current` versus trailing
-    `lookback_days` of `iv_history` snapshots for `symbol`.
-
-    Returns None when fewer than _IV_HISTORY_MIN_SAMPLES snapshots exist.
-    If `iv_current` is None the most recent snapshot is used.
-    Result is in [0, 100].
-    """
-    try:
-        db = get_db()
-        from datetime import datetime, timezone
-        cutoff_ts = (
-            datetime.now(timezone.utc).timestamp() - lookback_days * 86400
-        )
-        rows = db.execute(
-            "SELECT iv_current FROM iv_history "
-            "WHERE symbol = ? AND ts >= ? ORDER BY ts ASC",
-            (symbol.upper(), cutoff_ts),
-        ).fetchall()
-        if not rows or len(rows) < _IV_HISTORY_MIN_SAMPLES:
-            return None
-        values = [float(r["iv_current"]) for r in rows]
-        if iv_current is None:
-            iv_current = values[-1]
-        # Percentile = % of historical samples strictly below current IV.
-        below = sum(1 for v in values if v < iv_current)
-        return max(0.0, min(100.0, 100.0 * below / len(values)))
-    except Exception as e:
-        logger.debug(f"compute_iv_rank_percentile failed for {symbol}: {e}")
-        return None
+    from memory.repos.execution_repo import compute_iv_rank_percentile as _impl
+    return _impl(symbol, iv_current=iv_current, lookback_days=lookback_days)
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -563,50 +526,9 @@ def compute_iv_rank_percentile(
 # ═══════════════════════════════════════════════════════════════
 
 def get_execution_cost(symbol: str | None = None) -> dict:
-    """Query aggregated execution gaps from trade_feedback.
-
-    Returns per-symbol cost model from last 30 days:
-      {symbol -> {avg_gap, n, total_pnl, total_sim}}
-
-    If symbol given, returns single entry.
-    If not, returns top-10 symbols by trade count.
-    """
-    db = get_db()
-    cutoff = "datetime('now', '-30 days')"
-    if symbol:
-        row = db.execute(
-            f"""SELECT symbol,
-                       AVG(execution_gap) as avg_gap,
-                       COUNT(*) as n,
-                       SUM(actual_pnl) as total_pnl,
-                       SUM(simulated_return) as total_sim
-                FROM trade_feedback
-                WHERE symbol = ? AND ts >= {cutoff}""",
-            (symbol.upper(),),
-        ).fetchone()
-        if row and row["n"]:
-            return {
-                "symbol": row["symbol"],
-                "avg_gap_pct": round(row["avg_gap"] or 0, 4),
-                "trades": row["n"],
-                "total_pnl": round(row["total_pnl"] or 0, 2),
-                "total_sim": round(row["total_sim"] or 0, 4),
-            }
-        return {}
-    else:
-        rows = db.execute(
-            f"""SELECT symbol,
-                       AVG(execution_gap) as avg_gap,
-                       COUNT(*) as n
-                FROM trade_feedback
-                WHERE ts >= {cutoff}
-                GROUP BY symbol
-                ORDER BY n DESC LIMIT 10"""
-        ).fetchall()
-        return {
-            r["symbol"]: {"avg_gap_pct": round(r["avg_gap"] or 0, 4), "trades": r["n"]}
-            for r in rows
-        }
+    # Implementation lives in memory.repos.execution_repo (PR13 split).
+    from memory.repos.execution_repo import get_execution_cost as _impl
+    return _impl(symbol)
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -784,6 +706,30 @@ _pending_graduated_params: dict[str, int] = {}
 # Short-lived lookup: symbol → {"intent": ..., "atr_pct": ...}.
 # Bridges plan_order context to snapshot capture across the LLM tool-call gap.
 _pending_order_context: dict[str, dict] = {}
+
+
+def reset_state(db_path=None) -> None:
+    """Reset all module-level mutable state — primarily for tests.
+
+    Single chokepoint that test fixtures (``tests/conftest.py``) and
+    future DI scaffolding can call instead of poking five different
+    module attributes from outside. Closes any open connection, clears
+    the two pending lookup dicts, resets the calibration version, and
+    optionally repoints the DB path.
+    """
+    global _DB_PATH, _connection, _calibration_version
+    if db_path is not None:
+        _DB_PATH = db_path
+    if _connection is not None:
+        try:
+            _connection.close()
+        except Exception:  # pragma: no cover - defensive
+            pass
+    _connection = None
+    _calibration_version = 0
+    _pending_graduated_params.clear()
+    _pending_order_context.clear()
+
 
 # ── Canonical order type mapping ─────────────────────────────
 # IBKR order type string → canonical name used in param_key schema.
@@ -978,26 +924,15 @@ def get_filled_snapshots(since_id: int = 0, limit: int = 500) -> list[dict]:
 
 
 def get_graduated_params(active_only: bool = True) -> list[dict]:
-    """Get graduated parameter overrides."""
-    db = get_db()
-    where = "WHERE active = 1" if active_only else ""
-    rows = db.execute(
-        f"SELECT * FROM graduated_params {where} ORDER BY ts DESC"
-    ).fetchall()
-    return [dict(r) for r in rows]
+    # Implementation lives in memory.repos.config_repo (PR12 split).
+    from memory.repos.config_repo import get_graduated_params as _impl
+    return _impl(active_only=active_only)
 
 
 def deactivate_graduated_param(param_id: int, reason: str) -> None:
-    """Deactivate a graduated param and record why."""
-    db = get_db()
-    try:
-        db.execute(
-            "UPDATE graduated_params SET active = 0, rollback_reason = ? WHERE id = ?",
-            (reason, param_id),
-        )
-        db.commit()
-    except Exception as e:
-        logger.warning(f"Failed to deactivate graduated param {param_id}: {e}")
+    # Implementation lives in memory.repos.config_repo (PR12 split).
+    from memory.repos.config_repo import deactivate_graduated_param as _impl
+    return _impl(param_id, reason)
 
 
 def get_snapshots_for_param_review(param_id: int, activated_ts: str) -> dict:
@@ -1070,35 +1005,13 @@ def get_snapshots_for_param_review(param_id: int, activated_ts: str) -> dict:
 
 # ── Param key schema ────────────────────────────────────────────
 # Structured format: {order_type}.{intent}.{time_bucket}.{atr_bucket}
-# Each component must be from a known set or 'all' for wildcard.
-_VALID_ORDER_TYPES = {
-    "market", "limit", "stop_entry", "bracket", "trailing_stop",
-    "oca_exit", "midprice", "adaptive", "vwap", "twap",
-    "relative", "snap_mid", "moc", "moo", "loc", "loo", "all",
-}
-_VALID_INTENTS = {"entry", "exit", "stop", "all"}
-_VALID_TIME_BUCKETS = {"open", "morning", "midday", "close", "extended", "all"}
-_VALID_ATR_BUCKETS = {"low", "medium", "high", "all"}
-
+# Constants and validation moved to memory.repos.config_repo (PR12).
+# `validate_param_key` and `insert_graduated_param` remain importable
+# from `memory` via thin shims below.
 
 def validate_param_key(key: str) -> str | None:
-    """Validate a graduated param key matches the structured schema.
-
-    Returns None if valid, or an error message if invalid.
-    """
-    parts = key.split(".")
-    if len(parts) != 4:
-        return f"Expected 4 dot-separated parts, got {len(parts)}: {key}"
-    ot, intent, tb, ab = parts
-    if ot not in _VALID_ORDER_TYPES:
-        return f"Invalid order_type '{ot}' in key: {key}"
-    if intent not in _VALID_INTENTS:
-        return f"Invalid intent '{intent}' in key: {key}"
-    if tb not in _VALID_TIME_BUCKETS:
-        return f"Invalid time_bucket '{tb}' in key: {key}"
-    if ab not in _VALID_ATR_BUCKETS:
-        return f"Invalid atr_bucket '{ab}' in key: {key}"
-    return None
+    from memory.repos.config_repo import validate_param_key as _impl
+    return _impl(key)
 
 
 def insert_graduated_param(
@@ -1110,26 +1023,11 @@ def insert_graduated_param(
     improvement_bps: float,
     p_value: float,
 ) -> int | None:
-    """Insert a new graduated parameter override."""
-    from datetime import datetime, timezone
-    db = get_db()
-    try:
-        cur = db.execute(
-            """INSERT INTO graduated_params
-               (ts, param_key, param_value, previous_value, evidence_json,
-                snapshots_analyzed, improvement_bps, p_value, active)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1)""",
-            (
-                datetime.now(timezone.utc).isoformat(),
-                param_key, param_value, previous_value, evidence_json,
-                snapshots_analyzed, improvement_bps, p_value,
-            ),
-        )
-        db.commit()
-        return cur.lastrowid
-    except Exception as e:
-        logger.warning(f"Failed to insert graduated param: {e}")
-        return None
+    from memory.repos.config_repo import insert_graduated_param as _impl
+    return _impl(
+        param_key, param_value, previous_value, evidence_json,
+        snapshots_analyzed, improvement_bps, p_value,
+    )
 
 
 # Monotonic version counter — incremented on each calibration upsert.
@@ -1138,41 +1036,23 @@ _calibration_version: int = 0
 
 
 def get_calibration_version() -> int:
-    """Return current calibration version (monotonic counter)."""
-    return _calibration_version
+    # Implementation lives in memory.repos.config_repo (PR12 split).
+    # The underlying counter (`_calibration_version`) remains owned here
+    # because `upsert_calibrated_slippage` (execution domain) mutates it.
+    from memory.repos.config_repo import get_calibration_version as _impl
+    return _impl()
 
 
 def get_open_hypotheses(slot: int | None = None, limit: int = 10) -> list[dict]:
-    """Return open trader hypotheses, optionally filtered by slot."""
-    db = get_db()
-    if slot is not None:
-        rows = db.execute(
-            """SELECT hypothesis_type, description, suggested_action, priority, related_slot
-               FROM trader_hypotheses
-               WHERE status = 'open' AND (related_slot = ? OR related_slot IS NULL)
-               ORDER BY priority ASC, ts DESC LIMIT ?""",
-            (slot, limit),
-        ).fetchall()
-    else:
-        rows = db.execute(
-            """SELECT hypothesis_type, description, suggested_action, priority, related_slot
-               FROM trader_hypotheses
-               WHERE status = 'open'
-               ORDER BY priority ASC, ts DESC LIMIT ?""",
-            (limit,),
-        ).fetchall()
-    return [dict(r) for r in rows]
+    # Implementation lives in memory.repos.feedback_repo (PR8 split).
+    from memory.repos.feedback_repo import get_open_hypotheses as _impl
+    return _impl(slot=slot, limit=limit)
 
 
 def mark_hypothesis_incorporated(hypothesis_type: str, description: str) -> None:
-    """Mark matching open hypotheses as incorporated."""
-    db = get_db()
-    db.execute(
-        """UPDATE trader_hypotheses SET status = 'incorporated', kept = 1
-           WHERE status = 'open' AND hypothesis_type = ? AND description = ?""",
-        (hypothesis_type, description),
-    )
-    db.commit()
+    # Implementation lives in memory.repos.feedback_repo (PR8 split).
+    from memory.repos.feedback_repo import mark_hypothesis_incorporated as _impl
+    return _impl(hypothesis_type, description)
 
 
 def upsert_calibrated_slippage(
@@ -1213,12 +1093,15 @@ def upsert_calibrated_slippage(
 
 
 def get_calibrated_slippage() -> dict[tuple[str, str, str], float]:
-    """Get all calibrated slippage values as {(order_type, time_bucket, atr_bucket): median_bps}."""
-    db = get_db()
-    rows = db.execute(
-        "SELECT order_type, time_bucket, atr_bucket, median_slippage_bps FROM calibrated_slippage"
-    ).fetchall()
-    return {
-        (r["order_type"], r["time_bucket"], r["atr_bucket"]): r["median_slippage_bps"]
-        for r in rows
-    }
+    # Implementation lives in memory.repos.execution_repo (PR13 split).
+    from memory.repos.execution_repo import get_calibrated_slippage as _impl
+    return _impl()
+
+
+# -- Back-compat re-exports (PR13 split) -------------------------
+# _IV_HISTORY_MIN_SAMPLES is read by tests via `from memory import`.
+# Imported at the bottom of this module (after writer functions are
+# defined) to avoid circular-import issues with `execution_repo`,
+# which re-exports those writers back from `memory`.
+from memory.repos.execution_repo import _IV_HISTORY_MIN_SAMPLES  # noqa: E402,F401
+

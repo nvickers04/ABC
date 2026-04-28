@@ -79,6 +79,11 @@ def validate_startup():
     if not grok_key:
         errors.append("Missing GROK_API_KEY or XAI_API_KEY")
 
+    # Validate config invariants (risk %, RR, thresholds, LLM params).
+    # Imported lazily so .env load above takes effect first.
+    from core.config import validate_config
+    errors.extend(validate_config())
+
     if errors:
         for err in errors:
             logger.error(f"Startup: {err}")

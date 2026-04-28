@@ -140,16 +140,10 @@ from memory import (
 logger = logging.getLogger(__name__)
 
 
-@dataclass
-class ToolResult:
-    """Structured result from tool execution."""
-    action: str
-    data: Any
-    success: bool
-    raw_json: str  # JSON string for backward compat (agent message injection)
-
-    def __str__(self) -> str:
-        return self.raw_json
+# ToolResult and envelope helpers now live in tools.tool_contract — re-exported
+# here for backward compatibility with every caller that did
+# ``from tools.tools_executor import ToolResult``.
+from tools.tool_contract import ToolResult, validate_envelope  # noqa: E402,F401
 
 
 # Build unified handler registry from submodules
@@ -1675,6 +1669,23 @@ class ToolExecutor:
 
             result = await self._dispatch(action, params)
             payload = self._standardize_tool_payload(result)
+            # Defense-in-depth: enforce the contract before the result reaches
+            # the agent loop. _standardize_tool_payload should always produce a
+            # valid envelope; if it doesn't, fail loudly here rather than
+            # leaking malformed JSON into the LLM context.
+            try:
+                validate_envelope(payload)
+            except ValueError as ve:
+                logger.error(
+                    f"Tool '{action}' produced invalid envelope: {ve} "
+                    f"(payload keys={list(payload.keys()) if isinstance(payload, dict) else type(payload).__name__})"
+                )
+                payload = {
+                    "success": False,
+                    "error": f"Internal envelope validation failed: {ve}",
+                    "is_realtime": False,
+                    "data_warning": None,
+                }
 
             return ToolResult(
                 action=action,

@@ -582,9 +582,38 @@ class DataProvider:
 
     # ==================== QUOTES ====================
 
+    def _ibkr_source(self):
+        """Return the process-wide IBKRQuoteSource, or None if disabled/unavailable."""
+        try:
+            from data.ibkr_quote_source import get_ibkr_quote_source
+            return get_ibkr_quote_source()
+        except Exception as e:
+            logger.debug("IBKRQuoteSource lookup failed: %s", e)
+            return None
+
+    @staticmethod
+    def _ibkr_quote_to_quote(symbol: str, q) -> "Quote":
+        """Convert an IBKRQuote into the public Quote dataclass."""
+        return Quote(
+            symbol=symbol,
+            last=q.last,
+            bid=q.bid,
+            ask=q.ask,
+            volume=int(q.volume or 0),
+            change_pct=None,  # IBKR ticker doesn't expose change_pct directly
+            source="ibkr",
+            timestamp=datetime.now(),
+            source_updated=int(q.ts) if q.ts else None,
+        )
+
     def get_quote(self, symbol: str) -> Optional[Quote]:
         """
         Get real-time quote for a symbol.
+
+        Routing: when IBKR_QUOTES_ENABLED is True (and IBKR is connected),
+        we read from the IBKR streaming subscription. If IBKR has no data
+        the call returns None — we DO NOT fall back to MDA's 15-min delayed
+        quotes. Signals must abstain rather than trade on stale data.
 
         Args:
             symbol: Stock ticker (e.g., 'AAPL')
@@ -597,6 +626,23 @@ class DataProvider:
         if cached is not _CACHE_MISS:
             return cached
 
+        # Real-time path: IBKR streaming
+        ibkr_src = self._ibkr_source()
+        if ibkr_src is not None:
+            try:
+                ibkr_q = self._run_async(ibkr_src.get_quote(symbol))
+            except Exception as e:
+                logger.debug("IBKR get_quote(%s) raised: %s", symbol, e)
+                ibkr_q = None
+            if ibkr_q is not None:
+                quote = self._ibkr_quote_to_quote(symbol, ibkr_q)
+                self._set_cached(cache_key, quote)
+                return quote
+            # IBKR enabled but no data — fail honest.  Do NOT fall back to MDA.
+            logger.debug("IBKR returned no quote for %s; abstaining (no MDA fallback)", symbol)
+            return None
+
+        # Legacy path: MDA (only when IBKR is disabled).
         try:
             raw = self._run_async(self._mda_client.get_quote(symbol))
 
@@ -626,13 +672,29 @@ class DataProvider:
         """
         Get quotes for multiple symbols efficiently.
 
+        IBKR path (when enabled): per-symbol streaming reads.  Symbols with
+        no real-time data are simply absent from the result (NOT filled
+        with MDA delayed quotes).
+
         Args:
             symbols: List of stock tickers
 
         Returns:
             Dict mapping symbol -> Quote
         """
-        results = {}
+        results: Dict[str, Quote] = {}
+
+        ibkr_src = self._ibkr_source()
+        if ibkr_src is not None:
+            for sym in symbols:
+                try:
+                    ibkr_q = self._run_async(ibkr_src.get_quote(sym))
+                except Exception as e:
+                    logger.debug("IBKR bulk get_quote(%s) raised: %s", sym, e)
+                    continue
+                if ibkr_q is not None:
+                    results[sym] = self._ibkr_quote_to_quote(sym, ibkr_q)
+            return results
 
         try:
             raw_quotes = self._run_async(self._mda_client.get_quotes_bulk(symbols))
@@ -662,6 +724,19 @@ class DataProvider:
         Use from async callers sharing the main event loop.
         """
         results: Dict[str, Quote] = {}
+
+        ibkr_src = self._ibkr_source()
+        if ibkr_src is not None:
+            for sym in symbols:
+                try:
+                    ibkr_q = await ibkr_src.get_quote(sym)
+                except Exception as e:
+                    logger.debug("IBKR bulk get_quote(%s) raised: %s", sym, e)
+                    continue
+                if ibkr_q is not None:
+                    results[sym] = self._ibkr_quote_to_quote(sym, ibkr_q)
+            return results
+
         try:
             raw_quotes = await self._mda_client.get_quotes_bulk(symbols)
             for symbol, raw in raw_quotes.items():

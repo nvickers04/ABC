@@ -123,6 +123,17 @@ def main():
     parser.add_argument("--no-evolution", action="store_true",
                         help="Don't pre-start template evolution "
                              "(agent can still start it via research_engine tool)")
+    daemon_group = parser.add_mutually_exclusive_group()
+    daemon_group.add_argument(
+        "--require-daemon", action="store_true",
+        help="Refuse to start unless research_daemon.py is alive (fresh heartbeat). "
+             "Use in production to guarantee the agent never silently runs the scorer in-process.",
+    )
+    daemon_group.add_argument(
+        "--force-in-process", action="store_true",
+        help="Always run the scorer in-process, even if the daemon heartbeat is fresh. "
+             "Useful for dev/debug when you want one process to own everything.",
+    )
     parser.add_argument(
         "--account",
         choices=["paper", "live"],
@@ -151,9 +162,36 @@ def main():
     from core.agent import run_agent
 
     if not args.no_research:
-        from signals.scorer import run_research_threaded
-        print("Research scorer running (agent can pause/stop via research_engine tool)\n")
-        run_research_threaded(verbose=args.verbose)
+        # Three modes:
+        #   --require-daemon   → hard-fail if daemon isn't alive (production)
+        #   --force-in-process → always run scorer in-process (dev/debug)
+        #   default            → detect daemon via heartbeat; fall back if stale
+        from core.runtime.heartbeat import is_daemon_alive, heartbeat_age_s
+        daemon_alive = is_daemon_alive()
+
+        if args.require_daemon and not daemon_alive:
+            age = heartbeat_age_s()
+            age_str = "never" if age == float("inf") else f"{age:.1f}s"
+            msg = (f"--require-daemon set but research_daemon heartbeat is stale "
+                   f"(age={age_str}). Start research_daemon.py first, or drop the flag.")
+            print(msg)
+            logger.error(msg)
+            sys.exit(2)
+
+        if daemon_alive and not args.force_in_process:
+            age = heartbeat_age_s()
+            print(f"Research daemon detected (last heartbeat {age:.1f}s ago) — "
+                  f"agent will not spawn its own scorer.\n")
+            logger.info("Research daemon alive (age=%.1fs); skipping in-process scorer", age)
+        else:
+            from signals.scorer import run_research_threaded
+            if args.force_in_process and daemon_alive:
+                print("--force-in-process set: running scorer in-process despite live daemon "
+                      "(this will double-write — use only for dev/debug)\n")
+                logger.warning("--force-in-process: in-process scorer running alongside live daemon")
+            else:
+                print("Research scorer running in-process (no daemon heartbeat)\n")
+            run_research_threaded(verbose=args.verbose)
 
     tasks = [run_agent()]
     if not args.no_evolution:

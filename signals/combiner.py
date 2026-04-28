@@ -75,6 +75,7 @@ def combine_signals(
         try:
             ic_stats = _compute_and_log_ic_attribution(db_conn, signal_names)
             _publish_ir_snapshot(db_conn, ic_stats, n_eff=float(N))
+            _safe_update_per_symbol_ic(db_conn, signal_names)
         except Exception as e:
             logger.debug("IC attribution failed on insufficient-data path: %s", e)
         _persist_weights(db_conn, weights, n_eff=float(N))
@@ -116,6 +117,7 @@ def combine_signals(
     ic_stats: dict[str, dict[str, float]] = {}
     try:
         ic_stats = _compute_and_log_ic_attribution(db_conn, signal_names)
+        _safe_update_per_symbol_ic(db_conn, signal_names)
     except Exception as e:  # non-fatal — never break the combiner
         logger.debug("IC attribution failed: %s", e)
 
@@ -774,6 +776,22 @@ def _compute_and_log_ic_attribution(
     _log_ic_attribution(ic_stats)
     _update_ic_retirement(db_conn, ic_stats)
     return ic_stats
+
+
+def _safe_update_per_symbol_ic(db_conn, signal_names: list[str]) -> None:
+    """Refresh per-(signal, symbol, horizon) IC; swallow all errors.
+
+    Per-symbol IC is purely measured here — the combiner does NOT yet
+    apply a per-symbol modifier to weights.  The cognitive layer reads
+    the resulting ``signal_symbol_ic`` rows once it's wired in.  Keeping
+    the call here means per-symbol IC stays in lockstep with the global
+    IC's window/cadence and gets refreshed on every combiner round.
+    """
+    try:
+        from signals.per_symbol_ic import update_per_symbol_ic
+        update_per_symbol_ic(db_conn, signal_names, window_days=_IC_WINDOW_DAYS)
+    except Exception as e:  # pragma: no cover — defensive
+        logger.debug("per-symbol IC update failed: %s", e)
 
 
 def _apply_ic_retirement_mask(

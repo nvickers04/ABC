@@ -41,6 +41,11 @@ _scorer_thread: "threading.Thread | None" = None  # type: ignore[name-defined]
 _scorer_stop_event: "threading.Event | None" = None  # type: ignore[name-defined]
 _scorer_pause_event: "threading.Event | None" = None  # type: ignore[name-defined]
 
+# When True, ``run_research`` uses the session-aware cadence helper
+# (daemon mode) instead of the fixed ROUND_DELAY_SECS.  Set by
+# ``run_research(use_cadence=True)`` / ``run_research_threaded``.
+_USE_CADENCE: bool = False
+
 
 def is_scorer_running() -> bool:
     """True if a scorer thread exists and is alive."""
@@ -81,9 +86,13 @@ def stop_scorer() -> bool:
     return True
 
 
-def run_research_threaded(*, verbose: bool = False) -> None:
+def run_research_threaded(*, verbose: bool = False, use_cadence: bool = False) -> None:
     """Start `run_research` on a dedicated daemon thread with its own
     asyncio event loop. Returns immediately.
+
+    When ``use_cadence`` is True the loop sleeps according to the
+    session-aware cadence (regular/extended/overnight) instead of the
+    fixed ``ROUND_DELAY_SECS``.  Used by ``research_daemon.py``.
 
     Idempotent: if the scorer is already running this is a no-op.
     """
@@ -101,7 +110,7 @@ def run_research_threaded(*, verbose: bool = False) -> None:
         loop = asyncio.new_event_loop()
         asyncio.set_event_loop(loop)
         try:
-            loop.run_until_complete(run_research(verbose=verbose))
+            loop.run_until_complete(run_research(verbose=verbose, use_cadence=use_cadence))
         except Exception:
             logger.exception("Scorer thread crashed")
         finally:
@@ -114,7 +123,7 @@ def run_research_threaded(*, verbose: bool = False) -> None:
     _scorer_thread.start()
 
 
-async def run_research(*, verbose: bool = False) -> None:
+async def run_research(*, verbose: bool = False, use_cadence: bool = False) -> None:
     """
     Main research scoring loop — replaces old slot-based research agent.
 
@@ -123,7 +132,13 @@ async def run_research(*, verbose: bool = False) -> None:
       2. Tier 2: Option chain fetch + 10 volatility signals for top 20
       3. Tier 3: Template selection for top 8
       4. Compute forward returns, run combiner, persist results
+
+    When ``use_cadence`` is True (research-daemon mode) the loop sleeps
+    according to ``core.runtime.cadence.cadence_seconds()`` between
+    rounds instead of ``ROUND_DELAY_SECS``.
     """
+    global _USE_CADENCE
+    _USE_CADENCE = bool(use_cadence)
     from data.data_provider import DataProvider
     from memory import get_db
 
@@ -166,14 +181,28 @@ async def run_research(*, verbose: bool = False) -> None:
                 wake_bus.signal(f"scorer_round_{round_num}")
             except Exception:
                 pass
+            # Heartbeat — the trading agent uses this to decide whether
+            # to skip spawning its own in-process scorer.  Fail-soft.
+            try:
+                from core.runtime.heartbeat import write_heartbeat
+                write_heartbeat()
+            except Exception:
+                pass
         except asyncio.CancelledError:
             logger.info("Scoring loop cancelled")
             break
         except Exception as e:
             logger.error("Scoring round %d failed: %s", round_num, e, exc_info=True)
 
+        # Sleep until the next round.  When ``use_cadence`` was passed
+        # to ``run_research`` we use the session-aware cadence (daemon
+        # mode); otherwise fall back to the configured fixed delay.
         try:
-            await safe_sleep(ROUND_DELAY_SECS)
+            if _USE_CADENCE:
+                from core.runtime.cadence import cadence_seconds
+                await safe_sleep(float(cadence_seconds()))
+            else:
+                await safe_sleep(ROUND_DELAY_SECS)
         except asyncio.CancelledError:
             logger.info("Scoring loop cancelled")
             break
@@ -387,6 +416,20 @@ async def _scoring_round(dp, conn, round_num: int) -> int:
     n_eff = full_combo["n_eff"]
 
     full_composites = compute_composite_scores(conn, full_weights, tier2_symbols)
+
+    # ── Attention evaluator ────────────────────────────────
+    # Sync any new watching_for entries into structured triggers, then
+    # check every active trigger against this round's quotes &
+    # composites.  Fires post to wake_bus (waking the agent loop) and
+    # surface in the next cycle's ATTENTION block.  Fail-soft.
+    try:
+        from core.runtime import attention as _attention
+        _attention.sync_from_working_memory(conn)
+        fired = _attention.evaluate(conn, quotes=quotes, composites=full_composites)
+        if fired:
+            logger.info("Round %d: %d attention trigger(s) fired", round_num, len(fired))
+    except Exception as e:
+        logger.debug("attention layer skipped: %s", e)
 
     # ── Tier 3: Template selection for top N ───────────────
     top_symbols = sorted(

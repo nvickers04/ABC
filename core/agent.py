@@ -694,7 +694,49 @@ If no changes warranted: []"""
 
         from zoneinfo import ZoneInfo
         _et_now = datetime.now(ZoneInfo("America/New_York"))
-        context = f"""{state_text}
+        # ── Working Memory: curate then render ──────────────────
+        # Auto-injected at the top so the agent sees its own prior
+        # interpretations (theses, verdicts, watch-fors) before today's
+        # state.  See docs/PLAN_COGNITIVE_ARCHITECTURE.md §2-§3.
+        wm_block = ""
+        try:
+            from memory.working_memory import get_working_memory
+            wm = get_working_memory()
+            wm.curate()
+            wm_block = wm.render() + "\n\n"
+        except Exception as e:
+            logger.debug("working_memory render failed: %s", e)
+
+        # ── Attention: sync new watching_for into triggers, render fires ──
+        # Rendered ABOVE working memory so the agent sees "what just
+        # fired" before "what I was thinking earlier".  See plan §4.
+        attn_block = ""
+        try:
+            from core.runtime import attention as _attention
+            from memory import get_db as _get_db
+            _conn = _get_db()
+            _attention.sync_from_working_memory(_conn)
+            rendered = _attention.render_attention_block(_conn)
+            if rendered:
+                attn_block = rendered + "\n\n"
+        except Exception as e:
+            logger.debug("attention render failed: %s", e)
+
+        # ── Intuition: top-N by attention score ──────────────────
+        # Rendered just below ATTENTION so "what just fired" comes
+        # before "where my edge is sitting".  See plan §5.
+        intu_block = ""
+        try:
+            from core.runtime import intuition as _intuition
+            from memory import get_db as _get_db2
+            _conn2 = _get_db2()
+            rendered_i = _intuition.render_intuition_block(_conn2)
+            if rendered_i:
+                intu_block = rendered_i + "\n\n"
+        except Exception as e:
+            logger.debug("intuition render failed: %s", e)
+
+        context = f"""{attn_block}{intu_block}{wm_block}{state_text}
 {cost_line}
 Time: {_et_now.strftime('%Y-%m-%d %H:%M:%S')} ET
 {continuity}{pre_scan_prompt}{gap_guard_prompt}

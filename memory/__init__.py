@@ -356,9 +356,91 @@ def init_db() -> sqlite3.Connection:
 
         CREATE INDEX IF NOT EXISTS idx_signal_scores_ts ON signal_scores(ts);
         CREATE INDEX IF NOT EXISTS idx_signal_returns_signal ON signal_returns(signal_name, ts);
+        CREATE INDEX IF NOT EXISTS idx_signal_returns_signal_symbol ON signal_returns(signal_name, symbol, ts);
         CREATE INDEX IF NOT EXISTS idx_composite_scores_ts ON composite_scores(ts);
+
+        -- Per-(signal, symbol, horizon) Information Coefficient.
+        -- Computed by signals/per_symbol_ic.py from rows already present
+        -- in signal_returns (so it's pure derived state — safe to drop and
+        -- recompute).  Used by the cognitive layer to scale a signal's
+        -- weight per symbol when its per-symbol reliability diverges from
+        -- its global IC.
+        CREATE TABLE IF NOT EXISTS signal_symbol_ic (
+            signal_name TEXT NOT NULL,
+            symbol TEXT NOT NULL,
+            horizon_bars INTEGER NOT NULL,
+            ic REAL NOT NULL,
+            t_stat REAL NOT NULL,
+            n_obs INTEGER NOT NULL,
+            ic_neg_streak INTEGER NOT NULL DEFAULT 0,
+            last_updated_ts REAL NOT NULL,
+            PRIMARY KEY (signal_name, symbol, horizon_bars)
+        );
+        CREATE INDEX IF NOT EXISTS idx_sym_ic_symbol ON signal_symbol_ic(symbol);
+        CREATE INDEX IF NOT EXISTS idx_sym_ic_signal ON signal_symbol_ic(signal_name);
+
+        -- Trader's working memory: short-term, structured monologue.
+        -- Holds *interpretations* (theses, verdicts, watch-fors), not
+        -- *observations* (prices, quotes).  Persisted so the trader
+        -- survives a restart with today's context intact; entries auto-
+        -- expire via expires_ts and the in-process curator drops them at
+        -- the top of each cycle.  See memory/working_memory.py.
+        CREATE TABLE IF NOT EXISTS working_memory (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            section TEXT NOT NULL,
+            entry_text TEXT NOT NULL,
+            created_ts REAL NOT NULL,
+            expires_ts REAL NOT NULL,
+            metadata_json TEXT
+        );
+        CREATE INDEX IF NOT EXISTS idx_wm_section_expires ON working_memory(section, expires_ts);
+        CREATE INDEX IF NOT EXISTS idx_wm_created ON working_memory(created_ts);
+
+        -- Attention triggers — structured "watching_for" entries the
+        -- agent registers (directly via metadata or parsed from a
+        -- watching_for entry).  Evaluated each scorer round; when a
+        -- trigger fires we record fired_ts/fire_value and the cycle
+        -- prompt renders an ATTENTION block.  Cap: 10 active rows
+        -- (oldest active evicted on insert).
+        -- See docs/PLAN_COGNITIVE_ARCHITECTURE.md §4 and
+        -- core/runtime/attention.py.
+        CREATE TABLE IF NOT EXISTS attention_triggers (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            symbol TEXT NOT NULL,
+            condition TEXT NOT NULL,
+            threshold REAL,
+            confirm_with_json TEXT,
+            source_entry_id INTEGER,
+            source_text TEXT,
+            created_ts REAL NOT NULL,
+            fired_ts REAL,
+            fire_value REAL,
+            fire_note TEXT,
+            last_value REAL,
+            state TEXT NOT NULL DEFAULT 'active'
+        );
+        CREATE INDEX IF NOT EXISTS idx_attn_state_created ON attention_triggers(state, created_ts);
+        CREATE INDEX IF NOT EXISTS idx_attn_symbol ON attention_triggers(symbol);
+        CREATE INDEX IF NOT EXISTS idx_attn_source_entry ON attention_triggers(source_entry_id);
+
         CREATE INDEX IF NOT EXISTS idx_template_recs_ts ON template_recommendations(ts);
         CREATE INDEX IF NOT EXISTS idx_iv_history_symbol_ts ON iv_history(symbol, ts);
+
+        -- Latest real-time stock quote per symbol (single row per symbol;
+        -- written by the IBKRQuoteSource on every successful tick read).
+        -- Exists so the future research daemon can read what the trader
+        -- saw without holding its own IBKR streaming subscription.
+        CREATE TABLE IF NOT EXISTS latest_quotes (
+            symbol TEXT PRIMARY KEY,
+            last REAL,
+            bid REAL,
+            ask REAL,
+            volume INTEGER,
+            high REAL,
+            low REAL,
+            ts REAL NOT NULL,
+            source TEXT NOT NULL
+        );
     """)
 
     # ── Migrations for existing DBs ─────────────────────────────
@@ -487,6 +569,61 @@ def get_research_config(key: str, default: float) -> float:
 def set_research_config(key: str, value: float, reason: str = "") -> None:
     from memory.repos.config_repo import set_research_config as _impl
     return _impl(key, value, reason)
+
+
+# ═══════════════════════════════════════════════════════════════
+# LATEST QUOTES (real-time stock NBBO mirror)
+# ═══════════════════════════════════════════════════════════════
+# Written by IBKRQuoteSource on every successful tick read.
+# Read by the future research daemon (so it doesn't need its own
+# IBKR streaming subscription) and by anything that wants a
+# point-in-time look at what the trader most recently saw.
+
+def write_latest_quote(quote, source: str = "ibkr") -> None:
+    """Upsert a single symbol's latest quote.
+
+    `quote` is anything with .symbol, .last, .bid, .ask, .volume,
+    .high, .low, .ts (the IBKRQuote dataclass satisfies this).
+    Errors are swallowed — quote mirroring must never block the trader.
+    """
+    try:
+        db = get_db()
+        db.execute(
+            "INSERT INTO latest_quotes (symbol, last, bid, ask, volume, high, low, ts, source) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?) "
+            "ON CONFLICT(symbol) DO UPDATE SET "
+            "last=excluded.last, bid=excluded.bid, ask=excluded.ask, "
+            "volume=excluded.volume, high=excluded.high, low=excluded.low, "
+            "ts=excluded.ts, source=excluded.source",
+            (
+                quote.symbol.upper(),
+                quote.last,
+                quote.bid,
+                quote.ask,
+                int(quote.volume or 0),
+                quote.high,
+                quote.low,
+                float(quote.ts),
+                source,
+            ),
+        )
+        db.commit()
+    except Exception as e:
+        logger.debug("write_latest_quote(%s) failed: %s", getattr(quote, "symbol", "?"), e)
+
+
+def read_latest_quote(symbol: str) -> dict | None:
+    """Return the most recent latest_quotes row for `symbol` or None."""
+    try:
+        row = get_db().execute(
+            "SELECT symbol, last, bid, ask, volume, high, low, ts, source "
+            "FROM latest_quotes WHERE symbol = ?",
+            (symbol.upper(),),
+        ).fetchone()
+        return dict(row) if row else None
+    except Exception as e:
+        logger.debug("read_latest_quote(%s) failed: %s", symbol, e)
+        return None
 
 
 def get_all_research_config() -> dict[str, float]:

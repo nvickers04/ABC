@@ -244,19 +244,15 @@ async def handle_iv_info(executor, params: dict) -> Any:
     if not symbol:
         return {"error": "symbol required"}
 
-    # Agent-controlled IV sampling parameters — no defaults
+    # Agent-friendly defaults: 7-45 DTE covers near-term front-month IV
+    # (the most actionable window for short-vol/long-vol decisions). Agent
+    # may override either bound when investigating term-structure or LEAPS.
     dte_min = params.get("dte_min")
     dte_max = params.get("dte_max")
-    if dte_min is None or dte_max is None:
-        return {
-            "error": "dte_min and dte_max are required",
-            "available_params": {
-                "symbol": "required - underlying ticker",
-                "dte_min": "required - minimum days to expiration",
-                "dte_max": "required - maximum days to expiration",
-                "strike_pct": "optional - strike range as decimal (0.15 = ±15%). Auto-adaptive if omitted."
-            }
-        }
+    if dte_min is None:
+        dte_min = 7
+    if dte_max is None:
+        dte_max = 45
     dte_min = int(dte_min)
     dte_max = int(dte_max)
     strike_pct = params.get("strike_pct")  # e.g. 0.15 = ±15%; None = auto

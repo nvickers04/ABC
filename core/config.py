@@ -85,6 +85,20 @@ OPEN_GAP_GUARD_PCT = 2.0        # Skip entries if overnight gap exceeds this %
 OPEN_GUARD_DELAY_MINUTES = 15   # Wait N minutes after open if gap guard triggers
 MAX_DAILY_LLM_COST = 50.0      # LLM cost ceiling per day
 
+# ── Quote source (real-time vs. delayed) ───────────────────────────────────
+# When IBKR_QUOTES_ENABLED is True, get_quote()/get_quotes_bulk() route to
+# IBKR streaming subscriptions for real-time NBBO. If IBKR returns no data
+# the call returns None — we DO NOT silently fall back to MarketData's
+# 15-min delayed quotes (signals abstain on missing data instead).
+# Requires: IBKR Pro account, US Equity & Options Add-On Streaming Bundle
+# subscription, Market Data API Acknowledgement form completed.
+IBKR_QUOTES_ENABLED: bool = os.getenv("IBKR_QUOTES_ENABLED", "0") == "1"
+
+# Concurrent IBKR streaming subscriptions cap. IBKR allocates 100 lines by
+# default; we leave 10 headroom for transient snapshots and bracket-monitor
+# subscriptions that share the same per-user budget.
+IBKR_QUOTE_LINE_BUDGET: int = int(os.getenv("IBKR_QUOTE_LINE_BUDGET", "90"))
+
 # Backward compat alias
 MAX_RISK_PER_TRADE = RISK_PER_TRADE
 
@@ -94,7 +108,18 @@ LLM_SEED = 42                   # Reproducibility
 LLM_MAX_TOKENS = 8192           # Generous reasoning space
 
 # ── System Prompt ───────────────────────────────────────────────────────────
-SYSTEM_PROMPT = f"""You are Grok 4.20, Noah's autonomous portfolio manager.
+SYSTEM_PROMPT = f"""You are an optimistic, truth-seeking trader. You look for opportunity, but
+you tell yourself the truth about what you see. Conviction without evidence
+is gambling; evidence without conviction is paralysis.
+
+The only trade that matters is the next one. Past P&L is a fact, not a feeling.
+Don't avenge losers. Don't reward winners with size you wouldn't otherwise take.
+
+Continuity matters. If you said something 5 minutes ago, you owe yourself
+either to act on it or to explicitly change your mind and say why. Don't
+silently contradict yourself.
+
+You are Grok 4.20, Noah's autonomous portfolio manager.
 Mode: {TRADING_MODE}. Account: CASH-ONLY (no margin, no shorting).
 
 {MODE_DESCRIPTION}

@@ -13,7 +13,7 @@ candles: {symbol, days?=30, resolution?='D'} -> OHLCV data (resolution: D=daily,
 fundamentals: {symbol} -> sector, industry, market_cap, pe_ratio, earnings_date
 earnings: {symbol} -> next_earnings_date, days_until_earnings
 atr: {symbol, period?=14} -> ATR value and ATR as % of price (for stop calibration)
-iv_info: {symbol, dte_min, dte_max, strike_pct?=auto} -> current IV from ATM options (dte_min/dte_max required, strike_pct as decimal e.g. 0.15=±15%)
+iv_info: {symbol, dte_min?=7, dte_max?=45, strike_pct?=auto} -> current IV from ATM options (defaults sample front-month vol; widen DTE for term-structure)
 news: {symbol} -> recent headlines + basic sentiment (positive/negative/neutral)
 analysts: {symbol} -> consensus, price targets, upside_pct, recent upgrades/downgrades
 extended_fundamentals: {symbol} -> short_interest, beta, debt_to_equity, ROE, margins, growth
@@ -117,6 +117,11 @@ instrument_selector: {symbol?, outlook?='bullish'|'bearish'|'neutral'|'volatile'
 stats: {} -> comprehensive performance stats (P&L, win rate, positions, LLM costs, action breakdown)
 daily_summary: {} -> generate + persist daily summary to logs/daily_summary.json
 review_trades: {days?=3, sort?='efficiency', symbol?} -> closed trades with efficiency ranking
+signal_breakdown: {symbol} -> per-signal attribution for the symbol's most-recent composite (score, weight, IC, contribution, trust), sorted by |contribution|; reveals which signals drove the consensus and which had no fresh data
+
+=== WORKING MEMORY ===
+update_working_memory: {section, entry, expires_in_minutes?, metadata?} -> add an interpretation/thesis/verdict/watch-for note. Sections: open_theses (cap 8, EOD), recent_verdicts (cap 12, 30m default), watching_for (cap 10, 60m), regime_notes (cap 5, EOD), lessons_today (cap 8, EOD). Auto-rendered at top of every cycle.
+clear_working_memory_entry: {section, entry_id?} -> remove one entry, or whole section if entry_id omitted
 """
 
 import asyncio
@@ -155,6 +160,8 @@ from tools.tools_stats import HANDLERS as _STATS
 from tools.tools_sizing import HANDLERS as _SIZING
 from tools.tools_instruments import HANDLERS as _INSTRUMENTS
 from tools.tools_multiagent import HANDLERS as _MULTIAGENT
+from tools.tools_working_memory import HANDLERS as _WORKING_MEMORY
+from tools.tools_signal_breakdown import HANDLERS as _SIGNAL_BREAKDOWN
 
 _REGISTRY: dict[str, Any] = {}
 _REGISTRY.update(_RESEARCH)
@@ -165,6 +172,8 @@ _REGISTRY.update(_STATS)
 _REGISTRY.update(_SIZING)
 _REGISTRY.update(_INSTRUMENTS)
 _REGISTRY.update(_MULTIAGENT)
+_REGISTRY.update(_WORKING_MEMORY)
+_REGISTRY.update(_SIGNAL_BREAKDOWN)
 
 
 # ── plan_order / enter_option handler wrappers ────────────────

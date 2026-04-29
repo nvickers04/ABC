@@ -21,7 +21,11 @@ logger = logging.getLogger(__name__)
 
 
 HEARTBEAT_KEY: str = "daemon_heartbeat_ts"
-DEFAULT_STALE_AFTER_S: float = 60.0
+
+# Hard floor used when no cadence is supplied — long enough that a
+# regular-hours round (~75s effective cycle) is still considered fresh,
+# short enough that a truly dead daemon is detected within ~3 minutes.
+DEFAULT_STALE_AFTER_S: float = 180.0
 
 
 def write_heartbeat(now: Optional[float] = None) -> float:
@@ -48,12 +52,29 @@ def read_heartbeat() -> float:
         return 0.0
 
 
-def is_daemon_alive(stale_after_s: float = DEFAULT_STALE_AFTER_S,
+def is_daemon_alive(stale_after_s: Optional[float] = None,
                     *, now: Optional[float] = None) -> bool:
-    """True iff a heartbeat exists and is younger than ``stale_after_s``."""
+    """True iff a heartbeat exists and is fresh enough for the current cadence tier.
+
+    When ``stale_after_s`` is None (the common case) the threshold is
+    derived from the current cadence: ``3 × cadence_seconds() + 60``,
+    floored at ``DEFAULT_STALE_AFTER_S``.  This means a daemon sleeping
+    overnight at 1800s cadence won't be falsely flagged dead between
+    rounds, while a daemon that's actually crashed during regular hours
+    is still detected within ~3 minutes.
+
+    Pass an explicit value to opt out of the cadence-aware default.
+    """
     last = read_heartbeat()
     if last <= 0.0:
         return False
+    if stale_after_s is None:
+        try:
+            from core.runtime.cadence import cadence_seconds
+            cadence_s = float(cadence_seconds())
+        except Exception:
+            cadence_s = 30.0
+        stale_after_s = max(DEFAULT_STALE_AFTER_S, 3.0 * cadence_s + 60.0)
     cur = float(now) if now is not None else time.time()
     return (cur - last) <= float(stale_after_s)
 

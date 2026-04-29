@@ -230,7 +230,9 @@ async def _scoring_round(dp, conn, round_num: int) -> int:
 
     focus_syms = get_focus_symbols(conn)
     base_every_n = base_universe_every_n_rounds()
-    include_base = (round_num % base_every_n) == 0
+    # round_num is 1-indexed; this makes round 1 include base (no cold
+    # start with focus-only rounds before the first base sweep).
+    include_base = ((round_num - 1) % base_every_n) == 0
     universe = merge_universes(
         RESEARCH_UNIVERSE, focus_syms, include_base=include_base,
     )

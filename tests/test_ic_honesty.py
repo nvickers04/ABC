@@ -19,11 +19,11 @@ class TestCadenceAwareMinObs:
             def __init__(self, res):
                 self.return_resolution = res
 
-        assert _min_obs_for(_S("1min")) == 200
-        assert _min_obs_for(_S("5min")) == 100
-        assert _min_obs_for(_S("15min")) == 75
-        assert _min_obs_for(_S("1h")) == 50
-        assert _min_obs_for(_S("D")) == 30
+        assert _min_obs_for(_S("1min")) == 60
+        assert _min_obs_for(_S("5min")) == 40
+        assert _min_obs_for(_S("15min")) == 25
+        assert _min_obs_for(_S("1h")) == 20
+        assert _min_obs_for(_S("D")) == 12
 
     def test_unknown_resolution_falls_back_to_default(self):
         from signals.combiner import _min_obs_for, _IC_MIN_OBS
@@ -43,12 +43,11 @@ class TestCadenceAwareMinObs:
     @pytest.mark.parametrize(
         "name,expected_min",
         [
-            ("market_momentum", 30),    # macro / D
-            ("momentum", 50),           # price / 1h
-            ("iv_rv_spread", 50),       # volatility / 1h
-            ("option_flow", 100),       # microstructure / 5min
-            ("spread_dynamics", 200),   # microstructure / 1min (override)
-            ("seasonality", 30),        # macro / D (override)
+            ("momentum", 20),           # price / 1h
+            ("iv_rv_spread", 20),       # volatility / 1h
+            ("option_flow", 40),        # microstructure / 5min
+            ("spread_dynamics", 60),    # microstructure / 1min (override)
+            ("seasonality", 12),        # macro / D (override)
         ],
     )
     def test_real_signals_use_their_resolution(self, name, expected_min):

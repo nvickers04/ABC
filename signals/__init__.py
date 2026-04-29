@@ -35,6 +35,19 @@ def _autoload_signal_modules() -> None:
         "templates",
         "template_evolution",
         "briefing",
+        # ── Regime / market-wide signals ──────────────────────────
+        # These emit the SAME value for every symbol in the universe
+        # each round, so they contribute zero cross-sectional info to
+        # per-symbol composites (a constant added to every composite
+        # cancels out under any monotone ranking).  They belong in a
+        # regime-conditioning layer, not in the per-symbol scorer.
+        # Disabled here pending that refactor; can be re-enabled by
+        # removing from this set.
+        "market_momentum",
+        "vix_proxy",
+        "breadth",
+        "correlation_regime",
+        "carry",
     }
 
     for _finder, modname, _ispkg in pkgutil.iter_modules(__path__):

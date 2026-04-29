@@ -231,6 +231,10 @@ class AuctionImbalanceSignal(Signal):
     data_source = "mda_quotes"
     refresh_rate = "every_round"
     tier = 1
+    # NYSE auction imbalance is only available via IBKR generic ticks.
+    # The research daemon has IBKR disabled (it shares MDA), so this
+    # signal would emit zeros there; only the trader runs it.
+    requires_ibkr = True
     # Auction print resolves within minutes of the cross; override the
     # microstructure default (5min × 6 bars) with 1-min × 30.
     return_resolution = "1min"

@@ -25,6 +25,7 @@ from research.config import (
     TIER1_UNIVERSE_SIZE,
     TRADE_REC_TOP_N,
 )
+from core import config as _core_config
 from signals.base import SIGNAL_REGISTRY
 from signals.combiner import combine_signals, compute_composite_scores
 from signals.templates import init_default_boundaries, select_template, write_recommendations
@@ -322,9 +323,13 @@ async def _scoring_round(dp, conn, round_num: int) -> int:
     env = await asyncio.to_thread(_get_environment, dp, universe, candles_map)
 
     # ── Tier 1: Score cheap signals (40 signals, full universe) ─
+    # Skip signals that require an IBKR connection when this process
+    # has IBKR quotes disabled (e.g. the research daemon).  The trader
+    # process runs them and writes their scores directly.
+    _ibkr_on = bool(getattr(_core_config, "IBKR_QUOTES_ENABLED", False))
     tier1_signals = {
         name: sig for name, sig in SIGNAL_REGISTRY.items()
-        if sig.tier == 1
+        if sig.tier == 1 and (_ibkr_on or not getattr(sig, "requires_ibkr", False))
     }
 
     now = time.time()
@@ -381,8 +386,16 @@ async def _scoring_round(dp, conn, round_num: int) -> int:
 
     tier2_signals = {
         name: sig for name, sig in SIGNAL_REGISTRY.items()
-        if sig.tier == 2
+        if sig.tier == 2 and (_ibkr_on or not getattr(sig, "requires_ibkr", False))
     }
+    # Diagnostic: which symbols won the deep-scan slot this round?
+    # Tracked over time, this surfaces whether tier-2 rotates across
+    # the full universe or keeps re-selecting the same names (which
+    # would starve the others of options-derived signals).
+    logger.info(
+        "Round %d: Tier 2 selected %s",
+        round_num, ",".join(tier2_symbols),
+    )
 
     def _score_tier2(sym: str) -> tuple[str, dict]:
         try:

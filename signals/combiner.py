@@ -188,18 +188,31 @@ _IC_WINDOW_DAYS = 60
 # because their bars are more autocorrelated -- see _min_obs_for(sig).
 _IC_MIN_OBS = 30
 # Per-resolution minimum observations.  Sub-daily bars are tightly
-# autocorrelated so |IC| stabilises only after far more rows.
+# autocorrelated so |IC| stabilises only after many rows -- but we
+# also want the IR gate to *open* during warmup rather than waiting
+# weeks. The IR gate itself is t-stat / sample-size aware (it down-
+# weights short-history signals), so these min_obs values are the
+# WARMUP floor: "enough rows that IC isn't pure noise".  As the
+# system collects more data the gate naturally tightens via the IR
+# confidence math without us having to raise these thresholds.
 _MIN_OBS_BY_RES = {
-    "1min": 200,
-    "5min": 100,
-    "15min": 75,
-    "1h":   50,
-    "D":    30,
+    "1min":  60,   # ~1h of valid intraday rounds
+    "5min":  40,   # ~3-4h of 5-min bars
+    "15min": 25,
+    "1h":    20,   # ~3 trading days
+    "D":     12,   # ~2.5 trading weeks
 }
 
 
 def _min_obs_for(sig) -> int:
-    """Cadence-aware IC minimum-observation threshold for a signal."""
+    """Cadence-aware IC minimum-observation threshold for a signal.
+
+    A None signal (e.g. retired/renamed and missing from the registry)
+    falls back to the conservative ``_IC_MIN_OBS`` default rather than
+    the looser daily-bar warmup floor.
+    """
+    if sig is None:
+        return _IC_MIN_OBS
     res = getattr(sig, "return_resolution", "D")
     return _MIN_OBS_BY_RES.get(res, _IC_MIN_OBS)
 # A signal whose |IC| falls below this threshold (on a trusted sample)

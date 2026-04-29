@@ -75,6 +75,12 @@ class Signal(ABC):
     # Tier: 1 = cheap (no option chains), 2 = expensive (needs option chains)
     tier: int = 1
 
+    # If True, this signal needs a live IBKR connection to produce
+    # meaningful output (e.g. NYSE auction-imbalance generic ticks).
+    # The research daemon (which has IBKR quotes disabled) skips these
+    # signals entirely; they only run inside the trader process.
+    requires_ibkr: bool = False
+
     # ── Forward-return measurement attributes ─────────────────────────
     # Each signal declares the candle resolution and horizon (in bars of
     # that resolution) used to compute its realised forward return for

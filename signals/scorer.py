@@ -217,11 +217,33 @@ async def _scoring_round(dp, conn, round_num: int) -> int:
     credits_used = 0
 
     # ── Universe ────────────────────────────────────────────
+    # The daemon scores two tiers of symbols:
+    #   * focus  — symbols the trader is actively engaged with (active
+    #              attention triggers; usually held + watched names).
+    #              Scored EVERY round so positions are freshest.
+    #   * base   — RESEARCH_UNIVERSE static list.  Scored every Nth
+    #              round per core.runtime.cadence.base_universe_every_n_rounds.
+    # See cadence.py module docstring for the budget reasoning.
     from research.config import RESEARCH_UNIVERSE
-    universe = list(RESEARCH_UNIVERSE)
+    from core.runtime.cadence import base_universe_every_n_rounds
+    from core.runtime.focus_universe import get_focus_symbols, merge_universes
+
+    focus_syms = get_focus_symbols(conn)
+    base_every_n = base_universe_every_n_rounds()
+    include_base = (round_num % base_every_n) == 0
+    universe = merge_universes(
+        RESEARCH_UNIVERSE, focus_syms, include_base=include_base,
+    )
+    # Safety net: if attention has nothing AND we'd skip base, score base
+    # anyway — an empty round wastes a wakeup and still costs the
+    # bulk-quotes call.
+    if not universe:
+        universe = list(RESEARCH_UNIVERSE)
+        include_base = True
     logger.info(
-        "Round %d starting: universe=%d, signals=%d",
-        round_num, len(universe), len(SIGNAL_REGISTRY),
+        "Round %d starting: universe=%d (focus=%d, base_included=%s, base_every_n=%d), signals=%d",
+        round_num, len(universe), len(focus_syms),
+        include_base, base_every_n, len(SIGNAL_REGISTRY),
     )
 
     # ── Bulk data fetch (Tier 1 data) ──────────────────────

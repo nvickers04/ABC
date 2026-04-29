@@ -47,7 +47,7 @@ class TestCadenceAwareMinObs:
             ("iv_rv_spread", 20),       # volatility / 1h
             ("option_flow", 40),        # microstructure / 5min
             ("spread_dynamics", 60),    # microstructure / 1min (override)
-            ("seasonality", 12),        # macro / D (override)
+            ("gamma_exposure", 12),     # volatility / D
         ],
     )
     def test_real_signals_use_their_resolution(self, name, expected_min):

@@ -57,23 +57,23 @@ class TestEntryBarKeying:
 
     def test_three_intraday_scores_collapse_to_one_row(self, conn):
         from signals.scorer import _compute_forward_returns
-        import signals.news_sentiment  # noqa: F401  (macro / D / h=1)
+        import signals.gamma_exposure  # noqa: F401  (volatility / D / h=3)
         from signals.base import SIGNAL_REGISTRY
 
-        sig = SIGNAL_REGISTRY["news_sentiment"]
+        sig = SIGNAL_REGISTRY["gamma_exposure"]
         assert sig.return_resolution == "D"
-        assert sig.return_horizon == 1
+        assert sig.return_horizon == 3
 
         now = time.time()
         ts = [now - (60 - i) * 86400 for i in range(60)]
         closes = [100.0 + i for i in range(60)]
         cmap = {"D": {"AAPL": _candles(ts, closes)}}
 
-        # Three intraday scores all map to bar 57 (exit=58 is in-range).
+        # Three intraday scores all map to bar 55 (exit=58 is in-range with h=3).
         for offset, score in [(1000, 1.0), (5000, 0.5), (10000, -0.5)]:
             conn.execute(
                 "INSERT INTO signal_scores VALUES (?, ?, ?, ?)",
-                ("news_sentiment", "AAPL", ts[57] + offset, score),
+                ("gamma_exposure", "AAPL", ts[55] + offset, score),
             )
         conn.commit()
 
@@ -84,35 +84,35 @@ class TestEntryBarKeying:
             "FROM signal_returns"
         ).fetchall()
         assert len(rows) == 1, "intraday rounds should collapse to one row per entry bar"
-        assert rows[0][2] == pytest.approx(ts[57], abs=1e-3), \
+        assert rows[0][2] == pytest.approx(ts[55], abs=1e-3), \
             "row must be keyed by entry_bar_ts not score_ts"
         # Last write wins (score=-0.5 was the most recent).
         assert rows[0][3] == -0.5
-        assert rows[0][4] == 1
+        assert rows[0][4] == 3
 
 
 class TestPerSignalHorizon:
     """Each signal's own return_horizon must drive the bar lookahead."""
 
-    def test_horizon_5_skips_5_bars(self, conn):
+    def test_horizon_3_skips_3_bars(self, conn):
         from signals.scorer import _compute_forward_returns
-        import signals.cash_flow_yield  # noqa: F401
+        import signals.gamma_exposure  # noqa: F401
         from signals.base import SIGNAL_REGISTRY
 
-        sig = SIGNAL_REGISTRY["cash_flow_yield"]
+        sig = SIGNAL_REGISTRY["gamma_exposure"]
         assert sig.return_resolution == "D"
-        assert sig.return_horizon == 5
+        assert sig.return_horizon == 3
 
         now = time.time()
         ts = [now - (60 - i) * 86400 for i in range(60)]
-        # Linear ramp: forward return over 5 bars = 5 / entry_price
+        # Linear ramp: forward return over 3 bars = 3 / entry_price
         closes = [100.0 + i for i in range(60)]
         cmap = {"D": {"AAPL": _candles(ts, closes)}}
 
-        # Score at bar 50 → exit bar 55, both in range.
+        # Score at bar 50 → exit bar 53, both in range.
         conn.execute(
             "INSERT INTO signal_scores VALUES (?, ?, ?, ?)",
-            ("cash_flow_yield", "AAPL", ts[50] + 100, 1.0),
+            ("gamma_exposure", "AAPL", ts[50] + 100, 1.0),
         )
         conn.commit()
 
@@ -122,9 +122,9 @@ class TestPerSignalHorizon:
             "SELECT forward_return, horizon_bars FROM signal_returns"
         ).fetchone()
         assert row is not None
-        expected = (closes[55] - closes[50]) / closes[50]
+        expected = (closes[53] - closes[50]) / closes[50]
         assert row[0] == pytest.approx(expected, rel=1e-9)
-        assert row[1] == 5
+        assert row[1] == 3
 
 
 class TestPerResolutionRouting:
@@ -132,7 +132,7 @@ class TestPerResolutionRouting:
 
     def test_daily_signal_ignored_when_only_subdaily_candles_present(self, conn):
         from signals.scorer import _compute_forward_returns
-        import signals.news_sentiment  # noqa: F401  (D, h=1)
+        import signals.gamma_exposure  # noqa: F401  (D, h=3)
 
         now = time.time()
         ts = [now - (60 - i) * 86400 for i in range(60)]
@@ -144,7 +144,7 @@ class TestPerResolutionRouting:
 
         conn.execute(
             "INSERT INTO signal_scores VALUES (?, ?, ?, ?)",
-            ("news_sentiment", "AAPL", ts[50] + 100, 1.0),
+            ("gamma_exposure", "AAPL", ts[50] + 100, 1.0),
         )
         conn.commit()
 
@@ -159,7 +159,7 @@ class TestPruneAndTTL:
 
     def test_orphan_symbol_score_deleted(self, conn):
         from signals.scorer import _compute_forward_returns
-        import signals.news_sentiment  # noqa: F401
+        import signals.gamma_exposure  # noqa: F401
 
         now = time.time()
         ts = [now - (60 - i) * 86400 for i in range(60)]
@@ -169,7 +169,7 @@ class TestPruneAndTTL:
         # XYZ is not in any candle map → orphan → must be deleted.
         conn.execute(
             "INSERT INTO signal_scores VALUES (?, ?, ?, ?)",
-            ("news_sentiment", "XYZ", ts[50] + 100, 1.0),
+            ("gamma_exposure", "XYZ", ts[50] + 100, 1.0),
         )
         conn.commit()
 
@@ -182,7 +182,7 @@ class TestPruneAndTTL:
 
     def test_thirty_day_ttl_drops_ancient_scores(self, conn):
         from signals.scorer import _compute_forward_returns
-        import signals.news_sentiment  # noqa: F401
+        import signals.gamma_exposure  # noqa: F401
 
         now = time.time()
         ts = [now - (60 - i) * 86400 for i in range(60)]

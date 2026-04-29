@@ -307,9 +307,102 @@ async def test_imbalance_generic_tick_passed_to_reqmktdata(connector):
     await src.promote("AAPL")
     assert captured, "reqMktData was not called"
     generic_ticks, snapshot, regulatory = captured[0]
-    assert generic_ticks == "588"
+    # '225' = auction values (open/close cross) — see DEFAULT_GENERIC_TICK_LIST.
+    assert generic_ticks == "225"
     assert snapshot is False
     assert regulatory is False
+
+
+def test_read_ticker_populates_auction_fields():
+    """_read_ticker copies auctionImbalance/Volume/Price + regulatoryImbalance."""
+    from data.ibkr_quote_source import _read_ticker
+
+    class _T:
+        last = 100.0
+        bid = 99.95
+        ask = 100.05
+        volume = 1_000_000
+        high = 101.0
+        low = 99.0
+        # Imbalance fields (negative = sell-side, must NOT be filtered out)
+        auctionImbalance = -50_000.0
+        auctionVolume = 250_000
+        auctionPrice = 100.10
+        regulatoryImbalance = -45_000.0
+
+    q = _read_ticker("AAPL", _T())
+    assert q is not None
+    assert q.auction_imbalance == -50_000.0
+    assert q.auction_volume == 250_000
+    assert q.auction_price == 100.10
+    assert q.regulatory_imbalance == -45_000.0
+
+
+def test_read_ticker_auction_fields_default_to_none():
+    """When ticker has no auction attrs, fields stay None (no error)."""
+    from data.ibkr_quote_source import _read_ticker
+
+    class _T:
+        last = 100.0
+        bid = 99.95
+        ask = 100.05
+        volume = 1_000_000
+        high = 101.0
+        low = 99.0
+        # No auctionImbalance / auctionVolume / etc. attributes.
+
+    q = _read_ticker("AAPL", _T())
+    assert q is not None
+    assert q.auction_imbalance is None
+    assert q.auction_volume is None
+    assert q.auction_price is None
+    assert q.regulatory_imbalance is None
+
+
+def test_read_ticker_auction_imbalance_nan_becomes_none():
+    """ib_insync uses NaN for 'no value yet' — must normalize to None."""
+    from data.ibkr_quote_source import _read_ticker
+
+    class _T:
+        last = 100.0
+        bid = 99.95
+        ask = 100.05
+        volume = 1_000_000
+        high = 101.0
+        low = 99.0
+        auctionImbalance = float("nan")
+        auctionVolume = float("nan")
+        auctionPrice = float("nan")
+        regulatoryImbalance = float("nan")
+
+    q = _read_ticker("AAPL", _T())
+    assert q is not None
+    assert q.auction_imbalance is None
+    assert q.auction_volume is None
+    assert q.auction_price is None
+    assert q.regulatory_imbalance is None
+
+
+def test_read_ticker_auction_imbalance_zero_preserved():
+    """Zero imbalance is meaningful (book is balanced) — must not be filtered."""
+    from data.ibkr_quote_source import _read_ticker
+
+    class _T:
+        last = 100.0
+        bid = 99.95
+        ask = 100.05
+        volume = 1_000_000
+        high = 101.0
+        low = 99.0
+        auctionImbalance = 0.0
+        auctionVolume = 100_000
+        auctionPrice = 100.0
+        regulatoryImbalance = 0.0
+
+    q = _read_ticker("AAPL", _T())
+    assert q is not None
+    assert q.auction_imbalance == 0.0
+    assert q.regulatory_imbalance == 0.0
 
 
 @pytest.mark.asyncio

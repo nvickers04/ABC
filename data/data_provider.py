@@ -42,6 +42,13 @@ class Quote:
     source: str  # 'marketdata', 'yfinance', 'ibkr'
     timestamp: Optional[datetime] = None
     source_updated: Optional[int] = None  # Unix timestamp from data source
+    # Auction-cross fields (populated only by the IBKR backend during the
+    # open/close imbalance windows; None otherwise).  Imbalance values are
+    # SIGNED shares (positive = buy-side, negative = sell-side).
+    auction_imbalance: Optional[float] = None
+    auction_volume: Optional[int] = None
+    auction_price: Optional[float] = None
+    regulatory_imbalance: Optional[float] = None
 
     @property
     def mid(self) -> Optional[float]:
@@ -604,6 +611,10 @@ class DataProvider:
             source="ibkr",
             timestamp=datetime.now(),
             source_updated=int(q.ts) if q.ts else None,
+            auction_imbalance=getattr(q, "auction_imbalance", None),
+            auction_volume=getattr(q, "auction_volume", None),
+            auction_price=getattr(q, "auction_price", None),
+            regulatory_imbalance=getattr(q, "regulatory_imbalance", None),
         )
 
     def get_quote(self, symbol: str) -> Optional[Quote]:

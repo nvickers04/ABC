@@ -41,8 +41,13 @@ logger = logging.getLogger(__name__)
 # ---------- Tunables (also exposed via core.config) ----------
 DEFAULT_LINE_BUDGET = 90              # of IBKR's 100-line allocation
 DEFAULT_SNAPSHOT_TIMEOUT_SECS = 11.0  # IBKR releases snapshot lines ~11s after request
-# genericTickList '588' = NYSE/ARCA/MKT order imbalance ticks. Free piggyback.
-DEFAULT_GENERIC_TICK_LIST = "588"
+# genericTickList '225' = Auction values (open/close cross).  Delivers tick IDs:
+#   34 = auctionVolume      (paired shares)
+#   35 = auctionPrice       (indicative cross price)
+#   36 = auctionImbalance   (signed shares; +buy / -sell)
+#   61 = regulatoryImbalance (NYSE only, signed shares)
+# Free piggyback on the existing stock subscription.
+DEFAULT_GENERIC_TICK_LIST = "225"
 
 
 @dataclass
@@ -56,6 +61,13 @@ class IBKRQuote:
     high: Optional[float]
     low: Optional[float]
     ts: float  # unix seconds when read
+    # Auction-cross fields (None outside the open/close imbalance windows,
+    # or when generic tick list 225 isn't subscribed).  Imbalance values
+    # are SIGNED shares (positive = buy-side, negative = sell-side).
+    auction_imbalance: Optional[float] = None
+    auction_volume: Optional[int] = None
+    auction_price: Optional[float] = None
+    regulatory_imbalance: Optional[float] = None
 
 
 def _ticker_value(value: Any) -> Optional[float]:
@@ -78,6 +90,23 @@ def _ticker_value(value: Any) -> Optional[float]:
     return v
 
 
+def _signed_ticker_value(value: Any) -> Optional[float]:
+    """Like ``_ticker_value`` but preserves negatives.
+
+    Auction imbalance and regulatory imbalance are SIGNED (negative means
+    sell-side imbalance).  Only None and NaN are treated as "no data".
+    """
+    if value is None:
+        return None
+    try:
+        v = float(value)
+    except (TypeError, ValueError):
+        return None
+    if v != v:  # NaN
+        return None
+    return v
+
+
 def _read_ticker(symbol: str, ticker: Any) -> Optional[IBKRQuote]:
     """Convert an ib_insync Ticker into an IBKRQuote, or None if no usable data."""
     if ticker is None:
@@ -93,6 +122,22 @@ def _read_ticker(symbol: str, ticker: Any) -> Optional[IBKRQuote]:
         volume = int(vol_raw) if vol_raw and vol_raw == vol_raw and vol_raw >= 0 else 0
     except (TypeError, ValueError):
         volume = 0
+    # Auction-cross fields (only present during open/close imbalance windows
+    # when genericTickList='225' is subscribed).  Imbalance values are signed.
+    auction_imbalance = _signed_ticker_value(getattr(ticker, "auctionImbalance", None))
+    auction_price = _ticker_value(getattr(ticker, "auctionPrice", None))
+    regulatory_imbalance = _signed_ticker_value(getattr(ticker, "regulatoryImbalance", None))
+    auction_volume_raw = getattr(ticker, "auctionVolume", None)
+    auction_volume: Optional[int]
+    try:
+        if auction_volume_raw is None or auction_volume_raw != auction_volume_raw:  # None / NaN
+            auction_volume = None
+        else:
+            av = int(auction_volume_raw)
+            auction_volume = av if av > 0 else None
+    except (TypeError, ValueError):
+        auction_volume = None
+
     return IBKRQuote(
         symbol=symbol,
         last=last,
@@ -102,6 +147,10 @@ def _read_ticker(symbol: str, ticker: Any) -> Optional[IBKRQuote]:
         high=_ticker_value(getattr(ticker, "high", None)),
         low=_ticker_value(getattr(ticker, "low", None)),
         ts=time.time(),
+        auction_imbalance=auction_imbalance,
+        auction_volume=auction_volume,
+        auction_price=auction_price,
+        regulatory_imbalance=regulatory_imbalance,
     )
 
 

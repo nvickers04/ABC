@@ -340,6 +340,39 @@ _ORDER_ACTIONS = {
     "plan_order", "enter_option", "multi_leg",
 }
 
+# Order actions that close/exit existing exposure — exempt from the
+# universe guard so the agent can always reduce risk on a name even if
+# it has been removed from RESEARCH_UNIVERSE since entry.
+_EXIT_ORDER_ACTIONS = {
+    "close_position", "close_option", "close_spread", "roll_option",
+    "modify_stop", "flatten_limits",
+}
+
+
+def _allowed_trade_universe() -> set[str]:
+    """Symbols the agent is permitted to OPEN new exposure in.
+
+    = RESEARCH_UNIVERSE  ∪  active attention triggers  ∪  symbols with
+    a current open position.  Closing/rolling existing exposure is
+    always allowed (see ``_EXIT_ORDER_ACTIONS``).
+
+    Fail-soft: on any error returns an empty set, which makes the guard
+    block all NEW entries — the safe default if we can't read the DB.
+    """
+    allowed: set[str] = set()
+    try:
+        from research.config import RESEARCH_UNIVERSE
+        allowed.update(s.upper() for s in RESEARCH_UNIVERSE if isinstance(s, str))
+    except Exception:
+        pass
+    try:
+        from memory import get_db
+        from core.runtime.focus_universe import get_focus_symbols
+        allowed.update(get_focus_symbols(get_db(), limit=64))
+    except Exception:
+        pass
+    return allowed
+
 
 def get_valid_actions() -> list[str]:
     """Return sorted list of all valid action names from the tool registry."""
@@ -1675,6 +1708,45 @@ class ToolExecutor:
                     action=action, data=err, success=False,
                     raw_json=json.dumps(err),
                 )
+
+            # Universe confinement: ENTRIES into new exposure must be in
+            # the allowed universe (research universe ∪ active attention ∪
+            # current positions).  Exits/closes/rolls are always allowed.
+            # Aliases ``buy``/``sell`` are checked too — same symbol field.
+            if (action in _ORDER_ACTIONS or action in ("buy", "sell")) \
+                    and action not in _EXIT_ORDER_ACTIONS:
+                sym_raw = (params or {}).get("symbol")
+                if isinstance(sym_raw, str) and sym_raw.strip():
+                    sym = sym_raw.strip().upper()
+                    allowed = _allowed_trade_universe()
+                    # Always allow if we have a current position in the symbol
+                    has_position = False
+                    try:
+                        if self.gateway is not None:
+                            for item in (self.gateway.get_cached_portfolio() or []):
+                                if item.contract.symbol.upper() == sym and item.position != 0:
+                                    has_position = True
+                                    break
+                    except Exception:
+                        pass
+                    if not has_position and allowed and sym not in allowed:
+                        err = {
+                            "error": (
+                                f"Symbol {sym!r} is outside the allowed trading universe. "
+                                f"Use research tools to investigate, or add it via "
+                                f"update_working_memory(section='watching_for', "
+                                f"metadata={{'symbol': '{sym}', ...}}) to register attention."
+                            ),
+                            "allowed_size": len(allowed),
+                        }
+                        logger.warning(
+                            "Universe guard blocked %s on %s (allowed=%d)",
+                            action, sym, len(allowed),
+                        )
+                        return ToolResult(
+                            action=action, data=err, success=False,
+                            raw_json=json.dumps(err, separators=(',',':'), default=str),
+                        )
 
             result = await self._dispatch(action, params)
             payload = self._standardize_tool_payload(result)

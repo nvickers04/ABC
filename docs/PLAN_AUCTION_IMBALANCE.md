@@ -1,8 +1,56 @@
 # Plan: Auction Imbalance Signal
 
-Status: drafted, not yet implemented.
-Owner: next coding session.
-Depends on: PR-A (research daemon) — already landed.
+Status: **SHIPPED** (commit `bb8afde`, 2026-04-29).
+Final test count: **778 passed / 4 skipped** (was 742 before this work).
+
+## Decisions made (resolves §6 open questions)
+
+1. Tick list = `"225"` only.  Did not bundle `233` (volume rate) or keep
+   the spurious `588` — they weren't needed for the imbalance feed.
+2. **No** config gate.  The change is the new default.  Auction ticks
+   piggyback on the existing stock subscription and consume zero
+   additional lines, so there's no operational cost to leaving them on.
+3. Use the wider 09:25–09:30 ET open window unconditionally (covers
+   NASDAQ).  ~3 minutes of low-confidence scores for NYSE-listed names
+   that don't publish until 09:28 is acceptable; not worth the
+   `primaryExchange` lookup complexity.
+
+## What actually shipped (vs original plan)
+
+- Data layer fixes landed exactly as specified.
+- **Bug caught during implementation:** `_ticker_value` filtered values
+  ≤ 0 as "unset", but auction imbalance is **signed** (negative = sell-side).
+  Introduced `_signed_ticker_value` to preserve negatives.  Without this
+  fix, every sell-side imbalance would have been silently dropped.  The
+  original plan said "use the existing `_ticker_value` helper" — that
+  was wrong.
+- Public `Quote` dataclass in `data/data_provider.py` was extended too
+  (the plan only mentioned `IBKRQuote`).  `_ibkr_quote_to_quote`
+  propagates the four new fields so signals reading
+  `data["quote"].auction_imbalance` get the right values.
+- ADV is computed inside the signal from the existing `candles_daily`
+  rather than via a new `data["adv_20"]` key — fewer scorer changes.
+- `compute_auction_score(...)` is exposed at module scope as a pure
+  function so tests drive it without reconstructing a full data dict
+  (mirrors the `core/runtime/cadence.py` pattern).
+- Tests: **21** in `tests/test_auction_imbalance.py` and **4** new in
+  `tests/test_ibkr_quote_source.py` (covering field extraction,
+  NaN→None, zero preserved, and missing-attr defaults).  Plan estimated
+  ~10 tests.
+
+## Files touched (final)
+
+| File | Change |
+|---|---|
+| `data/ibkr_quote_source.py` | `DEFAULT_GENERIC_TICK_LIST` `"588"`→`"225"`; `_signed_ticker_value` helper; `_read_ticker` extracts 4 fields; `IBKRQuote` extended. |
+| `data/data_provider.py` | `Quote` dataclass extended with the 4 fields; `_ibkr_quote_to_quote` propagates them. |
+| `signals/auction_imbalance.py` | NEW. Microstructure, tier 1, every round, 1-min × 30 horizon. |
+| `tests/test_auction_imbalance.py` | NEW. 21 tests. |
+| `tests/test_ibkr_quote_source.py` | Updated existing assertion to `"225"`; +4 tests for `_read_ticker` auction extraction. |
+
+---
+
+## Original plan (preserved below for context)
 
 ---
 

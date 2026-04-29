@@ -59,7 +59,8 @@ def _setup_logging(verbose: bool = False) -> None:
     root.addHandler(fh)
     for lib in ("httpx", "httpcore", "urllib3", "asyncio",
                 "ib_insync.wrapper", "ib_insync.ib", "ib_insync.client",
-                "ib_insync.decoder", "ib_insync.connection"):
+                "ib_insync.decoder", "ib_insync.connection",
+                "yfinance", "peewee"):
         logging.getLogger(lib).setLevel(logging.WARNING)
 
 
@@ -114,6 +115,19 @@ def main() -> None:
         load_dotenv(override=True)
     except Exception as e:
         logger.debug(".env load skipped: %s", e)
+
+    # Force-disable IBKR quote routing in this process. The daemon does NOT
+    # connect to IBKR (only the trader does), so leaving IBKR_QUOTES_ENABLED=1
+    # would cause data_provider.get_quote() to route to a never-connected
+    # IBKR singleton and return None, making signals abstain.  The daemon's
+    # real-time path is MarketData.app (trader plan, not delayed).
+    os.environ["IBKR_QUOTES_ENABLED"] = "0"
+    try:
+        from core import config as _cfg
+        _cfg.IBKR_QUOTES_ENABLED = False
+        logger.info("IBKR quote routing disabled for daemon (MDA is the real-time source)")
+    except Exception as e:
+        logger.warning("Could not override IBKR_QUOTES_ENABLED: %s", e)
 
     print("Research daemon starting (Ctrl+C to stop)\n")
 

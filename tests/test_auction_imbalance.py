@@ -179,17 +179,44 @@ def test_abstains_when_imbalance_missing():
     assert r.components["window"] == "open"
 
 
-def test_abstains_when_adv_zero():
+def test_abstains_when_paired_and_adv_both_zero():
+    """With no paired volume and no ADV we have no denominator at all."""
     r = compute_auction_score(
         auction_imbalance=200_000.0,
-        auction_volume=100_000,
+        auction_volume=0,        # no paired
         auction_price=100.0,
         regulatory_imbalance=None,
-        adv=0.0,
+        adv=0.0,                 # no ADV
         now=_et(2026, 4, 28, 9, 29),
     )
     assert r.score == 0.0 and r.confidence == 0.0
-    assert r.components["abstain"] == "no_adv"
+    assert r.components["abstain"] == "no_paired_or_adv"
+
+
+def test_falls_back_to_adv_when_paired_missing():
+    """When paired_volume is None, denominator should be ADV (with a flag)."""
+    r = compute_auction_score(
+        auction_imbalance=200_000.0,
+        auction_volume=None,
+        auction_price=100.0,
+        regulatory_imbalance=None,
+        adv=10_000_000.0,
+        now=_et(2026, 4, 28, 9, 29),
+    )
+    assert r.components["denominator"] == "adv"
+    assert r.score > 0
+
+
+def test_uses_paired_when_present():
+    r = compute_auction_score(
+        auction_imbalance=200_000.0,
+        auction_volume=500_000,
+        auction_price=100.0,
+        regulatory_imbalance=None,
+        adv=10_000_000.0,
+        now=_et(2026, 4, 28, 9, 29),
+    )
+    assert r.components["denominator"] == "paired"
 
 
 def test_components_dict_keys():
@@ -200,11 +227,15 @@ def test_components_dict_keys():
         regulatory_imbalance=180_000.0,
         adv=10_000_000.0,
         now=_et(2026, 4, 28, 9, 29),
+        mid=100.0,
     )
     assert set(r.components.keys()) == {
         "window", "imbalance_shares", "paired_shares",
-        "imbalance_pct_adv", "auction_price",
-        "regulatory_imbalance", "minutes_to_cross",
+        "imbalance_pct_paired", "denominator",
+        "auction_price", "mid", "dislocation_bps",
+        "regulatory_imbalance", "regulatory_disagrees",
+        "thin_auction", "minutes_to_cross",
+        "imb_component", "dislocation_component",
     }
 
 
@@ -262,3 +293,101 @@ def test_signal_score_wrapper_clamps_and_catches():
     out = sig.score("AAPL", {})  # missing everything
     assert out["score"] == 0.0
     assert out["confidence"] == 0.0
+
+
+# ── Rewrite-specific behaviors ────────────────────────────────────────
+
+def test_dislocation_reinforces_score_when_aligned():
+    """auction_price > mid + positive imbalance → score larger than imbalance alone."""
+    base = dict(
+        auction_imbalance=200_000.0,
+        auction_volume=500_000,
+        regulatory_imbalance=None,
+        adv=10_000_000.0,
+        now=_et(2026, 4, 28, 9, 29),
+    )
+    no_disloc = compute_auction_score(auction_price=100.0, mid=100.0, **base).score
+    with_disloc = compute_auction_score(auction_price=100.5, mid=100.0, **base).score
+    assert with_disloc > no_disloc > 0
+
+
+def test_dislocation_dampens_score_when_opposed():
+    """auction_price < mid + positive imbalance → score should shrink."""
+    base = dict(
+        auction_imbalance=200_000.0,
+        auction_volume=500_000,
+        regulatory_imbalance=None,
+        adv=10_000_000.0,
+        now=_et(2026, 4, 28, 9, 29),
+    )
+    aligned = compute_auction_score(auction_price=100.0, mid=100.0, **base).score
+    opposed = compute_auction_score(auction_price=99.5, mid=100.0, **base).score
+    assert opposed < aligned
+
+
+def test_regulatory_disagree_halves_confidence():
+    """If regulatory_imbalance disagrees in sign, confidence is halved."""
+    base = dict(
+        auction_imbalance=200_000.0,
+        auction_volume=500_000,
+        auction_price=100.0,
+        adv=10_000_000.0,
+        now=_et(2026, 4, 28, 9, 29),
+    )
+    agree = compute_auction_score(regulatory_imbalance=180_000.0, **base)
+    disagree = compute_auction_score(regulatory_imbalance=-180_000.0, **base)
+    assert disagree.confidence == pytest.approx(agree.confidence * 0.5, rel=1e-6)
+    assert disagree.components["regulatory_disagrees"] is True
+    assert agree.components["regulatory_disagrees"] is False
+
+
+def test_thin_auction_halves_confidence():
+    """When paired_volume < 1% of ADV, confidence is halved."""
+    base = dict(
+        auction_imbalance=200_000.0,
+        auction_price=100.0,
+        regulatory_imbalance=None,
+        adv=10_000_000.0,                  # 1% of ADV = 100k
+        now=_et(2026, 4, 28, 9, 29),
+    )
+    thin = compute_auction_score(auction_volume=50_000, **base)        # < 100k → thin
+    healthy = compute_auction_score(auction_volume=500_000, **base)    # ≥ 100k
+    assert thin.components["thin_auction"] is True
+    assert healthy.components["thin_auction"] is False
+    assert thin.confidence < healthy.confidence
+
+
+def test_paired_normalization_more_sensitive_than_adv():
+    """Paired-volume denominator should yield a much larger ratio than ADV."""
+    paired = compute_auction_score(
+        auction_imbalance=200_000.0,
+        auction_volume=500_000,            # ratio = 200k / 700k ≈ 28.6%
+        auction_price=100.0,
+        regulatory_imbalance=None,
+        adv=10_000_000.0,
+        now=_et(2026, 4, 28, 9, 29),
+    )
+    adv_fallback = compute_auction_score(
+        auction_imbalance=200_000.0,
+        auction_volume=None,               # ratio = 200k / 10M = 2%
+        auction_price=100.0,
+        regulatory_imbalance=None,
+        adv=10_000_000.0,
+        now=_et(2026, 4, 28, 9, 29),
+    )
+    assert paired.components["imbalance_pct_paired"] > adv_fallback.components["imbalance_pct_paired"] * 5
+
+
+def test_score_in_bounds():
+    """Score should always be in [-1, 1] even with extreme inputs."""
+    r = compute_auction_score(
+        auction_imbalance=10_000_000.0,
+        auction_volume=1,                  # ratio ≈ 1.0
+        auction_price=200.0,               # 100% dislocation
+        regulatory_imbalance=10_000_000.0,
+        adv=100_000.0,
+        now=_et(2026, 4, 28, 9, 29),
+        mid=100.0,
+    )
+    assert -1.0 <= r.score <= 1.0
+    assert 0.0 <= r.confidence <= 1.0

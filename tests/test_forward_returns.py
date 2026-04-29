@@ -57,10 +57,10 @@ class TestEntryBarKeying:
 
     def test_three_intraday_scores_collapse_to_one_row(self, conn):
         from signals.scorer import _compute_forward_returns
-        import signals.market_momentum  # noqa: F401  (registers signal)
+        import signals.news_sentiment  # noqa: F401  (macro / D / h=1)
         from signals.base import SIGNAL_REGISTRY
 
-        sig = SIGNAL_REGISTRY["market_momentum"]
+        sig = SIGNAL_REGISTRY["news_sentiment"]
         assert sig.return_resolution == "D"
         assert sig.return_horizon == 1
 
@@ -73,7 +73,7 @@ class TestEntryBarKeying:
         for offset, score in [(1000, 1.0), (5000, 0.5), (10000, -0.5)]:
             conn.execute(
                 "INSERT INTO signal_scores VALUES (?, ?, ?, ?)",
-                ("market_momentum", "AAPL", ts[57] + offset, score),
+                ("news_sentiment", "AAPL", ts[57] + offset, score),
             )
         conn.commit()
 
@@ -132,7 +132,7 @@ class TestPerResolutionRouting:
 
     def test_daily_signal_ignored_when_only_subdaily_candles_present(self, conn):
         from signals.scorer import _compute_forward_returns
-        import signals.market_momentum  # noqa: F401  (D, h=1)
+        import signals.news_sentiment  # noqa: F401  (D, h=1)
 
         now = time.time()
         ts = [now - (60 - i) * 86400 for i in range(60)]
@@ -144,7 +144,7 @@ class TestPerResolutionRouting:
 
         conn.execute(
             "INSERT INTO signal_scores VALUES (?, ?, ?, ?)",
-            ("market_momentum", "AAPL", ts[50] + 100, 1.0),
+            ("news_sentiment", "AAPL", ts[50] + 100, 1.0),
         )
         conn.commit()
 
@@ -159,7 +159,7 @@ class TestPruneAndTTL:
 
     def test_orphan_symbol_score_deleted(self, conn):
         from signals.scorer import _compute_forward_returns
-        import signals.market_momentum  # noqa: F401
+        import signals.news_sentiment  # noqa: F401
 
         now = time.time()
         ts = [now - (60 - i) * 86400 for i in range(60)]
@@ -169,7 +169,7 @@ class TestPruneAndTTL:
         # XYZ is not in any candle map → orphan → must be deleted.
         conn.execute(
             "INSERT INTO signal_scores VALUES (?, ?, ?, ?)",
-            ("market_momentum", "XYZ", ts[50] + 100, 1.0),
+            ("news_sentiment", "XYZ", ts[50] + 100, 1.0),
         )
         conn.commit()
 
@@ -182,7 +182,7 @@ class TestPruneAndTTL:
 
     def test_thirty_day_ttl_drops_ancient_scores(self, conn):
         from signals.scorer import _compute_forward_returns
-        import signals.market_momentum  # noqa: F401
+        import signals.news_sentiment  # noqa: F401
 
         now = time.time()
         ts = [now - (60 - i) * 86400 for i in range(60)]
@@ -192,7 +192,7 @@ class TestPruneAndTTL:
         ancient_ts = now - 45 * 86400  # > 30 day cutoff
         conn.execute(
             "INSERT INTO signal_scores VALUES (?, ?, ?, ?)",
-            ("market_momentum", "AAPL", ancient_ts, 1.0),
+            ("news_sentiment", "AAPL", ancient_ts, 1.0),
         )
         conn.commit()
 

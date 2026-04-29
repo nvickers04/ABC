@@ -950,24 +950,30 @@ class TestTradeFeedbackMatching:
 class TestSignalICAttribution:
     """_compute_signal_ic / _log_ic_attribution / _update_ic_retirement."""
 
-    def _seed_paired(self, db, sig_name, ic_target, n=60):
-        """Seed signal_returns for one signal so corr(score, fwd_ret) ≈ ic_target."""
+    def _seed_paired(self, db, sig_name, ic_target, n=60, n_symbols=8):
+        """Seed signal_returns with cross-sectional structure so the
+        per-period IC of (score, fwd_return) across symbols at each ts
+        averages to ``ic_target``.  ``n`` is interpreted as the number
+        of TIMESTAMPS; total rows = n * n_symbols."""
         import sqlite3  # noqa: F401
         rng = np.random.default_rng(123)
         ts_base = time.time() - n * 3600  # recent → inside default 60-day window
-        # score ~ N(0,1); forward_return = ic*score + sqrt(1-ic^2)*noise
-        score = rng.standard_normal(n)
-        noise = rng.standard_normal(n)
-        fwd = ic_target * score + np.sqrt(max(0.0, 1 - ic_target ** 2)) * noise
+        symbols = [f"S{i:02d}" for i in range(n_symbols)]
         for j in range(n):
-            db.execute(
-                "INSERT INTO signal_returns (signal_name, symbol, ts, "
-                "score_at_entry, forward_return, r_value, horizon_bars) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?)",
-                (sig_name, "TEST", ts_base + j * 60,
-                 float(score[j]), float(fwd[j]),
-                 float(score[j] * fwd[j]), 1),
-            )
+            # Cross-sectional draw at this period.
+            score = rng.standard_normal(n_symbols)
+            noise = rng.standard_normal(n_symbols)
+            fwd = ic_target * score + np.sqrt(max(0.0, 1 - ic_target ** 2)) * noise
+            ts = ts_base + j * 3600
+            for k, sym in enumerate(symbols):
+                db.execute(
+                    "INSERT INTO signal_returns (signal_name, symbol, ts, "
+                    "score_at_entry, forward_return, r_value, horizon_bars) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?)",
+                    (sig_name, sym, ts,
+                     float(score[k]), float(fwd[k]),
+                     float(score[k] * fwd[k]), 1),
+                )
         db.commit()
 
     def test_ic_recovers_target_correlation(self, db):
@@ -979,19 +985,22 @@ class TestSignalICAttribution:
 
         ic = _compute_signal_ic(db, ["sig_pos", "sig_neg"], window_days=365)
         assert "sig_pos" in ic and "sig_neg" in ic
-        # Sample IC should be within ~0.22 of the target with n=80.
+        # Sample IC should be within ~0.22 of the target with n=80 periods.
         assert abs(ic["sig_pos"]["ic"] - 0.30) < 0.22
         assert abs(ic["sig_neg"]["ic"] - (-0.20)) < 0.22
         # t-stat sign should match IC sign.
         assert ic["sig_pos"]["t"] > 0
         assert ic["sig_neg"]["t"] < 0
+        # n is now the number of valid PERIODS, not pooled observations.
         assert ic["sig_pos"]["n"] == 80
 
     def test_ic_skips_signals_with_too_few_obs(self, db):
         from signals.combiner import _compute_signal_ic
         db.execute("DELETE FROM signal_returns")
         db.commit()
-        # Only 2 obs — below the hard cutoff of 3 in _compute_signal_ic.
+        # Only 2 rows under one symbol -> 2 single-symbol periods,
+        # neither has the >=3 symbols needed for cross-sectional IC,
+        # so the signal is omitted from the output entirely.
         for j in range(2):
             db.execute(
                 "INSERT INTO signal_returns (signal_name, symbol, ts, "

@@ -61,16 +61,30 @@ def _seed_composite(db, symbol, score, ts=None):
     db.commit()
 
 
-def _seed_signal_returns(db, signal_name, pairs, *, horizon_bars=10):
-    """Seed enough rows for IC computation. ``pairs`` is [(score, ret), ...]."""
+def _seed_signal_returns(db, signal_name, pairs, *, horizon_bars=10, n_periods=4):
+    """Seed enough rows for cross-sectional IC computation.
+
+    ``pairs`` is interpreted as the per-symbol (score, ret) draws for ONE
+    period.  We replicate them across ``n_periods`` synthetic timestamps
+    with tiny noise so each period has the same cross-sectional structure
+    -- enough for ``_compute_signal_ic`` (which needs >=3 symbols/period
+    and >=1 period) to recover a non-zero IC.
+    """
     base_ts = time.time() - 100.0
-    for i, (s, r) in enumerate(pairs):
-        db.execute(
-            "INSERT OR REPLACE INTO signal_returns "
-            "(signal_name, symbol, ts, score_at_entry, forward_return, r_value, horizon_bars) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?)",
-            (signal_name, f"S{i}", base_ts + i, s, r, r, horizon_bars),
-        )
+    for p in range(n_periods):
+        ts = base_ts + p * 60.0
+        for i, (s, r) in enumerate(pairs):
+            # Tiny per-period perturbation keeps cross-sectional rank intact
+            # without making the timestamps degenerate.
+            jitter = 1e-6 * (p + 1)
+            db.execute(
+                "INSERT OR REPLACE INTO signal_returns "
+                "(signal_name, symbol, ts, score_at_entry, forward_return, r_value, horizon_bars) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?)",
+                (signal_name, f"S{i}", ts,
+                 float(s) + jitter, float(r) + jitter,
+                 float(r), horizon_bars),
+            )
     db.commit()
 
 

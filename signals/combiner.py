@@ -635,49 +635,78 @@ def _compute_signal_ic(
     db_conn,
     signal_names: list[str],
     window_days: int = _IC_WINDOW_DAYS,
+    min_symbols_per_period: int = 3,
 ) -> dict[str, dict[str, float]]:
-    """Per-signal IC = Pearson corr(score_at_entry, forward_return).
+    """Per-signal IC via the institutional cross-sectional method.
 
-    Uses all (symbol, ts) observations in the rolling window.  Also
-    returns the IC t-statistic (two-sided) and observation count.
+    For each ``(signal, ts)`` we compute the Pearson correlation of
+    ``score_at_entry`` against ``forward_return`` ACROSS SYMBOLS at
+    that timestamp.  The signal's IC is the *mean* of those per-period
+    correlations.  This matches the procedure described in the article
+    (Part 2/3) and avoids the inflation that pooled (symbol \u00d7 ts)
+    correlations suffer from when within-symbol time-series autocorrelation
+    is mistaken for cross-sectional edge.
 
-    Returns: {signal_name: {"ic": float, "t": float, "n": int}}
-    Signals with no data in the window are omitted.
+    Outputs per signal:
+        ic            mean per-period cross-sectional Pearson correlation
+        t             standard t = IC / SE,  SE = std(IC_t) / sqrt(n_periods)
+        n             number of valid periods that contributed
+                      (each period needs >= ``min_symbols_per_period`` symbols
+                      with non-degenerate score AND return variance)
+
+    Signals that produce a constant value across symbols at every period
+    (e.g. a regime tag) yield zero usable periods and are omitted from
+    the output -- their |IC| is genuinely undefined cross-sectionally.
+
+    Returns: ``{signal_name: {\"ic\": float, \"t\": float, \"n\": int}}``
     """
     cutoff = time.time() - window_days * 86400.0
     placeholders = ",".join("?" * len(signal_names))
     cur = db_conn.execute(
         f"""
-        SELECT signal_name, score_at_entry, forward_return
+        SELECT signal_name, ts, symbol, score_at_entry, forward_return
           FROM signal_returns
          WHERE ts >= ? AND signal_name IN ({placeholders})
         """,
         (cutoff, *signal_names),
     )
 
-    buckets: dict[str, list[tuple[float, float]]] = {}
-    for sig, s, r in cur.fetchall():
-        buckets.setdefault(sig, []).append((float(s), float(r)))
+    # Group: signal -> ts -> [(score, return), ...] across symbols.
+    by_sig: dict[str, dict[float, list[tuple[float, float]]]] = {}
+    for sig, ts, _sym, s, r in cur.fetchall():
+        by_sig.setdefault(sig, {}).setdefault(float(ts), []).append((float(s), float(r)))
 
     out: dict[str, dict[str, float]] = {}
-    for sig, pairs in buckets.items():
-        n = len(pairs)
-        if n < 3:
+    for sig, periods in by_sig.items():
+        per_period_ic: list[float] = []
+        for _ts, pairs in periods.items():
+            if len(pairs) < min_symbols_per_period:
+                continue
+            arr = np.asarray(pairs, dtype=float)
+            s, r = arr[:, 0], arr[:, 1]
+            if float(s.std()) < 1e-12 or float(r.std()) < 1e-12:
+                # Constant-across-symbols at this period contributes
+                # no cross-sectional information; skip rather than
+                # injecting a zero that biases the mean toward 0.
+                continue
+            ic_t = float(np.corrcoef(s, r)[0, 1])
+            if np.isfinite(ic_t):
+                per_period_ic.append(ic_t)
+
+        n = len(per_period_ic)
+        if n < 1:
             continue
-        arr = np.asarray(pairs, dtype=float)
-        s, r = arr[:, 0], arr[:, 1]
-        s_std = float(s.std())
-        r_std = float(r.std())
-        if s_std < 1e-12 or r_std < 1e-12:
-            out[sig] = {"ic": 0.0, "t": 0.0, "n": n}
-            continue
-        ic = float(np.corrcoef(s, r)[0, 1])
-        if not np.isfinite(ic):
-            ic = 0.0
-        # Two-sided t-stat: t = IC * sqrt(n-2) / sqrt(1 - IC^2)
-        denom = max(1e-12, 1.0 - ic * ic)
-        t_stat = float(ic * np.sqrt(max(n - 2, 0)) / np.sqrt(denom))
-        out[sig] = {"ic": ic, "t": t_stat, "n": n}
+        ics = np.asarray(per_period_ic, dtype=float)
+        ic_mean = float(ics.mean())
+        # Standard error of the mean per-period IC.
+        if n >= 2:
+            se = float(ics.std(ddof=1) / np.sqrt(n))
+        else:
+            # Single period: no SE estimate possible; report t=0 so the
+            # signal contributes its IC but earns no statistical trust.
+            se = 0.0
+        t_stat = ic_mean / se if se > 1e-12 else 0.0
+        out[sig] = {"ic": ic_mean, "t": float(t_stat), "n": n}
     return out
 
 

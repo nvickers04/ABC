@@ -1,0 +1,28 @@
+services:
+  postgres:
+    image: postgres:16
+    container_name: abc-postgres
+    restart: unless-stopped
+    ports:
+      - "5432:5432"
+    env_file:
+      - .env
+    environment:
+      POSTGRES_USER: ${POSTGRES_SUPERUSER}
+      POSTGRES_PASSWORD: ${POSTGRES_SUPERPASS}
+      POSTGRES_DB: ${POSTGRES_DB}
+      APP_RESEARCH_USER: ${APP_RESEARCH_USER}
+      APP_RESEARCH_PASSWORD: ${APP_RESEARCH_PASSWORD}
+      APP_TRADER_USER: ${APP_TRADER_USER}
+      APP_TRADER_PASSWORD: ${APP_TRADER_PASSWORD}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./init:/docker-entrypoint-initdb.d
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_SUPERUSER} -d ${POSTGRES_DB}"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+
+volumes:
+  postgres_data:

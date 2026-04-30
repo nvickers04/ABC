@@ -47,7 +47,7 @@ def record_iv_snapshot(
     """Record one daily IV snapshot for a symbol.
 
     Idempotent within the same UTC day: a second call on the same day
-    overwrites the prior snapshot via INSERT OR REPLACE on (symbol, ts)
+    overwrites the prior snapshot via ON CONFLICT(symbol, ts) DO UPDATE,
     where ts is the UTC date as a unix timestamp at midnight.
     """
     if iv_current is None:
@@ -59,8 +59,10 @@ def record_iv_snapshot(
         day_ts = today.timestamp()
         db = get_db()
         db.execute(
-            "INSERT OR REPLACE INTO iv_history (symbol, ts, iv_current, source) "
-            "VALUES (?, ?, ?, ?)",
+            "INSERT INTO iv_history (symbol, ts, iv_current, source) "
+            "VALUES (?, ?, ?, ?) "
+            "ON CONFLICT (symbol, ts) DO UPDATE SET "
+            "iv_current = EXCLUDED.iv_current, source = EXCLUDED.source",
             (symbol.upper(), day_ts, float(iv_current), source),
         )
         db.commit()
@@ -116,7 +118,7 @@ def get_execution_cost(symbol: str | None = None) -> dict:
     If not, returns top-10 symbols by trade count.
     """
     db = get_db()
-    cutoff = "datetime('now', '-30 days')"
+    cutoff = "(NOW() - INTERVAL '30 days')"
     if symbol:
         row = db.execute(
             f"""SELECT symbol,

@@ -172,11 +172,13 @@ class WorkingMemory:
                 cur = self._db.execute(
                     "INSERT INTO working_memory "
                     "(section, entry_text, created_ts, expires_ts, metadata_json) "
-                    "VALUES (?, ?, ?, ?, ?)",
+                    "VALUES (?, ?, ?, ?, ?) "
+                    "RETURNING id",
                     (section, text, ts, expires, json.dumps(meta) if meta else None),
                 )
                 self._db.commit()
-                entry_id = int(cur.lastrowid)
+                row = cur.fetchone()
+                entry_id = int(row["id"]) if row else -int(ts * 1000)
             except Exception as e:
                 logger.debug("working_memory.add persistence failed: %s", e)
                 # Generate a synthetic id so the in-memory store still works

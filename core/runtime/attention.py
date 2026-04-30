@@ -289,6 +289,7 @@ def register_trigger(
             (symbol, condition, threshold, confirm_with_json,
              source_entry_id, source_text, created_ts, state)
         VALUES (?, ?, ?, ?, ?, ?, ?, 'active')
+        RETURNING id
         """,
         (
             sym,
@@ -301,7 +302,8 @@ def register_trigger(
         ),
     )
     conn.commit()
-    new_id = cur.lastrowid
+    row = cur.fetchone()
+    new_id = int(row["id"]) if row else None
     _evict_to_cap(conn)
     return new_id
 

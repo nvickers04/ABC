@@ -4,12 +4,12 @@ This runbook is for the split deployment:
 - **This machine** = research daemon + DB host
 - **Other machine** = trading agent
 
+Detailed host bootstrap commands live in `docs/POSTGRES_HOST_SETUP.md`.
+
 ## Current reality (important)
 
-The codebase currently defaults to local SQLite at `memory/abc.db`.
-That means each machine has its own DB unless/until Postgres support is wired in.
-
-Use this doc to prepare both machines now and complete cutover once shared DB support is enabled.
+The memory layer now targets PostgreSQL only.
+Both machines must point at the same Postgres DB to share research/trading state.
 
 ## Host machine (today)
 
@@ -21,6 +21,7 @@ Use this doc to prepare both machines now and complete cutover once shared DB su
 
 ### 2) Keep research running with current code
 - Pull latest repo changes
+- Set Postgres environment variables (`DATABASE_URL` or `PG*` vars)
 - Start your research daemon as normal
 - Confirm signal pipeline is live (IC logs, composite updates)
 
@@ -50,7 +51,7 @@ Use this doc to prepare both machines now and complete cutover once shared DB su
   - `git log --oneline -1`
 
 ### 3) Validate runtime before shared DB cutover
-- Start trader with local SQLite once to confirm environment health
+- Start trader once against shared Postgres to confirm environment health
 - Stop it after sanity check
 
 ## Shared DB cutover phases
@@ -63,9 +64,8 @@ Use this doc to prepare both machines now and complete cutover once shared DB su
 - Restrict inbound DB access to trader machine Tailscale IP
 
 ### Phase B: App support
-- Add Postgres backend support in memory layer
-- Keep SQLite fallback for local testing
-- Run schema/init against Postgres
+- Ensure Postgres env vars are set on both machines
+- Run app startup once to apply schema/init against Postgres
 
 ### Phase C: Data migration + switch
 - Export/import relevant SQLite tables into Postgres

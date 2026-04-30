@@ -10,41 +10,264 @@ strategies, slot_environment_scores) have been retired and are no
 longer created on fresh DBs.
 """
 
-import sqlite3
 import logging
+import os
+import re
 from datetime import datetime, timezone
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
+import psycopg
+from psycopg.rows import dict_row
+
 logger = logging.getLogger(__name__)
 
 _DB_PATH = Path(__file__).parent / "abc.db"
-_connection: sqlite3.Connection | None = None
+_connection = None
 
 
-def _ensure_column(conn: sqlite3.Connection, table: str, col: str, col_type: str) -> None:
+class _CompatRow(dict):
+    """Row wrapper that supports both dict and positional indexing."""
+
+    def __init__(self, row_dict: dict):
+        super().__init__(row_dict)
+        self._ordered_values = list(row_dict.values())
+
+    def __getitem__(self, key):
+        if isinstance(key, int):
+            return self._ordered_values[key]
+        return super().__getitem__(key)
+
+
+class _CompatCursor:
+    def __init__(self, cursor, lastrowid=None):
+        self._cursor = cursor
+        self.lastrowid = lastrowid if lastrowid is not None else getattr(cursor, "lastrowid", None)
+
+    def fetchone(self):
+        row = self._cursor.fetchone()
+        if row is None:
+            return None
+        return _CompatRow(dict(row))
+
+    def fetchall(self):
+        rows = self._cursor.fetchall()
+        return [_CompatRow(dict(r)) for r in rows]
+
+
+class _CompatConnection:
+    def __init__(self, conn):
+        self._conn = conn
+
+    def _adapt_sql(self, sql: str) -> str:
+        sql = self._rewrite_insert_or_replace(sql)
+        sql = sql.replace("?", "%s")
+        sql = re.sub(
+            r"datetime\('now',\s*'-([0-9]+)\s+days'\)",
+            r"(NOW() - INTERVAL '\1 days')",
+            sql,
+            flags=re.IGNORECASE,
+        )
+        return sql
+
+    def _rewrite_insert_or_replace(self, sql: str) -> str:
+        conflict_keys = {
+            "signal_scores": ["signal_name", "symbol", "ts"],
+            "signal_weights": ["signal_name"],
+            "signal_returns": ["signal_name", "symbol", "ts"],
+            "composite_scores": ["symbol", "ts"],
+            "template_performance": ["template_name", "regime_key", "composite_bucket"],
+            "template_boundaries": ["template_name", "param_name"],
+            "template_recommendations": ["symbol", "ts"],
+            "iv_history": ["symbol", "ts"],
+            "signal_symbol_ic": ["signal_name", "symbol", "horizon_bars"],
+            "latest_quotes": ["symbol"],
+            "research_config": ["key"],
+            "calibrated_slippage": ["order_type", "time_bucket", "atr_bucket"],
+        }
+        match = re.match(
+            r"^\s*INSERT\s+OR\s+REPLACE\s+INTO\s+([a-zA-Z_][a-zA-Z0-9_]*)\s*"
+            r"\(([^)]+)\)\s*VALUES\s*\((.*)\)\s*;?\s*$",
+            sql,
+            flags=re.IGNORECASE | re.DOTALL,
+        )
+        if not match:
+            return sql
+        table = match.group(1)
+        columns_raw = match.group(2)
+        values_expr = match.group(3)
+        key_cols = conflict_keys.get(table.lower())
+        if not key_cols:
+            return sql
+        columns = [c.strip() for c in columns_raw.split(",")]
+        update_cols = [c for c in columns if c not in key_cols]
+        if update_cols:
+            updates = ", ".join(f"{c} = EXCLUDED.{c}" for c in update_cols)
+            action = f"DO UPDATE SET {updates}"
+        else:
+            action = "DO NOTHING"
+        keys = ", ".join(key_cols)
+        return (
+            f"INSERT INTO {table} ({columns_raw}) VALUES ({values_expr}) "
+            f"ON CONFLICT ({keys}) {action}"
+        )
+
+    def _adapt_schema_sql(self, sql: str) -> str:
+        # SQLite -> PostgreSQL schema compatibility transforms.
+        sql = re.sub(
+            r"\bINTEGER\s+PRIMARY\s+KEY\s+AUTOINCREMENT\b",
+            "BIGSERIAL PRIMARY KEY",
+            sql,
+            flags=re.IGNORECASE,
+        )
+        # Legacy FKs reference old tables that may not exist in fresh DBs.
+        # Keep FK clauses, but ensure placeholder parent tables exist.
+        bootstrap = (
+            "CREATE TABLE IF NOT EXISTS strategies (id BIGINT PRIMARY KEY);\n"
+            "CREATE TABLE IF NOT EXISTS signals (id BIGINT PRIMARY KEY);\n"
+        )
+        return bootstrap + sql
+
+    def execute(self, sql: str, params=None):
+        cur = self._conn.cursor(row_factory=dict_row)
+        adapted = self._adapt_sql(sql)
+        if params is None:
+            cur.execute(adapted)
+        else:
+            cur.execute(adapted, params)
+        return _CompatCursor(cur)
+
+    def executescript(self, sql: str):
+        script = self._adapt_schema_sql(sql)
+        statements = self._split_sql_statements(script)
+        with self._conn.cursor() as cur:
+            for stmt in statements:
+                cur.execute(stmt)
+
+    def commit(self):
+        self._conn.commit()
+
+    def close(self):
+        self._conn.close()
+
+    def _split_sql_statements(self, script: str) -> list[str]:
+        statements: list[str] = []
+        buf: list[str] = []
+        in_single = False
+        in_double = False
+        in_line_comment = False
+        in_block_comment = False
+        i = 0
+        while i < len(script):
+            ch = script[i]
+            nxt = script[i + 1] if i + 1 < len(script) else ""
+            if in_line_comment:
+                buf.append(ch)
+                if ch == "\n":
+                    in_line_comment = False
+                i += 1
+                continue
+            if in_block_comment:
+                buf.append(ch)
+                if ch == "*" and nxt == "/":
+                    buf.append(nxt)
+                    in_block_comment = False
+                    i += 2
+                    continue
+                i += 1
+                continue
+            if not in_single and not in_double and ch == "-" and nxt == "-":
+                in_line_comment = True
+                buf.append(ch)
+                buf.append(nxt)
+                i += 2
+                continue
+            if not in_single and not in_double and ch == "/" and nxt == "*":
+                in_block_comment = True
+                buf.append(ch)
+                buf.append(nxt)
+                i += 2
+                continue
+            if ch == "'" and not in_double:
+                in_single = not in_single
+                buf.append(ch)
+                i += 1
+                continue
+            if ch == '"' and not in_single:
+                in_double = not in_double
+                buf.append(ch)
+                i += 1
+                continue
+            if ch == ";" and not in_single and not in_double:
+                stmt = "".join(buf).strip()
+                if stmt:
+                    statements.append(stmt)
+                buf = []
+                i += 1
+                continue
+            buf.append(ch)
+            i += 1
+        tail = "".join(buf).strip()
+        if tail:
+            statements.append(tail)
+        return statements
+
+
+def _resolve_postgres_dsn() -> str:
+    dsn = os.getenv("DATABASE_URL", "").strip()
+    if dsn:
+        return dsn
+    host = os.getenv("PGHOST", "").strip()
+    port = os.getenv("PGPORT", "5432").strip()
+    dbname = os.getenv("PGDATABASE", "").strip()
+    user = os.getenv("PGUSER", "").strip()
+    password = os.getenv("PGPASSWORD", "").strip()
+    if all([host, dbname, user, password]):
+        return f"postgresql://{user}:{password}@{host}:{port}/{dbname}"
+    raise RuntimeError(
+        "PostgreSQL is required. Set DATABASE_URL or PGHOST/PGPORT/PGDATABASE/PGUSER/PGPASSWORD."
+    )
+
+
+def _ensure_column(conn, table: str, col: str, col_type: str) -> None:
     """Helper to idempotently add a column if it doesn't exist (simplifies migrations)."""
+    table_exists = conn.execute(
+        "SELECT 1 FROM information_schema.tables "
+        "WHERE table_schema = 'public' AND table_name = ?",
+        (table,),
+    ).fetchone()
+    if not table_exists:
+        return
+    row = conn.execute(
+        "SELECT 1 FROM information_schema.columns "
+        "WHERE table_schema = 'public' AND table_name = ? AND column_name = ?",
+        (table, col),
+    ).fetchone()
+    if row:
+        return
     try:
-        conn.execute(f"SELECT {col} FROM {table} LIMIT 1")
-    except sqlite3.OperationalError:
-        try:
-            conn.execute(f"ALTER TABLE {table} ADD COLUMN {col} {col_type}")
-        except sqlite3.OperationalError:
-            pass
+        conn.execute(f"ALTER TABLE {table} ADD COLUMN {col} {col_type}")
+    except Exception:
+        pass
 
 
-def init_db() -> sqlite3.Connection:
-    """Initialize the database, create tables if missing, return connection."""
+def _table_exists(conn, table: str) -> bool:
+    row = conn.execute(
+        "SELECT 1 FROM information_schema.tables "
+        "WHERE table_schema = 'public' AND table_name = ?",
+        (table,),
+    ).fetchone()
+    return bool(row)
+
+
+def init_db():
+    """Initialize PostgreSQL connection and schema, return connection."""
     global _connection
     if _connection is not None:
         return _connection
 
-    _DB_PATH.parent.mkdir(parents=True, exist_ok=True)
-    conn = sqlite3.connect(str(_DB_PATH), check_same_thread=False)
-    conn.row_factory = sqlite3.Row
-    conn.execute("PRAGMA journal_mode=WAL")
-    conn.execute("PRAGMA busy_timeout=5000")
-    conn.execute("PRAGMA wal_autocheckpoint=1000")
+    raw_conn = psycopg.connect(_resolve_postgres_dsn(), autocommit=False)
+    conn = _CompatConnection(raw_conn)
 
     conn.executescript("""
         -- Closed-trade ledger (the legacy `signals` FK is kept for back-compat;
@@ -470,7 +693,7 @@ def init_db() -> sqlite3.Connection:
 
     conn.commit()
     _connection = conn
-    logger.info(f"Memory DB initialized: {_DB_PATH}")
+    logger.info("Memory DB initialized on PostgreSQL")
     return conn
 
 
@@ -483,17 +706,15 @@ def init_db() -> sqlite3.Connection:
 SCHEMA_VERSION = 2
 
 
-def _migration_v2_reset_forward_return_pipeline(conn: sqlite3.Connection) -> None:
+def _migration_v2_reset_forward_return_pipeline(conn) -> None:
     """Phase D (2026-04-20) changed signal_returns keying from score_ts
     to entry_bar_ts.  Existing rows mix the two semantics and re-inflate
     IC; drop them.  Also drop signal_scores so the 30d TTL doesn't have
     to grind through pre-fix timestamps.  composite_scores is derived
     and safe to clear."""
     for tbl in ("signal_returns", "signal_scores", "composite_scores"):
-        try:
+        if _table_exists(conn, tbl):
             conn.execute(f"DELETE FROM {tbl}")
-        except sqlite3.OperationalError:
-            pass  # table may not exist on very old DBs
 
 
 _MIGRATIONS: list[tuple[int, str, callable]] = [
@@ -502,7 +723,7 @@ _MIGRATIONS: list[tuple[int, str, callable]] = [
 ]
 
 
-def _apply_schema_migrations(conn: sqlite3.Connection) -> None:
+def _apply_schema_migrations(conn) -> None:
     conn.execute(
         "CREATE TABLE IF NOT EXISTS schema_version ("
         "version INTEGER PRIMARY KEY, applied_ts REAL NOT NULL, description TEXT)"
@@ -517,9 +738,9 @@ def _apply_schema_migrations(conn: sqlite3.Connection) -> None:
     if current > SCHEMA_VERSION:
         raise RuntimeError(
             f"Database schema version {current} is newer than this build "
-            f"supports (max={SCHEMA_VERSION}). The DB at {_DB_PATH} was "
-            f"likely written by a newer build of the bot. Either upgrade "
-            f"the code or restore a DB backup that matches this version."
+            f"supports (max={SCHEMA_VERSION}). The database was likely "
+            f"written by a newer build of the bot. Either upgrade the code "
+            f"or restore a DB backup that matches this version."
         )
 
     if current >= SCHEMA_VERSION:
@@ -538,19 +759,19 @@ def _apply_schema_migrations(conn: sqlite3.Connection) -> None:
     logger.info("Schema at version %d (was %d)", SCHEMA_VERSION, current)
 
 
-def get_db() -> sqlite3.Connection:
+def get_db():
     """Get the database connection, initializing if needed."""
     if _connection is None:
         return init_db()
     return _connection
 
 
-def get_schema_version(conn: sqlite3.Connection | None = None) -> int:
+def get_schema_version(conn=None) -> int:
     """Return the current schema version stamped in the DB (1 for legacy)."""
     db = conn if conn is not None else get_db()
     try:
         row = db.execute("SELECT MAX(version) FROM schema_version").fetchone()
-    except sqlite3.OperationalError:
+    except Exception:
         return 1
     return int(row[0]) if row and row[0] is not None else 1
 
@@ -691,7 +912,8 @@ def record_trade(
         db = get_db()
         cur = db.execute(
             """INSERT INTO trades (ts, symbol, side, pnl, signal_id, held_minutes)
-               VALUES (?, ?, ?, ?, ?, ?)""",
+               VALUES (?, ?, ?, ?, ?, ?)
+               RETURNING id""",
             (
                 datetime.now(timezone.utc).isoformat(),
                 symbol.upper(),
@@ -702,7 +924,8 @@ def record_trade(
             ),
         )
         db.commit()
-        trade_id = cur.lastrowid
+        row = cur.fetchone()
+        trade_id = int(row["id"]) if row else None
         logger.info(f"Trade recorded: {symbol} {side} pnl=${pnl:.2f} id={trade_id}")
 
         # Immediately try to match this trade to a signal for feedback
@@ -988,7 +1211,8 @@ def insert_execution_snapshot(
                 bid_at_submit, ask_at_submit, mid_at_submit, spread_at_submit,
                 volume_at_submit, atr_at_submit,
                 time_bucket, atr_bucket, graduated_param_id, status)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'submitted')""",
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'submitted')
+               RETURNING id""",
             (
                 ts, symbol, side, quantity, order_type, intent,
                 bid, ask, mid, spread,
@@ -998,7 +1222,8 @@ def insert_execution_snapshot(
             ),
         )
         db.commit()
-        return cur.lastrowid
+        row = cur.fetchone()
+        return int(row["id"]) if row else None
     except Exception as e:
         logger.warning(f"Failed to insert execution snapshot: {e}")
         return None

@@ -127,7 +127,8 @@ def insert_graduated_param(
             """INSERT INTO graduated_params
                (ts, param_key, param_value, previous_value, evidence_json,
                 snapshots_analyzed, improvement_bps, p_value, active)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1)""",
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1)
+               RETURNING id""",
             (
                 datetime.now(timezone.utc).isoformat(),
                 param_key, param_value, previous_value, evidence_json,
@@ -135,7 +136,8 @@ def insert_graduated_param(
             ),
         )
         db.commit()
-        return cur.lastrowid
+        row = cur.fetchone()
+        return int(row["id"]) if row else None
     except Exception as e:
         logger.warning(f"Failed to insert graduated param: {e}")
         return None

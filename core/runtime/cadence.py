@@ -7,40 +7,54 @@ so it's trivially testable and can run in any process.
 
 Tiers (Mon–Fri only; weekends always overnight):
 
-    * Regular hours      09:30 – 16:00 ET   →  10s
-    * Active extended    07:00 – 09:30 ET   →  30s
-                         16:00 – 18:00 ET   →  30s
-    * Quiet extended     04:00 – 07:00 ET   →  300s
-                         18:00 – 20:00 ET   →  300s
-    * Overnight          20:00 – 04:00 ET   →  1800s  (30 min)
-    * Weekend            anytime Sat/Sun    →  1800s
+    * Regular hours      09:30 – 16:00 ET   →   60s
+    * Active extended    07:00 – 09:30 ET   →  180s
+                         16:00 – 18:00 ET   →  180s
+    * Quiet extended     04:00 – 07:00 ET   →  900s   (15 min)
+                         18:00 – 20:00 ET   →  900s
+    * Overnight          20:00 – 04:00 ET   → 3600s   (60 min)
+    * Weekend            anytime Sat/Sun    → 3600s
 
 Why these numbers — credit-budget reasoning
 -------------------------------------------
-A scoring round burns ~120 MarketData credits and takes ~65s wall-clock
-end-to-end (Tier 1 + Tier 2 + Tier 3).  Effective cycle ≈ cadence + 65s.
+A productive scoring round burns ~120 MarketData credits and the wall-clock
+is dominated by Tier 2 option-chain fetches (2,000–5,000 cr/symbol when
+chains are wide). Effective cycle ≈ cadence + ~30s round.
 
-The MDA Trader plan budget is 100,000 credits/day.  With trader uptime
-~07:00–20:00 ET (13h), this allocation keeps us under budget while
-maximising freshness when the trader is most active:
+The MDA Trader plan budget is 100,000 credits/day. The earlier 10/30/300/1800
+schedule produced ~900 rounds/day on this universe and exhausted the daily
+quota by mid-morning.  The current schedule keeps regular hours fastest while
+dramatically reducing pre-/post-market and overnight rounds where price
+discovery is thin:
 
-    REGULAR          6.5h  ×  ~46 rounds/h  ×  120 cr  ≈  35,900 cr
-    ACTIVE_EXTENDED  4.5h  ×  ~38 rounds/h  ×  120 cr  ≈  20,500 cr
-    QUIET_EXTENDED   5.0h  ×  ~10 rounds/h  ×  120 cr  ≈   6,000 cr
-    OVERNIGHT        8.0h  ×  ~ 2 rounds/h  ×  120 cr  ≈   1,900 cr
+    REGULAR          6.5h  ×  ~40 rounds/h  ×  120 cr  ≈  31,200 cr
+    ACTIVE_EXTENDED  4.5h  ×  ~17 rounds/h  ×  120 cr  ≈   9,200 cr
+    QUIET_EXTENDED   5.0h  ×  ~ 4 rounds/h  ×  120 cr  ≈   2,400 cr
+    OVERNIGHT        8.0h  ×  ~ 1 rounds/h  ×  120 cr  ≈     960 cr
     -------------------------------------------------------------
-    Total                                              ≈  64,300 cr
+    Total                                              ≈  43,800 cr
 
-That leaves ~35k credits of headroom for credit spikes (universe growth,
-larger option chains, retry storms).  The MDA client's circuit breaker
-short-circuits all calls once credits hit zero, so going over still
-fails safe — but planning under headroom lets us avoid that path.
+That leaves ~56k credits of headroom for option-chain spikes (the dominant
+real-world cost), retry storms, and universe growth. The adaptive pacing
+layer (`core/runtime/mda_budget.py`) further stretches sleeps 2x/4x and skips
+sub-daily candle bundles when API headers show remaining credits dropping
+below configured fractions; the MDA client's circuit breaker is the final
+backstop once credits hit zero.
 
-Adaptive pacing (see ``core/runtime/mda_budget.py``): when API headers show
-remaining credits below configured fractions of the daily limit, the scorer
-multiplies this sleep interval (2x / 4x) and can skip sub-daily OHLCV bundles
-to shed ~75 calls per round at ``n=25``. Snapshot keys ``mda_*`` in
-``research_config`` expose live counters for dashboards.
+Effect on research horizons
+---------------------------
+Information-coefficient estimation needs samples spaced roughly the length
+of the forward-return horizon to be statistically independent. Sampling
+faster produces highly autocorrelated samples that the combiner already
+discounts via its ``n_eff`` reduction.  At the previous 10s regular cadence
+a ``1min/h=30`` (30-minute) horizon collected ~180 redundant samples per
+window; at the new 60s cadence we still collect ~30 samples per window —
+plenty for IC stability — and longer horizons (``1h/h=4``, ``1h/h=24``,
+``D/h=3``) are completely unaffected because their windows already span
+many rounds at any cadence in this range.
+
+Snapshot keys ``mda_*`` in ``research_config`` expose live counters for
+dashboards.
 
 Why these tiers map to real signal value
 ----------------------------------------
@@ -86,10 +100,12 @@ _ACTIVE_POSTMARKET_CLOSE = time(18, 0)
 _QUIET_POSTMARKET_CLOSE = time(20, 0)
 
 # Cadence values (seconds).  See module docstring for budget reasoning.
-CADENCE_REGULAR_S: int = 10
-CADENCE_ACTIVE_EXTENDED_S: int = 30
-CADENCE_QUIET_EXTENDED_S: int = 5 * 60
-CADENCE_OVERNIGHT_S: int = 30 * 60
+# Tuned 2026-04-30 after MDA quota exhaustion — old values
+# (10/30/300/1800) produced ~900 rounds/day and burned 100k credits.
+CADENCE_REGULAR_S: int = 60
+CADENCE_ACTIVE_EXTENDED_S: int = 180
+CADENCE_QUIET_EXTENDED_S: int = 15 * 60
+CADENCE_OVERNIGHT_S: int = 60 * 60
 
 # Backward-compatibility alias — older code (and the heartbeat staleness
 # threshold) imported CADENCE_EXTENDED_S; map it to the active tier so
@@ -149,10 +165,10 @@ def cadence_seconds(dt: Optional[datetime] = None) -> int:
 #
 # Effective base freshness  = N × (round_wallclock + cadence_seconds)
 #
-# During regular hours: round ~65s + 10s sleep ≈ 75s, N=3 ⇒ base every
-# ~225s (~3.75 min).  Focus stays at ~75s freshness.  This is the right
-# trade: a held position deserves 75s freshness; AVGO sitting in the
-# base universe with no trader interest can wait 4 minutes.
+# During regular hours: round ~30s + 60s sleep ≈ 90s, N=3 ⇒ base every
+# ~270s (~4.5 min).  Focus stays at ~90s freshness.  This is the right
+# trade: a held position deserves sub-2-minute freshness; AVGO sitting in
+# the base universe with no trader interest can wait 4-5 minutes.
 #
 # Outside regular hours we run base every round — the cadence sleep is
 # already long enough that there's no credit win from skipping it, and

@@ -39,9 +39,15 @@ Use this doc to prepare both machines now and complete cutover once shared DB su
 - Tailscale
 - Git + Python environment for this repo
 
-### 2) Pull code
-- `git pull`
-- Confirm branch is up to date with `main`
+### 2) Sync repo safely (required if history was rewritten)
+- If you have local uncommitted work, stash it first:
+  - `git stash push -m "pre-main-sync"`
+- Then hard-sync to remote `main`:
+  - `git fetch origin`
+  - `git checkout main`
+  - `git reset --hard origin/main`
+- Confirm latest commit:
+  - `git log --oneline -1`
 
 ### 3) Validate runtime before shared DB cutover
 - Start trader with local SQLite once to confirm environment health
@@ -76,7 +82,7 @@ Use this doc to prepare both machines now and complete cutover once shared DB su
 ## Tomorrow quick checklist (copy/paste)
 - [ ] Install Docker Desktop on trader machine
 - [ ] Install Tailscale on trader machine
-- [ ] `git pull` on trader machine
+- [ ] `git fetch origin && git checkout main && git reset --hard origin/main`
 - [ ] Verify local startup on trader machine
 - [ ] Confirm host and trader can reach each other over Tailscale
 - [ ] Proceed with Postgres setup + code cutover

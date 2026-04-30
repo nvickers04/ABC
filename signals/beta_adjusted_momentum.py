@@ -1,6 +1,7 @@
 """Signal 6: Beta-adjusted momentum — idiosyncratic alpha vs SPY."""
 
 import numpy as np
+from signals.formula_utils import bounded_tanh, confidence_from_strength, safe_pct_change
 from signals.base import Signal, SignalResult
 
 
@@ -32,14 +33,14 @@ class BetaAdjustedMomentumSignal(Signal):
         spy_returns_20 = 0.0
         if spy_candles is not None and len(spy_candles) >= 25:
             spy_close = np.array(spy_candles.close, dtype=float)
-            spy_returns_5 = (spy_close[-1] - spy_close[-6]) / spy_close[-6]
-            spy_returns_10 = (spy_close[-1] - spy_close[-11]) / spy_close[-11]
-            spy_returns_20 = (spy_close[-1] - spy_close[-21]) / spy_close[-21] if len(spy_close) > 20 else spy_returns_10
+            spy_returns_5 = safe_pct_change(spy_close[-1], spy_close[-6])
+            spy_returns_10 = safe_pct_change(spy_close[-1], spy_close[-11])
+            spy_returns_20 = safe_pct_change(spy_close[-1], spy_close[-21]) if len(spy_close) > 20 else spy_returns_10
 
         # Symbol returns
-        returns_5 = (close[-1] - close[-6]) / close[-6] if len(close) > 5 else 0
-        returns_10 = (close[-1] - close[-11]) / close[-11] if len(close) > 10 else 0
-        returns_20 = (close[-1] - close[-21]) / close[-21] if len(close) > 20 else returns_10
+        returns_5 = safe_pct_change(close[-1], close[-6]) if len(close) > 5 else 0.0
+        returns_10 = safe_pct_change(close[-1], close[-11]) if len(close) > 10 else 0.0
+        returns_20 = safe_pct_change(close[-1], close[-21]) if len(close) > 20 else returns_10
 
         # Alpha = symbol return minus (beta x SPY return)
         alpha_5 = returns_5 - beta * spy_returns_5
@@ -48,9 +49,9 @@ class BetaAdjustedMomentumSignal(Signal):
 
         # Weighted average alpha
         avg_alpha = alpha_5 * 0.5 + alpha_10 * 0.3 + alpha_20 * 0.2
-        score = np.clip(avg_alpha * 20, -1, 1)
-
-        confidence = min(1.0, abs(avg_alpha) * 30)
+        score = bounded_tanh(avg_alpha, scale=18.0)
+        data_quality = min(1.0, len(close) / 90.0) * (1.0 if spy_candles is not None else 0.6)
+        confidence = confidence_from_strength(abs(score), data_quality=data_quality)
 
         return SignalResult(
             score=float(score),

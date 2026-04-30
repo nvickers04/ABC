@@ -1,6 +1,7 @@
 """Signal 12: Support/resistance proximity — distance to swing high/low."""
 
 import numpy as np
+from signals.formula_utils import bounded_tanh, confidence_from_strength, rolling_atr
 from signals.base import Signal, SignalResult
 
 
@@ -41,11 +42,9 @@ class SupportResistanceSignal(Signal):
         price = close[-1]
 
         # ATR for distance normalization
-        tr = np.maximum(
-            high[1:] - low[1:],
-            np.maximum(np.abs(high[1:] - close[:-1]), np.abs(low[1:] - close[:-1])),
-        )
-        atr = np.mean(tr[-14:]) if len(tr) >= 14 else np.mean(tr) if len(tr) > 0 else 1e-9
+        atr = rolling_atr(high, low, close, period=14)
+        if atr <= 0:
+            return SignalResult(0.0, 0.0, {"error": "invalid ATR"})
 
         # Find nearest support and resistance
         swing_highs = _find_swing_highs(high[-30:])
@@ -66,13 +65,17 @@ class SupportResistanceSignal(Signal):
         # Score: near support = bullish (bounce), near resistance = bearish
         if dist_to_support < dist_to_resistance:
             # Closer to support = bullish
-            score = np.clip(1.0 - dist_to_support / 2.0, 0, 1)
+            score = bounded_tanh(1.2 - dist_to_support, scale=1.1)
         else:
             # Closer to resistance = bearish
-            score = np.clip(-(1.0 - dist_to_resistance / 2.0), -1, 0)
+            score = -bounded_tanh(1.2 - dist_to_resistance, scale=1.1)
 
         min_dist = min(dist_to_support, dist_to_resistance)
-        confidence = min(1.0, max(0.0, 1.0 - min_dist / 3.0))
+        data_quality = min(1.0, len(close) / 90.0)
+        confidence = confidence_from_strength(
+            abs(score),
+            data_quality=data_quality * max(0.0, 1.0 - min_dist / 3.0),
+        )
 
         return SignalResult(
             score=float(score),

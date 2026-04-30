@@ -1,6 +1,7 @@
 """Signal 19: Realized vol percentile — current 20-day RV vs historical RV distribution."""
 
 import numpy as np
+from signals.formula_utils import bounded_tanh, confidence_from_strength
 from signals.base import Signal, SignalResult
 
 
@@ -41,10 +42,9 @@ class RealizedVolConeSignal(Signal):
 
         # Low RV = calm, options cheap for buyers (+1)
         # High RV = volatile, risky (-1)
-        score = -(rv_percentile - 50) / 50  # Inverted: low percentile = bullish
-        score = np.clip(score, -1, 1)
-
-        confidence = min(1.0, abs(rv_percentile - 50) / 30)
+        score = bounded_tanh(-(rv_percentile - 50) / 50.0, scale=1.4)
+        history_quality = min(1.0, len(rv_history) / 120.0)
+        confidence = confidence_from_strength(abs(score), data_quality=history_quality)
 
         return SignalResult(
             score=float(score),

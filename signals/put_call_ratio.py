@@ -1,6 +1,7 @@
 """Signal 22: Put/call ratio — contrarian indicator from OI ratio."""
 
 import numpy as np
+from signals.formula_utils import bounded_tanh, confidence_from_strength
 from signals.base import Signal, SignalResult
 
 
@@ -27,14 +28,10 @@ class PutCallRatioSignal(Signal):
 
         # Contrarian: extreme put/call = oversold (bullish), extreme call/put = overbought
         # Normal range: 0.7-1.3. Below 0.5 = extreme call = overbought. Above 1.5 = extreme put = oversold
-        if pc_ratio > 1.5:
-            score = min(1.0, (pc_ratio - 1.0) / 1.0)  # Contrarian bullish
-        elif pc_ratio < 0.5:
-            score = max(-1.0, -(1.0 - pc_ratio) / 0.5)  # Contrarian bearish
-        else:
-            score = (pc_ratio - 1.0) * 0.5  # Mild signal in normal range
-
-        confidence = min(1.0, abs(pc_ratio - 1.0) / 0.8)
+        # Contrarian mapping around neutral ratio=1.
+        score = bounded_tanh((pc_ratio - 1.0), scale=1.6)
+        depth = min((total_put_oi + total_call_oi) / 50_000.0, 1.0)
+        confidence = confidence_from_strength(abs(score), data_quality=depth)
 
         return SignalResult(
             score=float(score),

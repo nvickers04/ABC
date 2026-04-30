@@ -1,6 +1,7 @@
 """Signal 49: Volume clock — intraday volume acceleration vs expected profile."""
 
 import numpy as np
+from signals.formula_utils import bounded_tanh, confidence_from_strength
 from signals.base import Signal, SignalResult
 
 
@@ -39,6 +40,7 @@ class VolumeClockSignal(Signal):
         avg_daily_vol = np.mean(hist_vols)
         components["current_volume"] = int(current_vol)
         components["avg_daily_volume"] = int(avg_daily_vol)
+        components["mode"] = "proxy_intraday_participation"
 
         # Volume ratio: current vs average full-day volume
         vol_ratio = current_vol / max(avg_daily_vol, 1)
@@ -46,16 +48,7 @@ class VolumeClockSignal(Signal):
 
         # When current volume already exceeds daily average, there's conviction
         # When volume is lagging, it's a quiet/uninterested day
-        if vol_ratio >= 2.0:
-            score = 1.0  # Very strong conviction day
-        elif vol_ratio >= 1.0:
-            score = 0.5  # Already at full-day volume before close
-        elif vol_ratio >= 0.5:
-            score = 0.0  # On pace — neutral
-        elif vol_ratio >= 0.2:
-            score = -0.3  # Lagging
-        else:
-            score = -0.7  # Very low interest
+        score = bounded_tanh(vol_ratio - 0.8, scale=1.2)
 
         # Compare recent volume trend
         if len(hist_vols) >= 10:
@@ -65,11 +58,14 @@ class VolumeClockSignal(Signal):
             components["vol_trend_5d"] = float(round(vol_trend * 100, 1))
             # Rising volume trend is bullish confirmation
             if vol_trend > 0.2:
-                score = min(1.0, score + 0.2)
+                score = min(1.0, score + 0.15)
             elif vol_trend < -0.2:
-                score = max(-1.0, score - 0.2)
+                score = max(-1.0, score - 0.15)
 
-        confidence = min(1.0, abs(score) * 0.8 + 0.3)
+        confidence = confidence_from_strength(
+            abs(score),
+            data_quality=min(1.0, len(hist_vols) / 12.0),
+        )
 
         return SignalResult(
             score=float(np.clip(score, -1, 1)),

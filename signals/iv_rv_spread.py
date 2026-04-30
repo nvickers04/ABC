@@ -1,6 +1,7 @@
 """Signal 14: IV vs realized vol spread — options overpriced/underpriced."""
 
 import numpy as np
+from signals.formula_utils import bounded_tanh, confidence_from_strength
 from signals.base import Signal, SignalResult
 
 
@@ -33,9 +34,9 @@ class IVRVSpreadSignal(Signal):
 
         # Positive spread = options overpriced (sell premium edge)
         # Negative spread = options underpriced (buy options edge)
-        score = np.clip(spread / 20, -1, 1)  # 20% spread = max
-
-        confidence = min(1.0, abs(spread) / 15.0)
+        score = bounded_tanh(spread, scale=0.08)
+        data_quality = min(1.0, len(candles_daily) / 120.0) if candles_daily is not None else 0.0
+        confidence = confidence_from_strength(abs(score), data_quality=data_quality)
 
         return SignalResult(
             score=float(score),

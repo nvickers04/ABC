@@ -1,6 +1,7 @@
 """Signal 17: IV term structure — front-month vs second-month IV."""
 
 import numpy as np
+from signals.formula_utils import bounded_tanh, confidence_from_strength
 from signals.base import Signal, SignalResult
 
 
@@ -47,11 +48,13 @@ class TermStructureSignal(Signal):
         # Contango: back > front (normal) = calm
         # Backwardation: front > back = stress/event
         spread = back_iv - front_iv
+        dte_gap = max(1, exp_dte[sorted_exps[1]] - exp_dte[sorted_exps[0]])
+        slope_per_day = spread / dte_gap
 
         # Contango = calm (+1), backwardation = stress (-1)
-        score = np.clip(spread / 10, -1, 1)
-
-        confidence = min(1.0, abs(spread) / 8.0)
+        score = bounded_tanh(slope_per_day, scale=1.2)
+        chain_depth = min(len(atm_options) / 60.0, 1.0)
+        confidence = confidence_from_strength(abs(score), data_quality=chain_depth)
 
         return SignalResult(
             score=float(score),
@@ -60,6 +63,7 @@ class TermStructureSignal(Signal):
                 "front_iv": float(front_iv),
                 "back_iv": float(back_iv),
                 "spread": float(spread),
+                "slope_per_day": float(slope_per_day),
                 "front_dte": exp_dte[sorted_exps[0]],
                 "back_dte": exp_dte[sorted_exps[1]],
             },

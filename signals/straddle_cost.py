@@ -1,6 +1,7 @@
 """Signal 20: ATM straddle cost — expected move vs actual recent moves."""
 
 import numpy as np
+from signals.formula_utils import bounded_tanh, confidence_from_strength
 from signals.base import Signal, SignalResult
 
 
@@ -63,9 +64,9 @@ class StraddleCostSignal(Signal):
         # Straddle cheap vs realized = buy vol (+1)
         # Straddle expensive vs realized = sell vol (-1)
         ratio = straddle_pct / realized_expected_move if realized_expected_move > 0 else 1.0
-        score = np.clip(-(ratio - 1.0) * 3, -1, 1)
-
-        confidence = min(1.0, abs(ratio - 1.0) * 2)
+        score = bounded_tanh(-(ratio - 1.0), scale=3.2)
+        chain_depth = min(len(option_chain.contracts) / 120.0, 1.0)
+        confidence = confidence_from_strength(abs(score), data_quality=chain_depth)
 
         return SignalResult(
             score=float(score),

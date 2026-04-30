@@ -1,6 +1,7 @@
 """Signal 9: Multi-timeframe alignment — trend direction on daily, hourly, and 5-min."""
 
 import numpy as np
+from signals.formula_utils import bounded_tanh, confidence_from_strength
 from signals.base import Signal, SignalResult
 
 
@@ -59,12 +60,17 @@ class MultiTimeframeSignal(Signal):
             tf_daily = tf_5min
 
         alignment = tf_5min + tf_hourly + tf_daily
-        score = alignment / 3.0  # -1 to +1
+        score = bounded_tanh(alignment / 3.0, scale=1.3)
 
         # Confidence proportional to alignment
         aligned_count = sum(1 for t in [tf_5min, tf_hourly, tf_daily] if t != 0)
         agreement = abs(alignment) / max(aligned_count, 1)
-        confidence = agreement * (aligned_count / 3.0)
+        data_quality = min(1.0, len(close) / 90.0) * (1.0 if candles_daily is not None else 0.7)
+        confidence = confidence_from_strength(
+            abs(score),
+            data_quality=data_quality * agreement * (aligned_count / 3.0),
+            floor=0.02,
+        )
 
         return SignalResult(
             score=float(score),

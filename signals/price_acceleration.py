@@ -1,6 +1,7 @@
 """Signal 10: Price acceleration — second derivative of price (ROC of ROC)."""
 
 import numpy as np
+from signals.formula_utils import bounded_tanh, confidence_from_strength, safe_pct_change
 from signals.base import Signal, SignalResult
 
 
@@ -19,11 +20,11 @@ class PriceAccelerationSignal(Signal):
         close = np.array(candles.close, dtype=float)
 
         # First derivative: ROC at different lookbacks
-        roc_5 = (close[-1] - close[-6]) / close[-6] if len(close) > 5 else 0
-        roc_5_prev = (close[-6] - close[-11]) / close[-11] if len(close) > 10 else 0
+        roc_5 = safe_pct_change(close[-1], close[-6]) if len(close) > 5 else 0.0
+        roc_5_prev = safe_pct_change(close[-6], close[-11]) if len(close) > 10 else 0.0
 
-        roc_10 = (close[-1] - close[-11]) / close[-11] if len(close) > 10 else 0
-        roc_10_prev = (close[-11] - close[-21]) / close[-21] if len(close) > 20 else 0
+        roc_10 = safe_pct_change(close[-1], close[-11]) if len(close) > 10 else 0.0
+        roc_10_prev = safe_pct_change(close[-11], close[-21]) if len(close) > 20 else 0.0
 
         # Second derivative: change in ROC
         accel_5 = roc_5 - roc_5_prev
@@ -32,8 +33,9 @@ class PriceAccelerationSignal(Signal):
         # Weighted combination
         accel = accel_5 * 0.6 + accel_10 * 0.4
 
-        score = np.clip(accel * 30, -1, 1)
-        confidence = min(1.0, abs(accel) * 40)
+        score = bounded_tanh(accel, scale=26.0)
+        data_quality = min(1.0, len(close) / 70.0)
+        confidence = confidence_from_strength(abs(score), data_quality=data_quality)
 
         return SignalResult(
             score=float(score),

@@ -1,6 +1,7 @@
 """Signal 47: Option OI flow — call vs put OI direction."""
 
 import numpy as np
+from signals.formula_utils import bounded_tanh, confidence_from_strength
 from signals.base import Signal, SignalResult
 
 
@@ -52,22 +53,24 @@ class OptionFlowSignal(Signal):
         # OI skew: more call OI = bullish, more put OI = bearish
         if total_oi > 0:
             oi_ratio = total_call_oi / total_oi
-            oi_score = np.clip((oi_ratio - 0.5) * 4, -1, 1)
+            oi_score = bounded_tanh((oi_ratio - 0.5), scale=3.0)
             scores.append(oi_score * 0.5)
             components["call_oi_pct"] = float(round(oi_ratio * 100, 1))
 
         # Volume skew: call volume building = bullish flow
         if total_vol > 0:
             vol_ratio = total_call_vol / total_vol
-            vol_score = np.clip((vol_ratio - 0.5) * 4, -1, 1)
+            vol_score = bounded_tanh((vol_ratio - 0.5), scale=3.0)
             scores.append(vol_score * 0.5)
             components["call_vol_pct"] = float(round(vol_ratio * 100, 1))
 
         if not scores:
             return SignalResult(0.0, 0.0, components)
 
-        score = np.clip(sum(scores), -1, 1)
-        confidence = min(1.0, (total_oi + total_vol) / 10000 * 0.5 + 0.3)
+        score = bounded_tanh(sum(scores), scale=1.2)
+        components["mode"] = "proxy_chain_flow"
+        depth = min((total_oi + total_vol) / 12_000.0, 1.0)
+        confidence = confidence_from_strength(abs(score), data_quality=depth)
 
         return SignalResult(
             score=float(score),

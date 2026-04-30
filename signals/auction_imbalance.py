@@ -205,6 +205,7 @@ def compute_auction_score(
         confidence *= _THIN_AUCTION_MULT
 
     components = {
+        "mode": "primary_paired" if denom_used == "paired" else "proxy_adv" if denom_used == "adv" else "none",
         "window": window,
         "imbalance_shares": int(auction_imbalance),
         "paired_shares": int(auction_volume) if auction_volume is not None else None,

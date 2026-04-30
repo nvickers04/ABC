@@ -46,6 +46,25 @@ _MUTATION_DELTA = {
 }
 
 
+def _normalize_boundary_pairs(params: dict[str, float]) -> dict[str, float]:
+    """Ensure *_min/*_max pairs are ordered after mutation."""
+    out = dict(params)
+    pairs = [
+        ("composite_min", "composite_max"),
+        ("iv_rank_min", "iv_rank_max"),
+        ("atr_pct_min", "atr_pct_max"),
+    ]
+    for min_k, max_k in pairs:
+        if min_k in out and max_k in out:
+            lo = float(out[min_k])
+            hi = float(out[max_k])
+            if lo > hi:
+                lo, hi = hi, lo
+            out[min_k] = lo
+            out[max_k] = hi
+    return out
+
+
 # ---------------------------------------------------------------------------
 # Public entry point
 # ---------------------------------------------------------------------------
@@ -209,7 +228,7 @@ async def _evolution_round(conn) -> None:
     improved = 0
 
     for tname, tdef in TEMPLATE_DEFS.items():
-        current_b = current_boundaries.get(tname, {})
+        current_b = _normalize_boundary_pairs(current_boundaries.get(tname, {}))
         if not current_b:
             continue
 
@@ -239,7 +258,6 @@ async def _evolution_round(conn) -> None:
         # Keep-gate: mutation must beat current on OOS
         if best_mutation is not None:
             generation = int(current_b.get("_generation", 0)) + 1
-            best_mutation["_generation"] = generation
             save_boundaries(
                 conn, tname, best_mutation,
                 generation=generation, fitness=best_fitness,
@@ -288,7 +306,7 @@ def _mutate_boundaries(
 
         mutated[pname] = round(new_val, 4)
 
-    return mutated
+    return _normalize_boundary_pairs(mutated)
 
 
 # ---------------------------------------------------------------------------
@@ -305,10 +323,11 @@ def _evaluate_boundaries(
 
     Returns metrics dict with search_fitness (capped at 5.0).
     """
-    comp_min = boundaries.get("composite_min", 0.25)
-    comp_max = boundaries.get("composite_max", 1.0)
-    iv_min = boundaries.get("iv_rank_min", 0.0)
-    iv_max = boundaries.get("iv_rank_max", 100.0)
+    b = _normalize_boundary_pairs(boundaries)
+    comp_min = b.get("composite_min", 0.25)
+    comp_max = b.get("composite_max", 1.0)
+    iv_min = b.get("iv_rank_min", 0.0)
+    iv_max = b.get("iv_rank_max", 100.0)
 
     trades = []
     for entry in data:

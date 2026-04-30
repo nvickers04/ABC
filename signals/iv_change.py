@@ -1,6 +1,7 @@
 """Signal 18: IV rank momentum — change in IV rank over trailing period."""
 
 import numpy as np
+from signals.formula_utils import bounded_tanh, confidence_from_strength
 from signals.base import Signal, SignalResult
 
 
@@ -33,8 +34,8 @@ class IVChangeSignal(Signal):
         # We infer momentum from where rank sits and the range spread
         range_pct = (iv_high - iv_low) / iv_high * 100 if iv_high > 0 else 0
 
-        # Higher rank with wider range = more room to fall back = sell premium
-        # Lower rank = IV compressed = may expand
+        # Higher rank with wider range = more room to mean-revert down.
+        # Lower rank = IV compressed = expansion risk.
         if iv_rank > 70:
             score = 0.5  # High IV, likely to mean-revert down
         elif iv_rank < 30:
@@ -46,13 +47,17 @@ class IVChangeSignal(Signal):
         if range_pct > 50:
             score *= 1.3  # Wide range = more conviction
 
-        score = np.clip(score, -1, 1)
-        confidence = min(1.0, abs(score) * 0.8 + range_pct / 100 * 0.3)
+        score = bounded_tanh(score, scale=1.6)
+        confidence = confidence_from_strength(
+            abs(score),
+            data_quality=min(1.0, range_pct / 60.0),
+        )
 
         return SignalResult(
             score=float(score),
             confidence=float(confidence),
             components={
+                "mode": "proxy",
                 "iv_rank": float(iv_rank),
                 "iv_current": float(iv_current),
                 "range_pct": float(range_pct),

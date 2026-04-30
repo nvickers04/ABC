@@ -44,6 +44,27 @@ def _seed_boundaries(db, *, composite_min=0.25, composite_max=1.0,
 
 
 class TestSelectTemplateEdgeCases:
+    def test_inverted_boundaries_are_normalized_on_save(self, db):
+        """save_boundaries should normalize min/max pairs if inverted."""
+        from signals.templates import load_boundaries, save_boundaries
+
+        save_boundaries(
+            db,
+            "stock_market",
+            {
+                "composite_min": 0.8,
+                "composite_max": 0.3,
+                "iv_rank_min": 70.0,
+                "iv_rank_max": 30.0,
+                "atr_pct_min": 3.0,
+                "atr_pct_max": 1.0,
+            },
+        )
+        b = load_boundaries(db)["stock_market"]
+        assert b["composite_min"] <= b["composite_max"]
+        assert b["iv_rank_min"] <= b["iv_rank_max"]
+        assert b["atr_pct_min"] <= b["atr_pct_max"]
+
     def test_none_iv_rank_bypasses_iv_filter(self, db):
         """When iv_rank is None, the iv_rank_min/max boundaries are
         ignored entirely (template passes even with iv_min=50)."""

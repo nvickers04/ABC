@@ -1,6 +1,7 @@
 """Signal 1: Trend/momentum — EMA crosses, ROC, MACD histogram."""
 
 import numpy as np
+from signals.formula_utils import bounded_tanh, confidence_from_strength, safe_pct_change
 from signals.base import Signal, SignalResult
 
 
@@ -31,13 +32,13 @@ class MomentumSignal(Signal):
         # EMA(10) vs EMA(50) cross direction and distance
         ema10 = _ema(close, 10)
         ema50 = _ema(close, 50)
-        ema_diff = (ema10[-1] - ema50[-1]) / close[-1]
-        ema_score = np.clip(ema_diff * 20, -1, 1)  # Scale so 5% diff = 1.0
+        ema_diff = safe_pct_change(ema10[-1], ema50[-1])
+        ema_score = bounded_tanh(ema_diff, scale=18.0)
 
         # 5-bar and 10-bar ROC
-        roc5 = (close[-1] - close[-6]) / close[-6] if len(close) > 5 else 0
-        roc10 = (close[-1] - close[-11]) / close[-11] if len(close) > 10 else 0
-        roc_score = np.clip((roc5 + roc10) * 10, -1, 1)
+        roc5 = safe_pct_change(close[-1], close[-6]) if len(close) > 5 else 0.0
+        roc10 = safe_pct_change(close[-1], close[-11]) if len(close) > 10 else 0.0
+        roc_score = bounded_tanh((roc5 * 0.6) + (roc10 * 0.4), scale=12.0)
 
         # MACD histogram sign and slope
         ema12 = _ema(close, 12)
@@ -45,10 +46,12 @@ class MomentumSignal(Signal):
         macd_line = ema12 - ema26
         signal_line = _ema(macd_line, 9)
         histogram = macd_line - signal_line
-        macd_score = np.clip(histogram[-1] / close[-1] * 100, -1, 1)
+        macd_ratio = histogram[-1] / max(abs(close[-1]), 1e-9)
+        macd_score = bounded_tanh(macd_ratio, scale=120.0)
 
         score = (ema_score * 0.4 + roc_score * 0.3 + macd_score * 0.3)
-        confidence = min(1.0, abs(score) * 1.5)
+        data_quality = min(1.0, len(close) / 80.0)
+        confidence = confidence_from_strength(abs(score), data_quality=data_quality)
 
         return SignalResult(
             score=float(score),

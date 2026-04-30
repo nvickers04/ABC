@@ -1,6 +1,7 @@
 """Signal 11: Trend strength — DMI (+DI vs -DI) and ADX-style measure."""
 
 import numpy as np
+from signals.formula_utils import bounded_tanh, confidence_from_strength
 from signals.base import Signal, SignalResult
 
 
@@ -75,11 +76,12 @@ class TrendStrengthSignal(Signal):
         direction = 1.0 if plus_di > minus_di else -1.0
 
         # Score: direction * strength
-        strength = min(dx / 40.0, 1.0)  # ADX 40+ = max strength
+        strength = bounded_tanh(dx / 30.0, scale=1.0)
         score = direction * strength
 
-        # Confidence from ADX magnitude
-        confidence = min(1.0, dx / 50.0)
+        # Confidence from trend strength and sample depth.
+        data_quality = min(1.0, len(close) / 90.0)
+        confidence = confidence_from_strength(abs(score), data_quality=data_quality)
 
         return SignalResult(
             score=float(score),

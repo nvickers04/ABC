@@ -1,6 +1,7 @@
 """Signal 13: Opening range position — price vs first 30-min high/low."""
 
 import numpy as np
+from signals.formula_utils import bounded_tanh, confidence_from_strength
 from signals.base import Signal, SignalResult
 
 
@@ -38,22 +39,30 @@ class OpeningRangeSignal(Signal):
         if price > or_high:
             # Above opening range — bullish breakout
             dist = (price - or_high) / or_range
-            score = min(1.0, dist * 0.5 + 0.5)
+            score = bounded_tanh(dist, scale=1.1)
         elif price < or_low:
             # Below opening range — bearish breakdown
             dist = (or_low - price) / or_range
-            score = max(-1.0, -(dist * 0.5 + 0.5))
+            score = -bounded_tanh(dist, scale=1.1)
         else:
             # Inside opening range
             pos = (price - or_low) / or_range  # 0 = bottom, 1 = top
-            score = (pos - 0.5) * 0.6  # Mild directional bias
+            score = bounded_tanh((pos - 0.5), scale=1.8) * 0.5
 
         # Confidence: higher when outside range with distance
         if price > or_high or price < or_low:
             dist = abs(price - (or_high if price > or_high else or_low)) / or_range
-            confidence = min(1.0, 0.5 + dist * 0.3)
+            confidence = confidence_from_strength(
+                abs(score),
+                data_quality=min(1.0, len(candles) / 80.0),
+                floor=0.08,
+            )
         else:
-            confidence = 0.3  # Low confidence inside range
+            confidence = confidence_from_strength(
+                abs(score),
+                data_quality=min(1.0, len(candles) / 80.0) * 0.6,
+                floor=0.05,
+            )
 
         return SignalResult(
             score=float(score),

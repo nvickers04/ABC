@@ -1,6 +1,7 @@
 """Signal 21: Option volume surge — today's option volume vs 20-day average."""
 
 import numpy as np
+from signals.formula_utils import bounded_tanh, confidence_from_strength
 from signals.base import Signal, SignalResult
 
 
@@ -40,9 +41,12 @@ class OptionVolumeRatioSignal(Signal):
         else:
             magnitude = 0.5
 
-        score = direction * (0.5 + magnitude * 0.5)
-        score = np.clip(score, -1, 1)
-        confidence = min(1.0, magnitude * 0.7 + abs(direction) * 0.3)
+        score = bounded_tanh(direction * (0.5 + magnitude * 0.5), scale=1.3)
+        depth = min((call_volume + put_volume) / 20_000.0, 1.0)
+        confidence = confidence_from_strength(
+            abs(score),
+            data_quality=min(1.0, 0.5 * magnitude + 0.5 * depth),
+        )
 
         return SignalResult(
             score=float(score),

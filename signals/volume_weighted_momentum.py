@@ -1,6 +1,7 @@
 """Signal 8: Volume-weighted momentum — price change weighted by relative volume."""
 
 import numpy as np
+from signals.formula_utils import bounded_tanh, confidence_from_strength, safe_pct_change
 from signals.base import Signal, SignalResult
 
 
@@ -28,7 +29,7 @@ class VolumeWeightedMomentumSignal(Signal):
         for lookback in [5, 10, 20]:
             if len(close) <= lookback:
                 continue
-            price_change = (close[-1] - close[-lookback - 1]) / close[-lookback - 1]
+            price_change = safe_pct_change(close[-1], close[-lookback - 1])
             rel_vol = np.mean(volume[-lookback:]) / avg_vol_20
             weighted = price_change * rel_vol
             scores.append(weighted)
@@ -38,11 +39,15 @@ class VolumeWeightedMomentumSignal(Signal):
 
         # Average across lookbacks
         avg_score = np.mean(scores)
-        score = np.clip(avg_score * 15, -1, 1)
+        score = bounded_tanh(avg_score, scale=14.0)
 
         # Confidence from volume magnitude
         rel_vol_now = volume[-1] / avg_vol_20
-        confidence = min(1.0, rel_vol_now / 3.0 * abs(score))
+        data_quality = min(1.0, len(close) / 90.0)
+        confidence = confidence_from_strength(
+            abs(score),
+            data_quality=data_quality * min(rel_vol_now / 2.0, 1.0),
+        )
 
         return SignalResult(
             score=float(score),

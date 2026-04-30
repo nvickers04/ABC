@@ -386,6 +386,122 @@ class TestCombinerWithDB:
         assert abs(sum(abs(w) for w in result["weights"].values()) - 1.0) < 1e-6
         assert result["n_eff"] > 0
 
+    def test_combine_signals_stratifies_weight_mass_by_horizon_bucket(self, db):
+        """Two equal-size horizon buckets each receive ~50% abs weight mass."""
+        from signals.base import Signal, SignalResult
+        from signals.combiner import combine_signals
+
+        class _HB1A(Signal):
+            name = "hb1_a"
+            category = "price"
+            return_resolution = "1h"
+            return_horizon = 4
+
+            def compute(self, symbol, data):
+                return SignalResult(0.0, 0.0, {})
+
+        class _HB1B(Signal):
+            name = "hb1_b"
+            category = "price"
+            return_resolution = "1h"
+            return_horizon = 4
+
+            def compute(self, symbol, data):
+                return SignalResult(0.0, 0.0, {})
+
+        class _HB2A(Signal):
+            name = "hb2_a"
+            category = "volatility"
+            return_resolution = "D"
+            return_horizon = 10
+
+            def compute(self, symbol, data):
+                return SignalResult(0.0, 0.0, {})
+
+        class _HB2B(Signal):
+            name = "hb2_b"
+            category = "volatility"
+            return_resolution = "D"
+            return_horizon = 10
+
+            def compute(self, symbol, data):
+                return SignalResult(0.0, 0.0, {})
+
+        names = ["hb1_a", "hb1_b", "hb2_a", "hb2_b"]
+        _seed_signal_returns(db, names, n_periods=80, correlation=0.0)
+        result = combine_signals(db, signal_names=names)
+
+        # The combined vector remains fully allocated.
+        w = result["weights"]
+        assert abs(sum(abs(v) for v in w.values()) - 1.0) < 1e-6
+
+        # With signal-count bucket mass and equal bucket sizes (2 + 2),
+        # each horizon bucket should carry ~0.5 absolute mass.
+        b1_mass = abs(w["hb1_a"]) + abs(w["hb1_b"])
+        b2_mass = abs(w["hb2_a"]) + abs(w["hb2_b"])
+        assert b1_mass == pytest.approx(0.5, abs=1e-6)
+        assert b2_mass == pytest.approx(0.5, abs=1e-6)
+
+    def test_combine_signals_equal_bucket_mass_mode_via_research_config(self, db):
+        """Mode=equal gives equal mass even when bucket sizes differ."""
+        from memory import set_research_config
+        from signals.base import Signal, SignalResult
+        from signals.combiner import combine_signals
+
+        class _E1A(Signal):
+            name = "eq_b1_a"
+            category = "price"
+            return_resolution = "1h"
+            return_horizon = 4
+
+            def compute(self, symbol, data):
+                return SignalResult(0.0, 0.0, {})
+
+        class _E1B(Signal):
+            name = "eq_b1_b"
+            category = "price"
+            return_resolution = "1h"
+            return_horizon = 4
+
+            def compute(self, symbol, data):
+                return SignalResult(0.0, 0.0, {})
+
+        class _E1C(Signal):
+            name = "eq_b1_c"
+            category = "price"
+            return_resolution = "1h"
+            return_horizon = 4
+
+            def compute(self, symbol, data):
+                return SignalResult(0.0, 0.0, {})
+
+        class _E2A(Signal):
+            name = "eq_b2_a"
+            category = "volatility"
+            return_resolution = "D"
+            return_horizon = 10
+
+            def compute(self, symbol, data):
+                return SignalResult(0.0, 0.0, {})
+
+        # 1 = equal bucket mass mode.
+        set_research_config(
+            "combiner_horizon_bucket_mass_mode",
+            1.0,
+            reason="test: equal bucket mass",
+        )
+
+        names = ["eq_b1_a", "eq_b1_b", "eq_b1_c", "eq_b2_a"]
+        _seed_signal_returns(db, names, n_periods=80, correlation=0.0)
+        result = combine_signals(db, signal_names=names)
+        w = result["weights"]
+
+        assert abs(sum(abs(v) for v in w.values()) - 1.0) < 1e-6
+        b1_mass = abs(w["eq_b1_a"]) + abs(w["eq_b1_b"]) + abs(w["eq_b1_c"])
+        b2_mass = abs(w["eq_b2_a"])
+        assert b1_mass == pytest.approx(0.5, abs=1e-6)
+        assert b2_mass == pytest.approx(0.5, abs=1e-6)
+
     def test_compute_composite_scores(self, db):
         """Composite = weighted sum of signal scores."""
         from signals.combiner import compute_composite_scores
@@ -598,6 +714,24 @@ class TestTemplateEvolution:
                 changed = True
                 break
         assert changed, "Mutation should change at least one parameter"
+
+    def test_mutation_keeps_min_max_order(self):
+        from signals.template_evolution import _mutate_boundaries
+        from signals.templates import TEMPLATE_DEFS
+
+        tdef = TEMPLATE_DEFS["stock_market"]
+        current = {
+            "composite_min": 0.9,
+            "composite_max": 0.4,
+            "iv_rank_min": 80.0,
+            "iv_rank_max": 40.0,
+            "atr_pct_min": 3.0,
+            "atr_pct_max": 1.0,
+        }
+        mutated = _mutate_boundaries("stock_market", current, tdef)
+        assert mutated["composite_min"] <= mutated["composite_max"]
+        assert mutated["iv_rank_min"] <= mutated["iv_rank_max"]
+        assert mutated["atr_pct_min"] <= mutated["atr_pct_max"]
 
     def test_evaluate_boundaries_basic(self):
         from signals.template_evolution import _evaluate_boundaries
@@ -1127,3 +1261,82 @@ class TestSignalICAttribution:
         assert abs(ir - 0.20) < 1e-9
         assert gate is True
         assert ir >= _IR_GATE_MIN
+
+    def test_ir_snapshot_stratifies_by_horizon_bucket(self, db):
+        """When signal_names are supplied, IR is computed per
+        (resolution, horizon) bucket before aggregation."""
+        from signals.base import Signal, SignalResult
+        from signals.combiner import _publish_ir_snapshot
+
+        class _B1A(Signal):
+            name = "test_b1_a"
+            category = "price"
+            return_resolution = "1h"
+            return_horizon = 4
+
+            def compute(self, symbol, data):
+                return SignalResult(0.0, 0.0, {})
+
+        class _B1B(Signal):
+            name = "test_b1_b"
+            category = "price"
+            return_resolution = "1h"
+            return_horizon = 4
+
+            def compute(self, symbol, data):
+                return SignalResult(0.0, 0.0, {})
+
+        class _B2A(Signal):
+            name = "test_b2_a"
+            category = "volatility"
+            return_resolution = "D"
+            return_horizon = 10
+
+            def compute(self, symbol, data):
+                return SignalResult(0.0, 0.0, {})
+
+        class _B2B(Signal):
+            name = "test_b2_b"
+            category = "volatility"
+            return_resolution = "D"
+            return_horizon = 10
+
+            def compute(self, symbol, data):
+                return SignalResult(0.0, 0.0, {})
+
+        ic_stats = {
+            "test_b1_a": {"ic": 0.10, "t": 2.0, "n": 100},
+            "test_b1_b": {"ic": 0.10, "t": 2.0, "n": 100},
+            "test_b2_a": {"ic": 0.05, "t": 1.5, "n": 100},
+            "test_b2_b": {"ic": 0.05, "t": 1.5, "n": 100},
+        }
+        names = list(ic_stats.keys())
+
+        # With no rows in signal_returns, compute_n_eff(names) returns
+        # len(names) for each bucket. Each bucket has 2 trusted signals:
+        #   IR_1h/h4 = 0.10 * sqrt(2)
+        #   IR_D/h10 = 0.05 * sqrt(2)
+        # Aggregate is count-weighted mean across buckets (2 and 2):
+        #   IR = (0.10*sqrt(2) + 0.05*sqrt(2)) / 2
+        expected = (0.10 * np.sqrt(2.0) + 0.05 * np.sqrt(2.0)) / 2.0
+        ir, gate = _publish_ir_snapshot(
+            db,
+            ic_stats,
+            n_eff=99.0,  # ignored when stratified
+            signal_names=names,
+        )
+        assert ir == pytest.approx(float(expected), abs=1e-12)
+        assert gate is True
+
+    def test_ir_snapshot_without_signal_names_keeps_legacy_formula(self, db):
+        """Backward compatibility: no signal_names means global IR formula."""
+        from signals.combiner import _publish_ir_snapshot
+
+        ic_stats = {
+            "legacy_a": {"ic": 0.08, "t": 1.0, "n": 100},
+            "legacy_b": {"ic": -0.12, "t": -1.2, "n": 100},
+        }
+        # mean_abs_ic = 0.10, n_eff = 4 -> IR = 0.20
+        ir, gate = _publish_ir_snapshot(db, ic_stats, n_eff=4.0)
+        assert ir == pytest.approx(0.20, abs=1e-12)
+        assert gate is True

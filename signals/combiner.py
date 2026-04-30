@@ -19,6 +19,11 @@ from research.config import (
     SIGNAL_WEIGHT_LOOKBACK_DAYS,
 )
 from signals.base import SIGNAL_REGISTRY
+from signals.candidate_lifecycle import (
+    apply_candidate_weight_caps,
+    filter_live_signal_names,
+    update_candidate_lifecycle,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -51,39 +56,64 @@ def combine_signals(
     """
     if signal_names is None:
         signal_names = sorted(SIGNAL_REGISTRY.keys())
+    signal_names = filter_live_signal_names(signal_names)
 
     N = len(signal_names)
     if N == 0:
         return {"weights": {}, "n_eff": 0.0, "status": "no_signals"}
 
-    # ── Load R(i,s) matrix from signal_returns ──────────────────
-    R, periods = _load_return_matrix(db_conn, signal_names)
-
-    M = R.shape[1] if R.ndim == 2 else 0
-    if M < MIN_SHARED_PERIODS_FOR_COMBINATION:
-        logger.info(
-            "Insufficient shared periods (%d < %d) — using equal weights",
-            M, MIN_SHARED_PERIODS_FOR_COMBINATION,
-        )
-        # Per-signal IC does NOT need shared periods across signals
-        # (each signal is its own Pearson correlation against its own
-        # score/return pairs), so emit attribution + IR snapshot even on
-        # the equal-weights path.  Otherwise the agent never sees IC/IR
-        # until the cross-signal matrix fills in, which for 50 signals of
-        # mixed horizons can take many sessions.
-        weights = {s: 1.0 / N for s in signal_names}
-        try:
-            ic_stats = _compute_and_log_ic_attribution(db_conn, signal_names)
-            _publish_ir_snapshot(db_conn, ic_stats, n_eff=float(N))
-            _safe_update_per_symbol_ic(db_conn, signal_names)
-        except Exception as e:
-            logger.debug("IC attribution failed on insufficient-data path: %s", e)
-        _persist_weights(db_conn, weights, n_eff=float(N))
-        return {"weights": weights, "n_eff": float(N), "status": "insufficient_data"}
-
-    # ── Steps 1-11 ──────────────────────────────────────────────
+    # ── Steps 1-11 (bucket-stratified by horizon) ───────────────
+    # Signals with different return cadences/horizons are benchmarked
+    # inside their own (resolution, horizon) bucket first, then merged.
+    # This avoids a 1h/h=4 stack being penalized against D/h=10 dynamics.
     try:
-        w_dict, n_eff = _run_11_steps(R, signal_names)
+        if _STRATIFY_BY_HORIZON_BUCKET:
+            w_dict, combine_status = _run_11_steps_stratified(db_conn, signal_names)
+            # Keep structural N_eff measured on the full shared matrix so
+            # the existing low-N_eff monitoring/circuit semantics remain
+            # comparable to prior rounds.
+            n_eff = float(compute_n_eff(db_conn, signal_names=signal_names))
+            if combine_status == "insufficient_data":
+                logger.info(
+                    "Insufficient data across all horizon buckets — using equal weights"
+                )
+                try:
+                    ic_stats = _compute_and_log_ic_attribution(db_conn, signal_names)
+                    _publish_ir_snapshot(
+                        db_conn,
+                        ic_stats,
+                        n_eff=float(N),
+                        signal_names=signal_names,
+                    )
+                    _safe_update_per_symbol_ic(db_conn, signal_names)
+                except Exception as e:
+                    logger.debug("IC attribution failed on insufficient-data path: %s", e)
+                _persist_weights(db_conn, w_dict, n_eff=float(N))
+                return {"weights": w_dict, "n_eff": float(N), "status": "insufficient_data"}
+        else:
+            # Legacy pooled mode (all signals share one return matrix).
+            R, _periods = _load_return_matrix(db_conn, signal_names)
+            M = R.shape[1] if R.ndim == 2 else 0
+            if M < MIN_SHARED_PERIODS_FOR_COMBINATION:
+                logger.info(
+                    "Insufficient shared periods (%d < %d) — using equal weights",
+                    M, MIN_SHARED_PERIODS_FOR_COMBINATION,
+                )
+                weights = {s: 1.0 / N for s in signal_names}
+                try:
+                    ic_stats = _compute_and_log_ic_attribution(db_conn, signal_names)
+                    _publish_ir_snapshot(
+                        db_conn,
+                        ic_stats,
+                        n_eff=float(N),
+                        signal_names=signal_names,
+                    )
+                    _safe_update_per_symbol_ic(db_conn, signal_names)
+                except Exception as e:
+                    logger.debug("IC attribution failed on insufficient-data path: %s", e)
+                _persist_weights(db_conn, weights, n_eff=float(N))
+                return {"weights": weights, "n_eff": float(N), "status": "insufficient_data"}
+            w_dict, n_eff = _run_11_steps(R, signal_names)
     except Exception as e:
         logger.error("Combination engine failed (%s) — falling back to equal weights", e)
         w_dict = {s: 1.0 / N for s in signal_names}
@@ -117,6 +147,7 @@ def combine_signals(
     ic_stats: dict[str, dict[str, float]] = {}
     try:
         ic_stats = _compute_and_log_ic_attribution(db_conn, signal_names)
+        update_candidate_lifecycle(ic_stats, evaluated_signal_names=signal_names)
         _safe_update_per_symbol_ic(db_conn, signal_names)
     except Exception as e:  # non-fatal — never break the combiner
         logger.debug("IC attribution failed: %s", e)
@@ -127,13 +158,19 @@ def combine_signals(
     # sample size — we stop giving it weight until its IC recovers.
     if status == "ok":
         w_dict = _apply_ic_retirement_mask(db_conn, w_dict)
+        w_dict = apply_candidate_weight_caps(w_dict)
 
     # ── Estimated IR + gate ─────────────────────────────────────
     # IR ≈ mean(positive IC) × √N_eff  (Fundamental Law of Active Mgmt).
     # Persist snapshot to research_config so the briefing can surface it
     # to the trading agent as an ADVISORY conviction multiplier — not a
     # binary trade permission.
-    estimated_ir, gate_open = _publish_ir_snapshot(db_conn, ic_stats, n_eff)
+    estimated_ir, gate_open = _publish_ir_snapshot(
+        db_conn,
+        ic_stats,
+        n_eff,
+        signal_names=signal_names,
+    )
     if not gate_open:
         logger.info(
             "Quant edge currently weak (IR=%.4f < %.4f): advisory — "
@@ -177,6 +214,17 @@ _EWMA_HALFLIFE_MIN = 30
 # single category (e.g. "price" with 15 correlated signals) from
 # dominating the portfolio.  0.40 allows 2x the equal-category share.
 _CATEGORY_WEIGHT_CAP = 0.40
+
+# Horizon-bucket combiner: run step-1..11 inside each
+# (return_resolution, return_horizon) bucket, then merge.
+_STRATIFY_BY_HORIZON_BUCKET = True
+# Merge mode is read from research_config key
+# ``combiner_horizon_bucket_mass_mode`` (numeric enum):
+#   0 = signal_count (default): mass ∝ number of signals in bucket
+#   1 = equal: equal mass per non-empty bucket
+#   2 = n_eff: mass ∝ bucket effective breadth
+_HORIZON_BUCKET_MASS_MODE_KEY = "combiner_horizon_bucket_mass_mode"
+_HORIZON_BUCKET_MASS_MODE_DEFAULT = 0
 
 # ── IC attribution tunables ─────────────────────────────────────
 # Rolling window for computing per-signal Information Coefficient
@@ -372,6 +420,143 @@ def compute_n_eff(db_conn, signal_names: list[str] | None = None) -> float:
     if sum_eig_sq < 1e-12:
         return float(n_active)
     return float(sum_eig ** 2 / sum_eig_sq)
+
+
+def _group_signals_by_horizon_bucket(
+    signal_names: list[str],
+) -> dict[tuple[str, int], list[str]]:
+    """Group signals by their (return_resolution, return_horizon) bucket."""
+    buckets: dict[tuple[str, int], list[str]] = {}
+    for name in signal_names:
+        buckets.setdefault(_signal_horizon_bucket(name), []).append(name)
+    return buckets
+
+
+def _resolve_horizon_bucket_mass_mode(db_conn) -> str:
+    """Resolve bucket-mass mode from research_config.
+
+    Enum values:
+      0 -> signal_count
+      1 -> equal
+      2 -> n_eff
+    """
+    mode_map = {0: "signal_count", 1: "equal", 2: "n_eff"}
+    mode_raw = _HORIZON_BUCKET_MASS_MODE_DEFAULT
+    try:
+        from memory import get_research_config
+        mode_raw = int(
+            get_research_config(
+                _HORIZON_BUCKET_MASS_MODE_KEY,
+                float(_HORIZON_BUCKET_MASS_MODE_DEFAULT),
+            )
+        )
+    except Exception:
+        pass
+    return mode_map.get(mode_raw, mode_map[_HORIZON_BUCKET_MASS_MODE_DEFAULT])
+
+
+def _run_11_steps_stratified(
+    db_conn,
+    signal_names: list[str],
+) -> tuple[dict[str, float], str]:
+    """Run the combiner per horizon bucket, then merge bucket weights.
+
+    Returns:
+        (weights_dict, status)
+        status in {"ok", "insufficient_data"}
+    """
+    if not signal_names:
+        return {}, "insufficient_data"
+
+    buckets = _group_signals_by_horizon_bucket(signal_names)
+    if not buckets:
+        return {s: 1.0 / len(signal_names) for s in signal_names}, "insufficient_data"
+
+    any_bucket_ok = False
+    mode = _resolve_horizon_bucket_mass_mode(db_conn)
+    bucket_rows: list[dict[str, Any]] = []
+
+    for bucket in sorted(buckets.keys(), key=lambda b: (b[0], b[1])):
+        names = buckets[bucket]
+        R_b, _periods_b = _load_return_matrix(db_conn, names)
+        M_b = R_b.shape[1] if R_b.ndim == 2 else 0
+
+        if M_b < MIN_SHARED_PERIODS_FOR_COMBINATION:
+            w_b = {s: 1.0 / len(names) for s in names}
+            status_b = "insufficient"
+            try:
+                n_eff_b = float(compute_n_eff(db_conn, signal_names=names))
+            except Exception:
+                n_eff_b = float(len(names))
+        else:
+            try:
+                w_b, n_eff_b = _run_11_steps(R_b, names)
+                status_b = "ok"
+                any_bucket_ok = True
+            except Exception as e:
+                logger.warning(
+                    "Bucket %s combine failed (%s) — equal weights inside bucket",
+                    _bucket_label(bucket), e,
+                )
+                w_b = {s: 1.0 / len(names) for s in names}
+                status_b = "fallback_equal"
+                try:
+                    n_eff_b = float(compute_n_eff(db_conn, signal_names=names))
+                except Exception:
+                    n_eff_b = float(len(names))
+
+        bucket_rows.append(
+            {
+                "bucket": bucket,
+                "names": names,
+                "weights": w_b,
+                "status": status_b,
+                "M": M_b,
+                "n_eff": max(float(n_eff_b), 0.0),
+            }
+        )
+
+    # Allocate mass across buckets according to configured mode.
+    n_buckets = len(bucket_rows)
+    if mode == "equal":
+        masses = [1.0 / max(n_buckets, 1)] * n_buckets
+    elif mode == "n_eff":
+        total_neff = sum(r["n_eff"] for r in bucket_rows)
+        if total_neff > 1e-12:
+            masses = [r["n_eff"] / total_neff for r in bucket_rows]
+        else:
+            masses = [1.0 / max(n_buckets, 1)] * n_buckets
+    else:  # signal_count
+        total_signals = sum(len(r["names"]) for r in bucket_rows)
+        masses = [
+            len(r["names"]) / max(total_signals, 1)
+            for r in bucket_rows
+        ]
+
+    merged: dict[str, float] = {s: 0.0 for s in signal_names}
+    bucket_log_parts: list[str] = []
+    for row, mass in zip(bucket_rows, masses):
+        for s, w in row["weights"].items():
+            merged[s] += mass * float(w)
+        bucket_log_parts.append(
+            f"{_bucket_label(row['bucket'])}:{row['status']},n={len(row['names'])},"
+            f"M={row['M']},n_eff={row['n_eff']:.2f},mass={mass:.3f}"
+        )
+
+    # Numerical hygiene: enforce full allocation (sum|w|=1).
+    abs_sum = sum(abs(v) for v in merged.values())
+    if abs_sum > 1e-12:
+        merged = {k: (v / abs_sum) for k, v in merged.items()}
+    else:
+        merged = {s: 1.0 / len(signal_names) for s in signal_names}
+
+    logger.info(
+        "HORIZON_BUCKET_COMBINE mode=%s %s",
+        mode,
+        " | ".join(bucket_log_parts),
+    )
+    status = "ok" if any_bucket_ok else "insufficient_data"
+    return merged, status
 
 
 # ---------------------------------------------------------------------------
@@ -878,18 +1063,51 @@ def _apply_ic_retirement_mask(
     return new_w
 
 
+def _signal_horizon_bucket(signal_name: str) -> tuple[str, int]:
+    """Return the (resolution, horizon) bucket for a signal.
+
+    Missing registry entries fall back to the base Signal defaults to keep
+    diagnostics stable during rename / retire transitions.
+    """
+    sig = SIGNAL_REGISTRY.get(signal_name)
+    if sig is None:
+        return ("D", 5)
+    res = str(getattr(sig, "return_resolution", "D"))
+    try:
+        horizon = int(getattr(sig, "return_horizon", 5))
+    except Exception:
+        horizon = 5
+    return (res, horizon)
+
+
+def _bucket_label(bucket: tuple[str, int]) -> str:
+    res, horizon = bucket
+    return f"{res}/h={horizon}"
+
+
 def _publish_ir_snapshot(
     db_conn,
     ic_stats: dict[str, dict[str, float]],
     n_eff: float,
+    signal_names: list[str] | None = None,
 ) -> tuple[float, bool]:
     """Compute estimated IR and publish gate state to research_config.
 
-    estimated_ir = mean(|IC| over trusted signals) * sqrt(N_eff).
-    Both positive and negative IC values contribute via their absolute
-    value -- a negative-IC signal is informative (the weight optimizer
-    flips its sign). Only |IC| near zero represents noise.
-    If no signal clears the bar we report IR = 0.
+    Backward-compatible behavior (``signal_names is None``): estimate a
+    single IR over the entire trusted set:
+
+        estimated_ir = mean(|IC|) * sqrt(N_eff)
+
+    Stratified behavior (``signal_names`` provided): first group signals by
+    ``(return_resolution, return_horizon)`` and compute an IR per bucket,
+    then aggregate bucket IRs by trusted-signal count:
+
+        ir_bucket = mean(|IC|_bucket) * sqrt(N_eff_bucket)
+        estimated_ir = weighted_mean(ir_bucket, weight=n_trusted_bucket)
+
+    This prevents a short-horizon stack (e.g. 1h/h=4) from being benchmarked
+    directly against long-horizon stacks (e.g. D/h=10) when forming the
+    confidence snapshot used by briefing / gate logic.
 
     Stores three numeric keys for briefing consumption:
       - estimated_ir
@@ -903,13 +1121,58 @@ def _publish_ir_snapshot(
     except Exception:
         return 0.0, True  # fail-open so the combiner still works
 
-    trusted_abs_ic = [
-        abs(d["ic"]) for name, d in ic_stats.items()
+    trusted = [
+        (name, d) for name, d in ic_stats.items()
         if d["n"] >= _min_obs_for(SIGNAL_REGISTRY.get(name))
         and abs(d["ic"]) >= _IC_NOISE_THRESHOLD
     ]
-    mean_ic = float(np.mean(trusted_abs_ic)) if trusted_abs_ic else 0.0
-    ir = mean_ic * float(np.sqrt(max(n_eff, 0.0)))
+
+    if signal_names is None:
+        trusted_abs_ic = [abs(d["ic"]) for _name, d in trusted]
+        mean_ic = float(np.mean(trusted_abs_ic)) if trusted_abs_ic else 0.0
+        ir = mean_ic * float(np.sqrt(max(n_eff, 0.0)))
+        bucket_parts: list[str] = []
+    else:
+        # Stratify by per-signal return horizon bucket.
+        by_bucket: dict[tuple[str, int], list[str]] = {}
+        for name, _d in trusted:
+            by_bucket.setdefault(_signal_horizon_bucket(name), []).append(name)
+
+        bucket_irs: list[tuple[tuple[str, int], float, int, float, float]] = []
+        # tuple = (bucket, ir_bucket, n_trusted, mean_abs_ic, n_eff_bucket)
+        for bucket, names in by_bucket.items():
+            abs_ics = [abs(ic_stats[n]["ic"]) for n in names]
+            mean_abs_ic = float(np.mean(abs_ics)) if abs_ics else 0.0
+            try:
+                n_eff_bucket = float(compute_n_eff(db_conn, signal_names=names))
+            except Exception:
+                n_eff_bucket = float(len(names))
+            ir_bucket = mean_abs_ic * float(np.sqrt(max(n_eff_bucket, 0.0)))
+            bucket_irs.append((bucket, ir_bucket, len(names), mean_abs_ic, n_eff_bucket))
+
+        total_weight = sum(n_trusted for _b, _ir_b, n_trusted, _m, _n in bucket_irs)
+        if total_weight > 0:
+            ir = float(
+                sum(ir_b * n_trusted for _b, ir_b, n_trusted, _m, _n in bucket_irs)
+                / total_weight
+            )
+        else:
+            ir = 0.0
+        mean_ic = (
+            float(np.mean([abs(d["ic"]) for _name, d in trusted]))
+            if trusted else 0.0
+        )
+        bucket_parts = [
+            (
+                f"{_bucket_label(bucket)}:ir={ir_b:.4f},mean_abs_ic={mean_abs_ic:.4f},"
+                f"n_eff={n_eff_bucket:.2f},n={n_trusted}"
+            )
+            for bucket, ir_b, n_trusted, mean_abs_ic, n_eff_bucket in sorted(
+                bucket_irs,
+                key=lambda x: (x[0][0], x[0][1]),
+            )
+        ]
+
     gate_open = ir >= _IR_GATE_MIN
 
     try:
@@ -926,6 +1189,8 @@ def _publish_ir_snapshot(
         "IR_ESTIMATE ir=%.4f mean_abs_ic=%.4f n_eff=%.2f gate_open=%s",
         ir, mean_ic, n_eff, gate_open,
     )
+    if bucket_parts:
+        logger.info("IR_BUCKETS %s", " | ".join(bucket_parts))
     return ir, gate_open
 
 

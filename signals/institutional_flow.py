@@ -1,6 +1,7 @@
 """Signal 50: Institutional flow — combined institutional positioning signal."""
 
 import numpy as np
+from signals.formula_utils import bounded_tanh, confidence_from_strength
 from signals.base import Signal, SignalResult
 
 
@@ -95,8 +96,12 @@ class InstitutionalFlowSignal(Signal):
         if not scores:
             return SignalResult(0.0, 0.0, components)
 
-        score = np.clip(sum(scores) / max(len(scores), 1), -1, 1)
-        confidence = min(1.0, len(scores) / 4.0 * 0.8)
+        score = bounded_tanh(sum(scores) / max(len(scores), 1), scale=1.3)
+        components["mode"] = "hybrid_proxy"
+        confidence = confidence_from_strength(
+            abs(score),
+            data_quality=min(1.0, len(scores) / 4.0),
+        )
 
         return SignalResult(
             score=float(score),

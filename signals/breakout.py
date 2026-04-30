@@ -1,6 +1,7 @@
 """Signal 3: Breakout — distance from highs/lows, volume confirmation, range expansion."""
 
 import numpy as np
+from signals.formula_utils import bounded_tanh, confidence_from_strength
 from signals.base import Signal, SignalResult
 
 
@@ -30,23 +31,28 @@ class BreakoutSignal(Signal):
 
         pos_in_range = (close[-1] - low_20) / rng  # 0 = at low, 1 = at high
         # Near high = bullish breakout, near low = bearish breakdown
-        direction_score = (pos_in_range - 0.5) * 2  # -1 to +1
+        direction_score = bounded_tanh((pos_in_range - 0.5), scale=3.0)
 
         # Volume confirmation
         avg_vol_20 = np.mean(volume[-20:])
         rel_vol = volume[-1] / avg_vol_20 if avg_vol_20 > 0 else 1.0
-        vol_confirm = np.clip((rel_vol - 1.0) / 2.0, 0, 1)  # 0 at avg, 1 at 3x
+        vol_confirm = float(np.clip((rel_vol - 1.0) / 2.0, 0, 1))  # 0 at avg, 1 at 3x
 
         # Range expansion (today's range vs 5-day avg range)
         daily_ranges = high[-5:] - low[-5:]
         avg_range = np.mean(daily_ranges[:-1]) if len(daily_ranges) > 1 else daily_ranges[0]
         current_range = high[-1] - low[-1]
         range_expansion = (current_range / avg_range - 1.0) if avg_range > 0 else 0
-        range_score = np.clip(range_expansion, 0, 1)
+        range_score = float(np.clip(range_expansion, 0, 1))
 
         # Combine: direction + volume + range expansion
-        score = direction_score * (0.5 + vol_confirm * 0.25 + range_score * 0.25)
-        confidence = min(1.0, vol_confirm * 0.5 + range_score * 0.5)
+        raw = direction_score * (0.5 + vol_confirm * 0.25 + range_score * 0.25)
+        score = bounded_tanh(raw, scale=1.2)
+        data_quality = min(1.0, len(close) / 80.0)
+        confidence = confidence_from_strength(
+            abs(score),
+            data_quality=data_quality * (0.6 + 0.4 * max(vol_confirm, range_score)),
+        )
 
         return SignalResult(
             score=float(score),

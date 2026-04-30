@@ -1,6 +1,7 @@
 """Signal 16: Volatility skew — put IV vs call IV from option chain."""
 
 import numpy as np
+from signals.formula_utils import bounded_tanh, confidence_from_strength
 from signals.base import Signal, SignalResult
 
 
@@ -38,9 +39,9 @@ class SkewSignal(Signal):
         skew = avg_put_iv - avg_call_iv
 
         # Call skew = bullish, put skew = bearish
-        score = np.clip(-skew / 10, -1, 1)  # 10% skew = max
-
-        confidence = min(1.0, abs(skew) / 8.0)
+        score = bounded_tanh(-skew, scale=0.12)
+        depth = min((len(atm_calls) + len(atm_puts)) / 40.0, 1.0)
+        confidence = confidence_from_strength(abs(score), data_quality=depth)
 
         return SignalResult(
             score=float(score),

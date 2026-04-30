@@ -1,6 +1,7 @@
 """Signal 7: Overnight gap — gap direction + partial fill assessment."""
 
 import numpy as np
+from signals.formula_utils import bounded_tanh, confidence_from_strength
 from signals.base import Signal, SignalResult
 
 
@@ -48,15 +49,19 @@ class GapSignal(Signal):
         # Holding gap (not filled) = continuation; filled gap = reversal
         if fill_pct < 0.3:
             # Gap holding = bullish for gap ups, bearish for gap downs
-            score = np.clip(gap_pct * 20, -1, 1)
+            score = bounded_tanh(gap_pct, scale=20.0)
         elif fill_pct > 0.7:
             # Gap filled = fading, slight reversal signal
-            score = np.clip(-gap_pct * 10, -1, 1)
+            score = bounded_tanh(-gap_pct, scale=12.0)
         else:
             # Partial fill, uncertain
-            score = np.clip(gap_pct * 5, -1, 1)
+            score = bounded_tanh(gap_pct, scale=6.0)
 
-        confidence = min(1.0, abs(gap_pct) * 30 * (1 - fill_pct * 0.5))
+        data_quality = 1.0 if candles_daily is not None else 0.4
+        confidence = confidence_from_strength(
+            abs(score),
+            data_quality=data_quality * (1.0 - 0.35 * fill_pct),
+        )
 
         return SignalResult(
             score=float(score),

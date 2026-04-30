@@ -1,6 +1,7 @@
 """Signal 15: IV rank — IV percentile position (sell premium when high)."""
 
 import numpy as np
+from signals.formula_utils import bounded_tanh, confidence_from_strength
 from signals.base import Signal, SignalResult
 
 
@@ -25,11 +26,11 @@ class IVRankSignal(Signal):
 
         # High IV rank = premium-selling opportunity (+1)
         # Low IV rank = cheap options (-1)
-        score = (iv_rank - 50) / 50  # Linear map: 0->-1, 50->0, 100->+1
-        score = np.clip(score, -1, 1)
+        centered = (iv_rank - 50.0) / 50.0
+        score = bounded_tanh(centered, scale=1.4)
 
         # Confidence higher at extremes
-        confidence = min(1.0, abs(iv_rank - 50) / 30)
+        confidence = confidence_from_strength(abs(score), data_quality=1.0)
 
         return SignalResult(
             score=float(score),

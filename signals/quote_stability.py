@@ -1,6 +1,7 @@
 """Signal 48: Quote stability — bid/ask mid-price variance measure."""
 
 import numpy as np
+from signals.formula_utils import bounded_tanh, confidence_from_strength
 from signals.base import Signal, SignalResult
 
 
@@ -49,6 +50,7 @@ class QuoteStabilitySignal(Signal):
 
         components["avg_range_pct"] = float(round(avg_range * 100, 3))
         components["range_change"] = float(round(range_change * 100, 2))
+        components["mode"] = "proxy_bar_microvol"
 
         # Close-to-close returns volatility
         returns = np.diff(closes) / closes[:-1]
@@ -60,26 +62,14 @@ class QuoteStabilitySignal(Signal):
 
         # Stable = low range + narrowing ranges = positive
         # Unstable = high range + widening ranges = negative
-        stability_score = 0.0
-
-        # Range level scoring
-        if avg_range < 0.01:  # < 1% avg range = very stable
-            stability_score += 0.5
-        elif avg_range < 0.02:
-            stability_score += 0.2
-        elif avg_range < 0.04:
-            stability_score -= 0.2
-        else:
-            stability_score -= 0.5
-
-        # Range trend scoring
-        if range_change < -0.1:  # Ranges narrowing
-            stability_score += 0.3
-        elif range_change > 0.2:  # Ranges expanding
-            stability_score -= 0.3
-
-        score = np.clip(stability_score, -1, 1)
-        confidence = min(1.0, len(ranges) / 15.0 * 0.7)
+        base = -(avg_range * 100.0) * 0.8  # higher ranges -> less stable
+        trend = -range_change * 0.9         # widening ranges -> less stable
+        vol_term = -(ret_std * 100.0) * 0.6
+        score = bounded_tanh(base + trend + vol_term, scale=0.35)
+        confidence = confidence_from_strength(
+            abs(score),
+            data_quality=min(1.0, len(ranges) / 15.0),
+        )
 
         return SignalResult(
             score=float(score),

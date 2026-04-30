@@ -1,6 +1,7 @@
 """Signal 23: Gamma exposure estimate — aggregate gamma × OI across strikes."""
 
 import numpy as np
+from signals.formula_utils import bounded_tanh, confidence_from_strength
 from signals.base import Signal, SignalResult
 
 
@@ -64,8 +65,12 @@ class GammaExposureSignal(Signal):
         else:
             gamma_skew = 0.0
 
-        score = np.clip(gamma_skew, -1, 1)
-        confidence = min(1.0, total_abs_gamma / (underlying * 10000))
+        score = bounded_tanh(gamma_skew, scale=1.4)
+        depth = min(len(option_chain.contracts) / 120.0, 1.0)
+        confidence = confidence_from_strength(
+            abs(score),
+            data_quality=depth * min(total_abs_gamma / (underlying * 12000.0), 1.0),
+        )
 
         return SignalResult(
             score=float(score),

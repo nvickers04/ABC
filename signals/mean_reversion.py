@@ -1,6 +1,7 @@
 """Signal 2: Mean reversion — RSI, Bollinger Band position, SMA distance."""
 
 import numpy as np
+from signals.formula_utils import bounded_tanh, confidence_from_strength, rolling_atr
 from signals.base import Signal, SignalResult
 
 
@@ -35,15 +36,14 @@ class MeanReversionSignal(Signal):
 
         # RSI(14) distance from 50
         rsi = _rsi(close, 14)
-        rsi_score = (50 - rsi) / 50  # Oversold > 0, overbought < 0
-        rsi_score = np.clip(rsi_score, -1, 1)
+        rsi_score = bounded_tanh((50.0 - rsi) / 25.0, scale=1.0)
 
         # Bollinger Band position
         sma20 = np.mean(close[-20:])
         std20 = np.std(close[-20:])
         if std20 > 0:
             bb_position = (close[-1] - sma20) / (2 * std20)
-            bb_score = -np.clip(bb_position, -1, 1)  # Below band = bullish
+            bb_score = -bounded_tanh(bb_position, scale=1.2)  # Below band = bullish
         else:
             bb_score = 0.0
 
@@ -61,16 +61,17 @@ class MeanReversionSignal(Signal):
                 np.abs(l20[-n:] - prev_close[-n:]),
             ),
         )
-        atr = np.mean(tr) if len(tr) > 0 else 1e-9
+        atr = rolling_atr(highs, lows, close, period=14)
         if atr > 0:
             sma_dist = -(close[-1] - sma20) / atr
-            sma_dist_score = np.clip(sma_dist / 3, -1, 1)  # 3 ATR = max
+            sma_dist_score = bounded_tanh(sma_dist, scale=0.6)
         else:
             sma_dist_score = 0.0
 
         score = rsi_score * 0.4 + bb_score * 0.35 + sma_dist_score * 0.25
-        # Higher confidence at extremes
-        confidence = min(1.0, max(abs(rsi - 50) / 30, abs(bb_score)) * 1.2)
+        # Higher confidence at extremes and with adequate history.
+        data_quality = min(1.0, len(close) / 90.0)
+        confidence = confidence_from_strength(abs(score), data_quality=data_quality)
 
         return SignalResult(
             score=float(score),

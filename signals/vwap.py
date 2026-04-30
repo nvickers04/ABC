@@ -1,6 +1,7 @@
 """Signal 4: VWAP deviation — price distance from VWAP in ATR units."""
 
 import numpy as np
+from signals.formula_utils import bounded_tanh, confidence_from_strength, rolling_atr
 from signals.base import Signal, SignalResult
 
 
@@ -28,25 +29,22 @@ class VWAPSignal(Signal):
         vwap = cum_tp_vol / np.where(cum_vol > 0, cum_vol, 1)
 
         # ATR for normalization
-        tr = np.maximum(
-            high[1:] - low[1:],
-            np.maximum(np.abs(high[1:] - close[:-1]), np.abs(low[1:] - close[:-1])),
-        )
-        atr = np.mean(tr[-14:]) if len(tr) >= 14 else np.mean(tr) if len(tr) > 0 else 1e-9
+        atr = rolling_atr(high, low, close, period=14)
 
         # Distance from VWAP in ATR units
         vwap_dist = (close[-1] - vwap[-1]) / atr if atr > 0 else 0
-        score = np.clip(vwap_dist / 3.0, -1, 1)  # 3 ATR = max
+        score = bounded_tanh(vwap_dist, scale=0.7)
 
         # VWAP slope direction (momentum)
         if len(vwap) >= 5:
             vwap_slope = (vwap[-1] - vwap[-5]) / atr if atr > 0 else 0
-            slope_component = np.clip(vwap_slope, -1, 1)
+            slope_component = bounded_tanh(vwap_slope, scale=0.9)
         else:
             slope_component = 0.0
 
-        score = score * 0.7 + slope_component * 0.3
-        confidence = min(1.0, abs(score) * 1.5)
+        score = bounded_tanh(score * 0.7 + slope_component * 0.3, scale=1.1)
+        data_quality = min(1.0, len(close) / 80.0)
+        confidence = confidence_from_strength(abs(score), data_quality=data_quality)
 
         return SignalResult(
             score=float(score),

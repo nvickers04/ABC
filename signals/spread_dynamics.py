@@ -1,6 +1,7 @@
 """Signal 46: Bid-ask spread dynamics — spread vs trailing average."""
 
 import numpy as np
+from signals.formula_utils import bounded_tanh, confidence_from_strength
 from signals.base import Signal, SignalResult
 
 
@@ -39,6 +40,7 @@ class SpreadDynamicsSignal(Signal):
 
         components["bid"] = float(bid)
         components["ask"] = float(ask)
+        components["mode"] = "proxy_quoted_spread"
         components["spread"] = float(round(spread, 4))
         components["spread_pct"] = float(round(spread_pct, 4))
 
@@ -67,16 +69,11 @@ class SpreadDynamicsSignal(Signal):
 
         # Tightening spread (< expected) = safe, healthy market
         # Widening spread (> expected) = informed trading, caution
-        if spread_ratio <= 0.5:
-            score = 0.8  # Very tight, healthy
-        elif spread_ratio <= 1.0:
-            score = 0.3  # Normal
-        elif spread_ratio <= 2.0:
-            score = -0.3  # Wider than usual
-        else:
-            score = -0.8  # Abnormally wide
-
-        confidence = min(1.0, 0.6 + abs(score) * 0.3)
+        score = bounded_tanh(-(spread_ratio - 1.0), scale=1.6)
+        confidence = confidence_from_strength(
+            abs(score),
+            data_quality=1.0 if (bid > 0 and ask > 0) else 0.0,
+        )
 
         return SignalResult(
             score=float(score),

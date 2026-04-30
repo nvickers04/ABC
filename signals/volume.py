@@ -1,6 +1,7 @@
 """Signal 5: Volume profile — relative volume, volume trend, OBV direction."""
 
 import numpy as np
+from signals.formula_utils import bounded_tanh, confidence_from_strength
 from signals.base import Signal, SignalResult
 
 
@@ -44,17 +45,25 @@ class VolumeSignal(Signal):
         # OBV slope (last 10 bars)
         if len(obv) >= 10:
             obv_slope = (obv[-1] - obv[-10]) / (np.std(obv[-10:]) + 1e-9)
-            obv_score = np.clip(obv_slope / 3, -1, 1)
+            obv_score = bounded_tanh(obv_slope, scale=0.45)
         else:
             obv_score = 0.0
 
         # Combine: direction from OBV, magnitude from relative volume
         vol_magnitude = rel_vol / 2.0  # Scale 2x avg = 1.0
-        vol_trend_score = np.clip(vol_trend, -1, 1)
+        vol_trend_score = bounded_tanh(vol_trend, scale=1.5)
 
         # Accumulation (+) vs distribution (-)
-        score = obv_score * 0.5 + vol_trend_score * 0.3 + np.clip(vol_magnitude - 1, -1, 1) * 0.2 * np.sign(obv_score)
-        confidence = min(1.0, max(abs(obv_score), vol_magnitude / 3.0))
+        participation = bounded_tanh(vol_magnitude - 1.0, scale=1.8)
+        score = bounded_tanh(
+            obv_score * 0.5 + vol_trend_score * 0.3 + participation * 0.2 * np.sign(obv_score),
+            scale=1.1,
+        )
+        data_quality = min(1.0, len(close) / 80.0)
+        confidence = confidence_from_strength(
+            abs(score),
+            data_quality=data_quality * (0.6 + 0.4 * min(rel_vol / 2.5, 1.0)),
+        )
 
         return SignalResult(
             score=float(score),

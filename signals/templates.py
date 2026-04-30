@@ -148,6 +148,25 @@ def load_boundaries(db_conn) -> dict[str, dict[str, float]]:
     return boundaries
 
 
+def _normalize_boundary_params(params: dict[str, float]) -> dict[str, float]:
+    """Normalize boundary params so *_min/*_max pairs stay ordered."""
+    out = dict(params)
+    pairs = [
+        ("composite_min", "composite_max"),
+        ("iv_rank_min", "iv_rank_max"),
+        ("atr_pct_min", "atr_pct_max"),
+    ]
+    for min_k, max_k in pairs:
+        if min_k in out and max_k in out:
+            lo = float(out[min_k])
+            hi = float(out[max_k])
+            if lo > hi:
+                lo, hi = hi, lo
+            out[min_k] = lo
+            out[max_k] = hi
+    return out
+
+
 def save_boundaries(
     db_conn,
     template_name: str,
@@ -157,9 +176,15 @@ def save_boundaries(
 ) -> None:
     """Persist boundary parameters for a template."""
     now = time.time()
+    clean = {
+        k: float(v)
+        for k, v in params.items()
+        if not str(k).startswith("_")
+    }
+    clean = _normalize_boundary_params(clean)
     rows = [
         (template_name, pname, pval, generation, fitness, now)
-        for pname, pval in params.items()
+        for pname, pval in clean.items()
     ]
     db_conn.executemany(
         "INSERT OR REPLACE INTO template_boundaries "
@@ -218,7 +243,7 @@ def select_template(
     candidates: list[tuple[str, float]] = []
 
     for tname, tdef in TEMPLATE_DEFS.items():
-        b = boundaries.get(tname, {})
+        b = _normalize_boundary_params(boundaries.get(tname, {}))
         comp_min = b.get("composite_min", 0.25)
         comp_max = b.get("composite_max", 1.0)
 
@@ -296,6 +321,16 @@ def _get_track_record(
         (template_name, regime_key),
     )
     row = cur.fetchone()
+    if row is None:
+        # Fallback to aggregate record if regime-specific row not yet present.
+        cur = db_conn.execute(
+            "SELECT trades, wins, avg_return_pct, sharpe "
+            "FROM template_performance "
+            "WHERE template_name = ? AND regime_key = ? "
+            "ORDER BY updated_ts DESC LIMIT 1",
+            (template_name, "all"),
+        )
+        row = cur.fetchone()
     if row:
         trades, wins, avg_ret, sharpe = row
         return {

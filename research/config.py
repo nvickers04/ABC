@@ -66,6 +66,15 @@ MAX_CREDITS_PER_ROUND = 200         # Circuit breaker
 OPTION_CHAIN_DTE_RANGE = (7, 60)    # Limit DTE to reduce response size
 OPTION_CHAIN_STRIKE_LIMIT = 20      # Max strikes per expiration (server-side filter)
 
+# ── Market Data App adaptive pacing (research daemon) ────────────
+# Uses X-Api-Ratelimit-* headers from responses (authoritative). Ratios
+# are credits_remaining / credits_limit. When unknown (before first HTTP),
+# the scorer runs normally until headers arrive.
+MDA_LOW_CREDIT_FRACTION = 0.20            # Below: double sleep between rounds
+MDA_CRITICAL_CREDIT_FRACTION = 0.10     # Below: 4x sleep (overrides low tier)
+MDA_SKIP_SUBDAILY_FRACTION = 0.15       # Below: skip 1m/5m/1h candle bundles (saves ~75 calls/round @ n=25)
+MDA_DAILY_CREDIT_LIMIT_TYPICAL = 100_000  # Doc / sanity only; API headers are authoritative
+
 # ── Options structure schemas ──────────────────────────────────
 # These are the REQUIRED fields for each options structure.
 # The simulator and promotion engine use these for deterministic contract

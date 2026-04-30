@@ -524,6 +524,10 @@ class DataProvider:
         self._default_ttl = 60  # Fallback
         self._executor = ThreadPoolExecutor(max_workers=4)
 
+    def get_mda_usage(self) -> Dict[str, Any]:
+        """Return MarketData.app client stats (credits, circuit breaker, request counts)."""
+        return self._mda_client.get_usage()
+
     @staticmethod
     def _normalize_expiration(exp: str) -> str:
         """Convert expiration to YYYYMMDD format for IBKR compatibility.

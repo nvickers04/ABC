@@ -36,6 +36,12 @@ larger option chains, retry storms).  The MDA client's circuit breaker
 short-circuits all calls once credits hit zero, so going over still
 fails safe — but planning under headroom lets us avoid that path.
 
+Adaptive pacing (see ``core/runtime/mda_budget.py``): when API headers show
+remaining credits below configured fractions of the daily limit, the scorer
+multiplies this sleep interval (2x / 4x) and can skip sub-daily OHLCV bundles
+to shed ~75 calls per round at ``n=25``. Snapshot keys ``mda_*`` in
+``research_config`` expose live counters for dashboards.
+
 Why these tiers map to real signal value
 ----------------------------------------
 * REGULAR 10s — all the intraday signals (momentum, mean_reversion,

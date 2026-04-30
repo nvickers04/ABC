@@ -33,7 +33,7 @@ def get_research_config(key: str, default: float) -> float:
     return float(row["value"]) if row else default
 
 
-def set_research_config(key: str, value: float, reason: str = "") -> None:
+def set_research_config(key: str, value: float, reason: str = "", *, log: bool = True) -> None:
     """Write (upsert) a tunable config value with an audit trail."""
     ts = datetime.now(timezone.utc).isoformat()
     get_db().execute(
@@ -46,7 +46,8 @@ def set_research_config(key: str, value: float, reason: str = "") -> None:
         (key, value, ts, reason),
     )
     get_db().commit()
-    logger.info(f"research_config[{key}] = {value}  ({reason})")
+    if log:
+        logger.info(f"research_config[{key}] = {value}  ({reason})")
 
 
 def get_all_research_config() -> dict[str, float]:

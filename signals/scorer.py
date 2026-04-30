@@ -17,6 +17,12 @@ import time
 from typing import Any
 
 from core.async_utils import safe_sleep
+from core.runtime.mda_budget import (
+    log_mda_round_status,
+    mda_cadence_multiplier,
+    persist_mda_snapshot_to_db,
+    should_skip_subdaily_candle_fetches,
+)
 from research.config import (
     DEEP_SCAN_TOP_N,
     OPTION_CHAIN_DTE_RANGE,
@@ -174,7 +180,7 @@ async def run_research(*, verbose: bool = False, use_cadence: bool = False) -> N
             credits_used = await _scoring_round(dp, conn, round_num)
             elapsed = time.time() - t0
             logger.info(
-                "Scoring round %d complete: %.1fs, ~%d credits",
+                "Scoring round %d complete: %.1fs, ~%d scorer_units (rough cost model; not MDA dashboard credits)",
                 round_num, elapsed, credits_used,
             )
             try:
@@ -187,6 +193,18 @@ async def run_research(*, verbose: bool = False, use_cadence: bool = False) -> N
             try:
                 from core.runtime.heartbeat import write_heartbeat
                 write_heartbeat()
+            except Exception:
+                pass
+            try:
+                usage = dp.get_mda_usage()
+                _mda_mult = mda_cadence_multiplier(usage)
+                persist_mda_snapshot_to_db(usage, _mda_mult)
+                log_mda_round_status(
+                    round_num,
+                    usage,
+                    _mda_mult,
+                    should_skip_subdaily_candle_fetches(usage),
+                )
             except Exception:
                 pass
         except asyncio.CancelledError:
@@ -205,7 +223,19 @@ async def run_research(*, verbose: bool = False, use_cadence: bool = False) -> N
         try:
             if _USE_CADENCE:
                 from core.runtime.cadence import cadence_seconds
-                await safe_sleep(float(cadence_seconds()))
+
+                _u = dp.get_mda_usage()
+                _base = float(cadence_seconds())
+                _mult = mda_cadence_multiplier(_u)
+                _sleep_s = _base * _mult
+                if _mult > 1.0:
+                    logger.info(
+                        "MDA pacing: sleep %.0fs (base %.0fs x %.1f low-credit stretch)",
+                        _sleep_s,
+                        _base,
+                        _mult,
+                    )
+                await safe_sleep(_sleep_s)
             else:
                 await safe_sleep(ROUND_DELAY_SECS)
         except asyncio.CancelledError:
@@ -295,25 +325,35 @@ async def _scoring_round(dp, conn, round_num: int) -> int:
         lb = int(getattr(sig, "return_lookback_days", 30))
         needed_res[res] = max(needed_res.get(res, 0), lb)
 
-    for res, lb_days in needed_res.items():
-        t_r = time.time()
-        bundle = await asyncio.gather(
-            *[dp.get_candles_async(sym, resolution=res, days_back=lb_days) for sym in universe],
-            return_exceptions=True,
+    _usage_ration = dp.get_mda_usage()
+    _skip_subdaily = should_skip_subdaily_candle_fetches(_usage_ration)
+    if _skip_subdaily and needed_res:
+        logger.warning(
+            "Round %d: MDA rationing — skipping %d sub-daily candle bundle(s) "
+            "(1m/5m/1h); daily bars only until credits recover",
+            round_num,
+            len(needed_res),
         )
-        cmap: dict[str, Any] = {}
-        for sym, raw in zip(universe, bundle):
-            if isinstance(raw, Exception):
-                logger.debug("Candles[%s] fetch failed for %s: %s", res, sym, raw)
-                continue
-            if raw:
-                cmap[sym] = raw
-        candles_by_res[res] = cmap
-        credits_used += len(universe)
-        logger.info(
-            "Round %d: candles[%s] fetched for %d/%d symbols in %.1fs (lb=%dd)",
-            round_num, res, len(cmap), len(universe), time.time() - t_r, lb_days,
-        )
+    if not _skip_subdaily:
+        for res, lb_days in needed_res.items():
+            t_r = time.time()
+            bundle = await asyncio.gather(
+                *[dp.get_candles_async(sym, resolution=res, days_back=lb_days) for sym in universe],
+                return_exceptions=True,
+            )
+            cmap: dict[str, Any] = {}
+            for sym, raw in zip(universe, bundle):
+                if isinstance(raw, Exception):
+                    logger.debug("Candles[%s] fetch failed for %s: %s", res, sym, raw)
+                    continue
+                if raw:
+                    cmap[sym] = raw
+            candles_by_res[res] = cmap
+            credits_used += len(universe)
+            logger.info(
+                "Round %d: candles[%s] fetched for %d/%d symbols in %.1fs (lb=%dd)",
+                round_num, res, len(cmap), len(universe), time.time() - t_r, lb_days,
+            )
 
     # SPY/QQQ for market-level signals
     spy_candles, qqq_candles = await asyncio.gather(
@@ -515,7 +555,7 @@ async def _scoring_round(dp, conn, round_num: int) -> int:
     await asyncio.to_thread(_compute_forward_returns, conn, dp, candles_by_res, now)
 
     logger.info(
-        "Round %d: N_eff=%.1f, %d composites, %d recs, %d credits",
+        "Round %d: N_eff=%.1f, %d composites, %d recs, %d scorer_units",
         round_num, n_eff, len(full_composites), len(recommendations), credits_used,
     )
 

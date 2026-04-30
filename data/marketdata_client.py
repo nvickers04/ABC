@@ -298,6 +298,7 @@ class MarketDataClient:
             'mda_credits_remaining': self._credits_remaining,
             'mda_credits_limit': self._credits_limit,
             'mda_credits_reset_epoch': self._credits_reset,
+            'mda_breaker_open': self._is_credits_exhausted(),
         }
 
     async def get_hybrid_quote(self, symbol: str) -> Optional[Dict[str, Any]]:

@@ -193,6 +193,10 @@ async def run_research(*, verbose: bool = False, use_cadence: bool = False) -> N
             logger.info("Scoring loop cancelled")
             break
         except Exception as e:
+            try:
+                conn.rollback()
+            except Exception:
+                pass
             logger.error("Scoring round %d failed: %s", round_num, e, exc_info=True)
 
         # Sleep until the next round.  When ``use_cadence`` was passed

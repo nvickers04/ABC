@@ -255,6 +255,7 @@ redis/*.exe
 
 # Memory backup snapshots
 data/memory_backup_*/
+backups/postgres/
 
 # Private keys (NEVER commit)
 *.pem

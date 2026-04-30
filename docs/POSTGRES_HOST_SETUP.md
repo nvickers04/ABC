@@ -68,3 +68,22 @@ Research machine URL format:
 `postgresql://research_user:<RESEARCH_PASSWORD>@127.0.0.1:5432/abc_shared`
 
 Note: the memory layer now requires PostgreSQL connection env vars (`DATABASE_URL` or `PG*`).
+
+## 6) Daily backups (recommended)
+
+This repo includes a local backup script:
+
+`scripts/backup_postgres.ps1`
+
+It will:
+- run `pg_dump -Fc` from the running `abc-postgres` container
+- write a timestamped `.dump` file to `backups/postgres/`
+- delete backups older than 14 days (default)
+
+Run once manually:
+
+`powershell -ExecutionPolicy Bypass -File "scripts/backup_postgres.ps1"`
+
+Create a daily Windows Task Scheduler job (example 03:15):
+
+`schtasks /Create /TN "ABC-Postgres-DailyBackup" /TR "powershell -NoProfile -ExecutionPolicy Bypass -File \"C:\Users\nvick\Documents\GitHub\ABC\scripts\backup_postgres.ps1\"" /SC DAILY /ST 03:15 /F`

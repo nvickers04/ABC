@@ -194,6 +194,10 @@ async def run_template_evolution() -> None:
             logger.info("Template evolution cancelled")
             break
         except Exception as e:
+            try:
+                conn.rollback()
+            except Exception:
+                pass
             logger.error("Template evolution error: %s", e, exc_info=True)
             time.sleep(60)
 

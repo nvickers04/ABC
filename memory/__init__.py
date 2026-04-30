@@ -13,6 +13,7 @@ longer created on fresh DBs.
 import logging
 import os
 import re
+import threading
 from datetime import datetime, timezone
 from pathlib import Path
 from zoneinfo import ZoneInfo
@@ -23,7 +24,7 @@ from psycopg.rows import dict_row
 logger = logging.getLogger(__name__)
 
 _DB_PATH = Path(__file__).parent / "abc.db"
-_connection = None
+_connections_by_thread: dict[int, "_CompatConnection"] = {}
 
 
 class _CompatRow(dict):
@@ -38,11 +39,20 @@ class _CompatRow(dict):
             return self._ordered_values[key]
         return super().__getitem__(key)
 
+    def __iter__(self):
+        # Match sqlite3.Row iteration semantics (values in column order),
+        # so existing tuple-unpacking code keeps working.
+        return iter(self._ordered_values)
+
+    def __len__(self):
+        return len(self._ordered_values)
+
 
 class _CompatCursor:
     def __init__(self, cursor, lastrowid=None):
         self._cursor = cursor
         self.lastrowid = lastrowid if lastrowid is not None else getattr(cursor, "lastrowid", None)
+        self.rowcount = getattr(cursor, "rowcount", -1)
 
     def fetchone(self):
         row = self._cursor.fetchone()
@@ -53,6 +63,10 @@ class _CompatCursor:
     def fetchall(self):
         rows = self._cursor.fetchall()
         return [_CompatRow(dict(r)) for r in rows]
+
+    def __getattr__(self, name):
+        # Preserve compatibility for cursor attrs used by existing code.
+        return getattr(self._cursor, name)
 
 
 class _CompatConnection:
@@ -131,17 +145,27 @@ class _CompatConnection:
     def execute(self, sql: str, params=None):
         cur = self._conn.cursor(row_factory=dict_row)
         adapted = self._adapt_sql(sql)
-        if params is None:
-            cur.execute(adapted)
-        else:
-            cur.execute(adapted, params)
+        try:
+            if params is None:
+                cur.execute(adapted)
+            else:
+                cur.execute(adapted, params)
+        except Exception:
+            # Clear failed transaction state so long-running loops can recover.
+            self._conn.rollback()
+            raise
         return _CompatCursor(cur)
 
     def executemany(self, sql: str, seq_of_parameters):
         """Batch execute; mirrors sqlite3.Connection.executemany."""
         adapted = self._adapt_sql(sql)
         with self._conn.cursor() as cur:
-            cur.executemany(adapted, seq_of_parameters)
+            try:
+                cur.executemany(adapted, seq_of_parameters)
+            except Exception:
+                # psycopg pipeline mode can leave the transaction INERROR.
+                self._conn.rollback()
+                raise
 
     def executescript(self, sql: str):
         script = self._adapt_schema_sql(sql)
@@ -152,6 +176,9 @@ class _CompatConnection:
 
     def commit(self):
         self._conn.commit()
+
+    def rollback(self):
+        self._conn.rollback()
 
     def close(self):
         self._conn.close()
@@ -268,9 +295,10 @@ def _table_exists(conn, table: str) -> bool:
 
 def init_db():
     """Initialize PostgreSQL connection and schema, return connection."""
-    global _connection
-    if _connection is not None:
-        return _connection
+    tid = threading.get_ident()
+    existing = _connections_by_thread.get(tid)
+    if existing is not None:
+        return existing
 
     raw_conn = psycopg.connect(_resolve_postgres_dsn(), autocommit=False)
     conn = _CompatConnection(raw_conn)
@@ -698,7 +726,7 @@ def init_db():
     _apply_schema_migrations(conn)
 
     conn.commit()
-    _connection = conn
+    _connections_by_thread[tid] = conn
     logger.info("Memory DB initialized on PostgreSQL")
     return conn
 
@@ -767,9 +795,10 @@ def _apply_schema_migrations(conn) -> None:
 
 def get_db():
     """Get the database connection, initializing if needed."""
-    if _connection is None:
+    tid = threading.get_ident()
+    if tid not in _connections_by_thread:
         return init_db()
-    return _connection
+    return _connections_by_thread[tid]
 
 
 def get_schema_version(conn=None) -> int:
@@ -1111,15 +1140,15 @@ def reset_state(db_path=None) -> None:
     the two pending lookup dicts, resets the calibration version, and
     optionally repoints the DB path.
     """
-    global _DB_PATH, _connection, _calibration_version
+    global _DB_PATH, _calibration_version
     if db_path is not None:
         _DB_PATH = db_path
-    if _connection is not None:
+    for conn in list(_connections_by_thread.values()):
         try:
-            _connection.close()
+            conn.close()
         except Exception:  # pragma: no cover - defensive
             pass
-    _connection = None
+    _connections_by_thread.clear()
     _calibration_version = 0
     _pending_graduated_params.clear()
     _pending_order_context.clear()

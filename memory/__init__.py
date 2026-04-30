@@ -137,6 +137,12 @@ class _CompatConnection:
             cur.execute(adapted, params)
         return _CompatCursor(cur)
 
+    def executemany(self, sql: str, seq_of_parameters):
+        """Batch execute; mirrors sqlite3.Connection.executemany."""
+        adapted = self._adapt_sql(sql)
+        with self._conn.cursor() as cur:
+            cur.executemany(adapted, seq_of_parameters)
+
     def executescript(self, sql: str):
         script = self._adapt_schema_sql(sql)
         statements = self._split_sql_statements(script)

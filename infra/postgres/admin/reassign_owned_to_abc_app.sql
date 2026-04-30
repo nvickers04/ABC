@@ -1,0 +1,14 @@
+-- One-time migration (superuser): move ownership from research_user to abc_app.
+-- Required so both research_user and trader_user can run memory.init_db() DDL
+-- after SET ROLE abc_app (see DATABASE_APP_ROLE in root .env.template).
+--
+-- IMPORTANT: Stop research daemon and trader connections first, or this can
+-- block waiting for ACCESS EXCLUSIVE locks on tables.
+--
+-- Prerequisites: create_abc_app_role.sql applied (or init 02 on new DBs).
+--
+-- Apply (from repo root, PowerShell):
+--   Get-Content infra/postgres/admin/reassign_owned_to_abc_app.sql -Raw |
+--     docker exec -i abc-postgres psql -U postgres -d abc_shared -v ON_ERROR_STOP=1
+--
+REASSIGN OWNED BY research_user TO abc_app;

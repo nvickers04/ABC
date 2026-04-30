@@ -19,9 +19,34 @@ from pathlib import Path
 from zoneinfo import ZoneInfo
 
 import psycopg
+from psycopg import sql as psql_sql
 from psycopg.rows import dict_row
 
 logger = logging.getLogger(__name__)
+
+_PG_IDENTIFIER_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+
+
+def _apply_database_app_role(raw_conn) -> None:
+    """Optional SET ROLE for shared schema ownership (see infra/postgres/init/02)."""
+    role_raw = os.getenv("DATABASE_APP_ROLE", "").strip()
+    if not role_raw:
+        return
+    if not _PG_IDENTIFIER_RE.fullmatch(role_raw):
+        raise RuntimeError(
+            f"Invalid DATABASE_APP_ROLE {role_raw!r} "
+            "(use letters, digits, underscore; e.g. abc_app)"
+        )
+    try:
+        with raw_conn.cursor() as cur:
+            cur.execute(psql_sql.SQL("SET ROLE {}").format(psql_sql.Identifier(role_raw)))
+        raw_conn.commit()
+    except Exception as e:
+        raw_conn.rollback()
+        raise RuntimeError(
+            f"SET ROLE {role_raw!r} failed (is the login user a member of that role?): {e}"
+        ) from e
+    logger.debug("Session using DATABASE_APP_ROLE=%s", role_raw)
 
 _DB_PATH = Path(__file__).parent / "abc.db"
 _connections_by_thread: dict[int, "_CompatConnection"] = {}
@@ -301,6 +326,7 @@ def init_db():
         return existing
 
     raw_conn = psycopg.connect(_resolve_postgres_dsn(), autocommit=False)
+    _apply_database_app_role(raw_conn)
     conn = _CompatConnection(raw_conn)
 
     conn.executescript("""

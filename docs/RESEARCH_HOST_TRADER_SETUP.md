@@ -21,7 +21,9 @@ Both machines must point at the same Postgres DB to share research/trading state
 
 ### 2) Keep research running with current code
 - Pull latest repo changes
-- Set Postgres environment variables (`DATABASE_URL` or `PG*` vars)
+- Set Postgres environment variables (`DATABASE_URL` or `PG*` vars) and
+  `DATABASE_APP_ROLE=abc_app` after running the shared-owner migration — see
+  `docs/POSTGRES_HOST_SETUP.md` §7.
 - Start your research daemon as normal
 - Confirm signal pipeline is live (IC logs, composite updates)
 

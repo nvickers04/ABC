@@ -48,6 +48,7 @@ Expected roles:
 - `postgres`
 - `research_user`
 - `trader_user`
+- `abc_app` (NOLOGIN — optional until shared DDL setup; see §7)
 
 ## 4) Security guardrails
 
@@ -87,3 +88,27 @@ Run once manually:
 Create a daily Windows Task Scheduler job (example 03:15):
 
 `schtasks /Create /TN "ABC-Postgres-DailyBackup" /TR "powershell -NoProfile -ExecutionPolicy Bypass -File \"C:\Users\nvick\Documents\GitHub\ABC\scripts\backup_postgres.ps1\"" /SC DAILY /ST 03:15 /F`
+
+## 7) Shared DDL role `abc_app` (trader + research `init_db`)
+
+PostgreSQL only allows the **table owner** (or a superuser) to run `CREATE INDEX` and similar DDL. Grants are not enough. The trader runs `memory.init_db()` too (e.g. `scripts/verify_trader_db.py`), so objects cannot remain owned solely by `research_user`.
+
+**Layout:** NOLOGIN role `abc_app` owns application tables. Both login roles are members. On connect, the app runs `SET ROLE abc_app` when `DATABASE_APP_ROLE=abc_app` is set in the **project** `.env` on the research host **and** the trader host.
+
+**New databases:** `infra/postgres/init/02-abc-app-role.sh` creates `abc_app` on first container init.
+
+**Existing databases** (tables already owned by `research_user`):
+
+1. Apply role + grants (safe online):
+
+`Get-Content "infra/postgres/admin/create_abc_app_role.sql" -Raw | docker exec -i abc-postgres psql -U postgres -d abc_shared -v ON_ERROR_STOP=1`
+
+2. **Pause** the research daemon and trader DB connections — otherwise `REASSIGN OWNED` can wait indefinitely on locks.
+
+3. Reassign ownership:
+
+`Get-Content "infra/postgres/admin/reassign_owned_to_abc_app.sql" -Raw | docker exec -i abc-postgres psql -U postgres -d abc_shared -v ON_ERROR_STOP=1`
+
+4. Add to **both** project `.env` files: `DATABASE_APP_ROLE=abc_app`
+
+5. Trader: `python scripts/verify_trader_db.py` should print OK and exit 0.

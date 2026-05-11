@@ -35,6 +35,86 @@ _OPTIONS_MAX_CONCURRENCY = 3
 _OPTIONS_RETRY_ATTEMPTS = 3
 _MDA_MAX_CONCURRENT = 45  # MDA hard limit is 50; keep 5 headroom
 
+# US regular session length used to convert "calendar lookback days" → bar count.
+_RTH_MINUTES = 390  # ~6.5h
+# API hard limit: intraday range ≤ 1 year; keep a generous cap on countback.
+_MAX_INTRADAY_COUNTBACK = 80_000
+
+
+def normalize_mda_candle_resolution(resolution: str) -> str:
+    """Map internal names (1min, 5min, 1h) to MarketData.app URL tokens.
+
+    Docs: https://www.marketdata.app/docs/api/stocks/candles/
+    Minute examples: ``1``, ``5``, ``15`` — not ``5min``.
+    """
+    if not resolution:
+        return "D"
+    key = resolution.strip().lower()
+    aliases = {
+        "1min": "1",
+        "1m": "1",
+        "minutely": "1",
+        "3min": "3",
+        "5min": "5",
+        "5m": "5",
+        "15min": "15",
+        "15m": "15",
+        "30min": "30",
+        "30m": "30",
+        "45min": "45",
+        "45m": "45",
+        "1h": "H",
+        "60min": "H",
+        "60m": "H",
+        "hourly": "H",
+        "daily": "D",
+        "day": "D",
+        "d": "D",
+    }
+    if key in aliases:
+        return aliases[key]
+    return resolution.strip()
+
+
+def _resolution_countback_is_bars(norm: str) -> bool:
+    """True when MDA interprets ``countback`` as N candles (intraday/time bars)."""
+    n = norm.strip().upper()
+    if n.isdigit():
+        return True
+    if n == "H" or (len(n) >= 2 and n.endswith("H") and n[:-1].isdigit()):
+        return True
+    return False
+
+
+def _bars_per_rth_session(norm: str) -> int:
+    """Approximate finished RTH bars per session for one symbol."""
+    n = norm.strip().upper()
+    if n == "H":
+        return max(1, _RTH_MINUTES // 60)
+    if n.endswith("H") and n[:-1].isdigit():
+        hrs = max(1, int(n[:-1]))
+        return max(1, _RTH_MINUTES // (60 * hrs))
+    if n.isdigit():
+        mins = max(1, int(n))
+        return max(1, _RTH_MINUTES // mins)
+    # Unknown token — safest generic intraday assumption (~5m)
+    return max(1, _RTH_MINUTES // 5)
+
+
+def intraday_countback_from_calendar_days(norm: str, calendar_days: int) -> int:
+    """Turn ``return_lookback_days`` intent into MarketData ``countback`` (bars).
+
+    Without this, ``countback=5`` on 5‑minute candles is only *five bars*
+    (~25 minutes), which makes mature forward-return pairing look like endless
+    "zombies" (score timestamps fall before the candle window).
+    """
+    cd = max(1, int(calendar_days))
+    sessions = max(1, int(round(cd * 252 / 365)))
+    per = _bars_per_rth_session(norm)
+    base = sessions * per
+    headroom = max(80, per * 4)
+    return min(base + headroom, _MAX_INTRADAY_COUNTBACK)
+
 
 class MarketDataClient:
     """
@@ -577,8 +657,13 @@ class MarketDataClient:
 
         Args:
             symbol: Stock ticker
-            resolution: 'D' (daily), 'H' (hourly), '1'/'5'/'15' (minutes)
-            days_back: Number of days of history (if from_date not specified)
+            resolution: 'D' (daily), 'H' hourly, '5'/'1' minute (aliases: 5min, 1min, …)
+            days_back: If ``from_date`` is omitted — for **daily (and weekly/monthly)**
+              this is interpreted as MarketData ``countback`` (**number of candles**).
+              For **intraday resolutions** (minutes / hour), callers still pass calendar
+              *lookback days* intent (same as signals' ``return_lookback_days``); it is
+              converted to an approximate bar ``countback`` so short values are not misread as
+              "only N bars (~minutes of history)".
             from_date: Start date (YYYY-MM-DD)
             to_date: End date (YYYY-MM-DD)
 
@@ -590,6 +675,7 @@ class MarketDataClient:
             return None
 
         try:
+            norm_res = normalize_mda_candle_resolution(resolution)
             # Build query params (resolution is already in the URL path)
             params = {}
             if from_date:
@@ -597,10 +683,20 @@ class MarketDataClient:
                 if to_date:
                     params['to'] = to_date
             else:
-                params['countback'] = days_back
+                if _resolution_countback_is_bars(norm_res):
+                    cb = intraday_countback_from_calendar_days(norm_res, days_back)
+                    params['countback'] = cb
+                    if os.getenv("MDA_INTRADAY_EXTENDED", "0") == "1":
+                        params["extended"] = "true"
+                    logger.debug(
+                        "MDA candles %s %s: countback=%d (from ~%d calendar-day lookback)",
+                        norm_res, symbol, cb, days_back,
+                    )
+                else:
+                    params['countback'] = days_back
 
             response = await self._get_with_retries(
-                f"/stocks/candles/{resolution}/{symbol}/",
+                f"/stocks/candles/{norm_res}/{symbol}/",
                 params=params,
                 label=f"candles({symbol})",
             )

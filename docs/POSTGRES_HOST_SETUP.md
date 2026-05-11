@@ -19,7 +19,8 @@ This machine is your DB host and research box.
   - `docker compose -f infra/postgres/docker-compose.yml down`
 - If you must reset all DB data:
   - `docker compose -f infra/postgres/docker-compose.yml down -v`
-- App runtime can continue using SQLite at `memory/abc.db`.
+- Current builds require PostgreSQL; there is no automatic SQLite fallback.
+- If Postgres is unavailable, stop trading/research processes and restore service from a known-good Postgres backup before resuming.
 
 ---
 

@@ -1,4 +1,4 @@
-# ABC — Grok 4.20 Autonomous Trader
+# ABC — Grok Autonomous Trader
 
 **Ultra-lean version — Grok does ALL screening, analysis, and decisions.**
 
@@ -115,18 +115,15 @@ TRADING_MODE=live python __main__.py
 
 ## Model
 
-Using **Grok 4.20 0309 Reasoning** via the native xAI SDK (`xai-sdk >= 1.8.0`).
+The trader uses **Grok** (xAI) via the native SDK (`xai-sdk >= 1.8.0`). Exact API
+model slugs are defined in **`core/grok_llm.py`** only (`REASONING_MODEL` for the
+ReAct loop, `MULTI_AGENT_MODEL` for the optional `research()` tool). Documentation
+refers generically to Grok so you do not chase version strings across the repo when
+xAI renames models.
 
-| Slug | Role |
-|------|------|
-| `grok-4.20-0309-reasoning` | Single-agent ReAct trading loop (client-side tools) |
-| `grok-4.20-multi-agent-experimental-beta-0304` | Multi-agent research swarm (built-in web_search/x_search only) |
+## Tools
 
-Model slugs are beta and may change without notice. Update in `core/grok_llm.py`.
-
-## Tools: 4.20-ready
-
-Tool interfaces are now normalized for Grok 4.20 usage:
+Tool interfaces are normalized for Grok tool-calling usage:
 
 - ATR accepts string resolutions (for example `daily`, `D`, `5`) without failing on `int()` parsing.
 - `bracket_order` accepts `stop_loss` + `take_profit` (entry price inferred from explicit input or live quote).

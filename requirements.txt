@@ -1,4 +1,4 @@
-# ABC Grok 4.20 Trader — Requirements
+# ABC Grok Trader — Requirements
 # pip install -r requirements.txt
 
 # LLM (Grok via xAI native SDK)
@@ -9,6 +9,7 @@ ib-insync>=0.9.86,<1.0
 
 # Data & Config
 numpy>=2.1.1,<3.0
+scipy>=1.14.1,<2.0
 pandas>=2.2.3,<3.0
 pyyaml>=6.0.2,<7.0
 python-dotenv>=1.0.0,<2.0

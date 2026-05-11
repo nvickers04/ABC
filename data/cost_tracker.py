@@ -45,13 +45,19 @@ logger = logging.getLogger(__name__)
 # Profit allocation to LLM research
 PROFIT_ALLOCATION_PCT = 0.50  # 50% of profits go to LLM credits
 
-# Cost per 1M tokens (approximate, update as pricing changes)
+# Cost per 1M tokens (approximate; align with https://docs.x.ai/docs/pricing )
 MODEL_COSTS = {
-    # xAI Grok 4.20 (0309 Reasoning)
+    # xAI Grok 4.3 (flagship chat / reasoning) — docs.x.ai/developers/models/grok-4.3
+    "grok-4.3": {"input": 1.25, "output": 2.50},
+    "grok-4.3-latest": {"input": 1.25, "output": 2.50},
+    "grok-latest": {"input": 1.25, "output": 2.50},
+    # xAI Grok 4.20-era slugs (legacy logs + prior builds)
     "grok-4.20-0309-reasoning": {"input": 2.00, "output": 6.00},
     "grok-4.20-experimental-beta-0304-reasoning": {"input": 2.00, "output": 6.00},
     "grok-4.20-experimental-beta-0304-non-reasoning": {"input": 2.00, "output": 6.00},
-    "grok-4.20-multi-agent-experimental-beta-0304": {"input": 2.00, "output": 6.00},
+    "grok-4.20-multi-agent-experimental-beta-0304": {"input": 1.25, "output": 2.50},
+    "grok-4.20-multi-agent": {"input": 1.25, "output": 2.50},
+    "grok-4.20-multi-agent-0309": {"input": 1.25, "output": 2.50},
     # xAI Grok (legacy)
     "grok-2": {"input": 2.00, "output": 10.00},
     "grok-2-mini": {"input": 0.30, "output": 0.50},

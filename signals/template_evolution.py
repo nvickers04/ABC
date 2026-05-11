@@ -214,7 +214,7 @@ async def _evolution_round(conn) -> None:
     composites = _load_historical_composites(conn)
     if len(composites) < TEMPLATE_EVOLUTION_MIN_TRADES:
         logger.debug(
-            "Not enough composite history (%d < %d) — skipping evolution",
+            "Not enough composite+forward-return rows (%d < %d) — skipping evolution",
             len(composites), TEMPLATE_EVOLUTION_MIN_TRADES,
         )
         return
@@ -236,8 +236,10 @@ async def _evolution_round(conn) -> None:
         if not current_b:
             continue
 
-        # Evaluate current boundaries on OOS
+        # Evaluate current boundaries on OOS and persist baseline metrics.
+        # This keeps template_performance populated even when no mutation wins.
         current_oos_metrics = _evaluate_boundaries(tname, current_b, oos_data)
+        _upsert_performance_metrics(conn, tname, current_oos_metrics)
 
         # Generate and test mutations
         best_mutation = None
@@ -452,8 +454,12 @@ def _update_performance(
 ) -> None:
     """Update template_performance table with OOS metrics."""
     metrics = _evaluate_boundaries(template_name, boundaries, oos_data)
-    now = time.time()
+    _upsert_performance_metrics(conn, template_name, metrics)
 
+
+def _upsert_performance_metrics(conn, template_name: str, metrics: dict[str, float]) -> None:
+    """Persist template OOS metrics to template_performance."""
+    now = time.time()
     conn.execute(
         "INSERT OR REPLACE INTO template_performance "
         "(template_name, regime_key, composite_bucket, trades, wins, "

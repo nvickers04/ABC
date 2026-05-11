@@ -1,7 +1,7 @@
 """
-Memory Layer — SQLite persistence for research + trading.
+Memory Layer — PostgreSQL persistence for research + trading.
 
-Single file (memory/abc.db), WAL mode. The signal-combination engine owns
+The signal-combination engine owns
 the live tables (signal_scores, signal_weights, composite_scores,
 template_recommendations, template_performance). Execution writes to
 trades + trade_feedback; the trader and research loops both read the

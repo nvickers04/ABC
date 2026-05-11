@@ -1,5 +1,5 @@
 """
-Grok 4.20 Trader — Entry Point
+Grok Trader — Entry Point
 
 Usage:
     python __main__.py                  # Run agent (paper trading)
@@ -7,7 +7,7 @@ Usage:
     python __main__.py --verbose        # Debug logging
     python __main__.py --account live   # Live trading (use with caution)
 
-Built for Grok 4.20 — dynamic liquidity, overnight holds OK, configurable risk.
+Built for Grok (xAI) — dynamic liquidity, overnight holds OK, configurable risk.
 """
 
 import asyncio
@@ -114,7 +114,7 @@ async def test_grok():
 
 def main():
     """Main entry point."""
-    parser = argparse.ArgumentParser(description="Grok 4.20 Trader")
+    parser = argparse.ArgumentParser(description="Grok Trader (xAI)")
     parser.add_argument("--test", action="store_true", help="Test Grok connection")
     parser.add_argument("--verbose", action="store_true", help="Enable DEBUG logging")
     parser.add_argument("--no-research", action="store_true",
@@ -156,7 +156,7 @@ def main():
 
     validate_startup()
 
-    print(f"\nStarting Grok 4.20 Trader (account={args.account})...")
+    print(f"\nStarting Grok Trader (account={args.account})...")
     print("Press Ctrl+C to stop\n")
 
     from core.agent import run_agent

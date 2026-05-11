@@ -923,7 +923,7 @@ Account state above. Start by calling briefing() to assess research status."""
 async def run_agent():
     """Main entry point for the autonomous trading agent."""
     logger.info("=" * 60)
-    logger.info("GROK 4.20 TRADER — Pure ReAct")
+    logger.info("GROK TRADER — Pure ReAct")
     logger.info(f"Risk per trade: {RISK_PER_TRADE*100:.1f}%  |  Min R:R: {MIN_RR_RATIO}:1")
     logger.info(f"Trading mode: {TRADING_MODE}")
     if PAPER_AGGRESSIVE:
@@ -990,5 +990,5 @@ if __name__ == "__main__":
                 "ib_insync.ib", "ib_insync.client", "ib_insync.decoder",
                 "ib_insync.connection", "ib_insync.flexreport", "ib_insync.order",
                 "asyncio", "nest_asyncio"):        logging.getLogger(lib).setLevel(logging.WARNING)
-    print("Grok 4.20 Trader started (paper mode recommended)")
+    print("Grok Trader started (paper mode recommended)")
     asyncio.run(run_agent())

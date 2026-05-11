@@ -10,7 +10,7 @@ a new architecture.
 | [marketdata-app.md](marketdata-app.md) | MarketData.app (MDA) | Primary historical + bulk current data |
 | [ibkr.md](ibkr.md) | Interactive Brokers (`ib_insync`) | Trading + real-time streaming + auction imbalance |
 | [yfinance.md](yfinance.md) | Yahoo Finance (unofficial scrape) | Fundamentals, ownership, news, earnings calendar |
-| [grok-xai.md](grok-xai.md) | xAI / Grok 4.20 | LLM (the trader's brain) |
+| [grok-xai.md](grok-xai.md) | xAI / Grok | LLM (the trader's brain) |
 | [process-ownership.md](process-ownership.md) | — | Which **process** owns which data source, and why |
 
 ## TL;DR

@@ -5,15 +5,14 @@ Uses the official xai-sdk (>= 1.8.0) for all model communication.
 The agent loop in agent.py uses self.grok.client.chat.create() to build
 conversations and chat.sample() to get responses.
 
-Models:
-    REASONING_MODEL  — single-agent with chain-of-thought (trading loop)
-    MULTI_AGENT_MODEL — 4/16 agent research swarm (built-in tools only)
+**API model slugs live only here** (`REASONING_MODEL`, `MULTI_AGENT_MODEL`).
+Elsewhere (docs, prompts, logs) refer generically to “Grok” so a version
+change is a single edit plus `data/cost_tracker.py` pricing if xAI changes
+rates. Slug validity: https://docs.x.ai/docs/models
 
-Usage:
-    llm = get_grok_llm()
-    chat = llm.client.chat.create(model=llm.model, messages=[...])
-    response = await chat.sample()
-    print(response.content)
+Models:
+    REASONING_MODEL   — single-agent ReAct trading loop (client-side tools)
+    MULTI_AGENT_MODEL — multi-agent research (built-in web_search / x_search)
 """
 
 import logging
@@ -24,11 +23,9 @@ from xai_sdk import AsyncClient
 
 logger = logging.getLogger(__name__)
 
-# ── Model Slugs (beta — may change without notice) ─────────────
-# WARNING: xAI beta slugs are NOT stable. Check https://docs.x.ai/docs
-# for latest model names if API calls start failing with model-not-found.
-REASONING_MODEL = "grok-4.20-0309-reasoning"
-MULTI_AGENT_MODEL = "grok-4.20-multi-agent-experimental-beta-0304"
+# ── xAI API model slugs (edit here when xAI renames or you switch tiers) ──
+REASONING_MODEL = "grok-4.3"
+MULTI_AGENT_MODEL = "grok-4.20-multi-agent"
 
 
 class GrokLLM:

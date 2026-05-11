@@ -1,5 +1,5 @@
 """
-Multi-Agent Research Tool — uses grok-4.20-multi-agent for web/X research.
+Multi-Agent Research Tool — server-side multi-agent Grok for web/X research.
 
 The trading agent's reasoning model calls research(query) like any other tool.
 Internally, this fires 4 multi-agent workers with web_search + x_search,

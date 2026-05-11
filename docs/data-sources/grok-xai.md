@@ -1,9 +1,10 @@
-# Grok 4.20 (xAI)
+# Grok (xAI)
 
-**Used by:** `core/grok_llm.py` → `core/agent.py`
-**Library:** `xai_sdk`
-**Model:** `grok-4.20-0309-reasoning`, `temperature=0.0`, `seed=42`
-**Process:** Trader only.  The research daemon makes zero LLM calls.
+**Used by:** `core/grok_llm.py` → `core/agent.py`  
+**Library:** `xai_sdk`  
+**API slugs:** `REASONING_MODEL` and `MULTI_AGENT_MODEL` in [`core/grok_llm.py`](../../core/grok_llm.py) (single source of truth; see [xAI models](https://docs.x.ai/docs/models)).  
+**Hyperparameters:** `temperature=0.0`, `seed=42` (from `core/config.py`).  
+**Process:** Trader only. The research daemon makes zero LLM calls.  
 **Auth env:** `XAI_API_KEY` or `GROK_API_KEY`
 
 ## What we use it for

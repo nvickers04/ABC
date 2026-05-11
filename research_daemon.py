@@ -87,7 +87,7 @@ async def _run(*, verbose: bool, run_evolution: bool) -> None:
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Grok 4.20 Research Daemon")
+    parser = argparse.ArgumentParser(description="ABC Research Daemon (no LLM)")
     parser.add_argument("--verbose", action="store_true", help="DEBUG logging")
     parser.add_argument(
         "--no-evolution",

@@ -607,15 +607,23 @@ def _format_chart_frame(candles, resolution: str, label: str) -> dict | None:
         else:
             dates.append('')
 
+    # Keep chart payload compact for LLM context. Intraday lookbacks can be
+    # very large (thousands of bars), which can explode token usage.
+    max_bars = 120
+    start = max(0, n - max_bars)
+    returned_n = n - start
+
     return {
         "frame": label,
-        "bars": n,
-        "dates": dates,
-        "open": [round(candles.open[i], 2) for i in range(n)],
-        "high": [round(highs[i], 2) for i in range(n)],
-        "low": [round(lows[i], 2) for i in range(n)],
-        "close": [round(closes[i], 2) for i in range(n)],
-        "volume": list(volumes),
+        "bars_total": n,
+        "bars": returned_n,
+        "truncated": n > returned_n,
+        "dates": dates[start:],
+        "open": [round(candles.open[i], 2) for i in range(start, n)],
+        "high": [round(highs[i], 2) for i in range(start, n)],
+        "low": [round(lows[i], 2) for i in range(start, n)],
+        "close": [round(closes[i], 2) for i in range(start, n)],
+        "volume": list(volumes[start:]),
         "atr_14": atr_14,
         "trend": trend,
         "rel_volume": rel_vol,
@@ -691,14 +699,19 @@ async def handle_chart_quick(executor, params: dict) -> Any:
 async def handle_execution_status(executor, params: dict) -> Any:
     """Return execution autoresearch status: snapshot stats, graduated params, calibrated slippage."""
     try:
-        from memory import get_db, get_graduated_params, get_calibrated_slippage
+        from datetime import datetime, timedelta, timezone
+
+        from memory import get_calibrated_slippage, get_db, get_graduated_params
+
         db = get_db()
+        cutoff = (datetime.now(timezone.utc) - timedelta(days=7)).isoformat()
 
         # Snapshot summary
         row = db.execute("SELECT COUNT(*) as n FROM execution_snapshots WHERE status = 'filled'").fetchone()
         snap_total = row["n"] if row else 0
         row = db.execute(
-            "SELECT COUNT(*) as n FROM execution_snapshots WHERE status = 'filled' AND ts > datetime('now', '-7 days')"
+            "SELECT COUNT(*) as n FROM execution_snapshots WHERE status = 'filled' AND ts > ?",
+            (cutoff,),
         ).fetchone()
         snap_recent = row["n"] if row else 0
 
@@ -753,7 +766,7 @@ async def handle_open_hypotheses(executor, params: dict) -> Any:
         return {"error": str(e)}
 
 
-async def handle_research_engine(params: dict) -> dict:
+async def handle_research_engine(executor, params: dict) -> dict:
     """Agent-controlled background scorer + template evolution.
 
     params.action in {"status", "start", "pause", "resume", "stop"}.

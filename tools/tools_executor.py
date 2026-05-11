@@ -231,6 +231,11 @@ _ALIASES: dict[str, str] = {
     "econ_calendar": "economic_calendar",
     "calendar": "economic_calendar",
     "macro_events": "economic_calendar",
+    # Robustness: if model outputs {"action":"status"} due nested key collision,
+    # treat it as engine-status intent rather than hard-fail looping.
+    "status": "trader_rules",
+    "engine_status": "trader_rules",
+    "rules_status": "trader_rules",
     "fundamentals_extended": "extended_fundamentals",
     "buy_stock": "market_order",
     "sell_stock": "market_order",

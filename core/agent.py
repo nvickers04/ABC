@@ -761,6 +761,7 @@ Account state above. Start by calling briefing() to assess research status."""
         turn = 0
 
         cycle_actions = []
+        invalid_json_streak = 0
 
         while True:
             turn += 1
@@ -812,10 +813,25 @@ Account state above. Start by calling briefing() to assess research status."""
                 json_objects = _parse_json_objects(raw or "")
 
                 if not json_objects:
-                    logger.warning(f"No valid JSON: {raw[:100]}")
+                    invalid_json_streak += 1
+                    logger.warning(
+                        f"No valid JSON (streak={invalid_json_streak}): {(raw or '')[:100]}"
+                    )
                     chat.append(response)
-                    chat.append(sdk_user("Please respond with valid JSON for your next action."))
+                    if invalid_json_streak >= 3:
+                        logger.warning(
+                            "Circuit breaker: repeated invalid JSON responses "
+                            f"({invalid_json_streak})"
+                        )
+                        return 60
+                    chat.append(sdk_user(
+                        "Respond with exactly ONE JSON object and no prose/code fences.\n"
+                        "Required shape: {\"action\":\"<tool_or_done>\", ...params}.\n"
+                        "If waiting, use: "
+                        "{\"action\":\"done\",\"summary\":\"...\",\"cooldown\":30}."
+                    ))
                     continue
+                invalid_json_streak = 0
 
                 # Process actions — one real action per response
                 last_result = None

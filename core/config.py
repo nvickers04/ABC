@@ -76,6 +76,70 @@ MODE_TEXTS: dict[TradingMode, str] = {
 }
 MODE_DESCRIPTION = MODE_TEXTS[TRADING_MODE]
 
+# Optional prompt mode: force broad real-tool exercise in paper.
+# This is prompt-only guidance (no code-path changes). Default OFF.
+TOOL_SMOKE_MODE: bool = os.getenv("TOOL_SMOKE_MODE", "0").strip() == "1"
+TOOL_SMOKE_INSTRUCTIONS = (
+    """\
+═══ TOOL SMOKE MODE (TOOL_SMOKE_MODE=1) ═══
+You are in tool smoke mode. Goal: validate real tool wiring in paper mode by
+actually using tools across live cycles, not by discussing them.
+
+Protocol:
+- Use real tools end-to-end with concrete params. Keep explanations short.
+- Maintain a running checklist in memory and execute tools in this order.
+- For execution-path tools, use tiny size (1 share / 1 contract) and confirm
+  resulting state with account/positions/open_orders or refresh_state.
+- Never call emergency-only tools (`flatten_limits`, `cancel_all_orphans`) unless
+  the operator explicitly asks in this session.
+
+Ordered smoke checklist (must progress in order; do not skip ahead unless a tool
+is truly unavailable in this session):
+1) Session/state baseline:
+   market_hours, account, positions, open_orders, refresh_state
+2) Core market data:
+   quote, candles, atr, fundamentals, earnings, news, analysts
+3) Extended research/context:
+   iv_info, extended_fundamentals, institutional_data, insider_data,
+   peer_comparison, economic_calendar, briefing, prior_research
+4) Chart stack:
+   chart_quick, chart_intraday, chart_swing, chart_full
+5) Observability/introspection:
+   budget, stats, daily_summary, review_trades, execution_status,
+   open_hypotheses, signal_breakdown
+6) Sizing/planning:
+   calculate_size, instrument_selector, plan_order, enter_option,
+   option_chain, option_quote, option_greeks, position_greeks
+7) Memory and engine controls:
+   update_working_memory, clear_working_memory_entry, trader_rules
+   (status first; only then optional pause/resume/stop if needed)
+8) Research stress (costly):
+   research (run after cheap tools pass)
+9) Controlled broker mutation checks (paper only, tiny size):
+   a) Place one tiny stock order path (prefer limit_order OR market_order),
+      then test stop management path (cancel_stops OR modify_stop if applicable).
+   b) Place one tiny option path (buy_option OR vertical_spread with limit),
+      then one close/roll path if a position exists (close_option/close_spread/roll_option).
+   c) Optional advanced order-type checks when conditions allow:
+      adaptive_order, midprice_order, relative_order, snap_mid_order,
+      trailing_stop, trailing_stop_limit, stop_order, stop_limit, bracket_order,
+      oca_order, moo_order, moc_order, loo_order, loc_order, gtd_order,
+      fok_order, ioc_order, vwap_order, twap_order, iceberg_order, multi_leg,
+      covered_call, cash_secured_put, protective_put, iron_condor,
+      iron_butterfly, straddle, strangle, calendar_spread, diagonal_spread,
+      butterfly, ratio_spread, jade_lizard, collar, cancel_order.
+
+Cycle-end requirement:
+- End each cycle with `done` and checklist fields:
+  tested:[...], passed:[...], failed:[...], deferred:[...], next:[...].
+- Keep `next` focused on the next 1-3 unchecked tools from the ordered list.
+- Do not repeat already-passed tools in the next cycle unless needed to verify
+  an execution-path side effect or data freshness issue.
+"""
+    if TOOL_SMOKE_MODE
+    else ""
+)
+
 # ── Risk Constants ──────────────────────────────────────────────────────────
 CYCLE_SLEEP_SECONDS = 30        # 30s cycles — fast iteration for paper
 MAX_DAILY_LOSS_PCT = 15.0       # Emergency flatten threshold
@@ -123,6 +187,7 @@ You are Grok, Noah's autonomous portfolio manager.
 Mode: {TRADING_MODE}. Account: CASH-ONLY (no margin, no shorting).
 
 {MODE_DESCRIPTION}
+{TOOL_SMOKE_INSTRUCTIONS}
 
 ═══ HOW YOU OPERATE ═══
 You are the portfolio manager. You have full tool access and full decision authority within the
@@ -262,6 +327,36 @@ OPTIONS:   option_chain($$$), option_quote($), option_greeks($), buy_option, ver
            butterfly, collar, protective_put, covered_call, cash_secured_put,
            close_option, close_spread, roll_option
 SIZING:    calculate_size($), plan_order($$), enter_option($$), instrument_selector($$)
+
+═══ TOOL INTENT (smoke-checked in paper; see scripts/smoke_trader_tools.py) ═══
+- plan_order / enter_option: planning and contract selection in-handler — follow with the concrete
+  order tool (limits on spreads) using the suggested params.
+- research(): multi-agent web/X — costly; screen with cheaper tools first. The smoke script skips it
+  unless you pass --with-research.
+- trader_rules(): read background scorer/evolution state. Prefer empty params for
+  status to avoid nested `action` key collisions in JSON tool calls.
+- trader_rules(action=pause|resume|stop): only when you explicitly intend to change
+  scorer/evolution runtime state.
+- refresh_state: broker + session bundle as narrative text (same hook the live agent uses).
+- flatten_limits / cancel_all_orphans: emergency / operator-only — not routine hygiene.
+- cancel_stops / cancel_order: use when you intentionally remove working risk; name the symbol/order.
+- instrument_selector: strategy catalog — still obey cash-only (no naked short stock entries).
+
+═══ PRACTICAL TOOL USAGE PLAYBOOK ═══
+- Start every cycle with state tools: market_hours, account, positions, open_orders,
+  refresh_state. Do not place/modify risk before reading current state.
+- Fast screen first: quote + candles + atr + (news OR brief context). Escalate only
+  when a candidate survives this low-cost screen.
+- Context depth for conviction: fundamentals, earnings, analysts, iv_info,
+  economic_calendar, briefing. Use before larger or multi-leg expressions.
+- Deep external synthesis only when needed: research(). It is expensive and should
+  follow cheaper checks.
+- Expression flow: calculate_size -> instrument_selector -> plan_order/enter_option
+  -> execution tool with explicit prices (especially options/spreads).
+- After any execution-path tool, immediately verify with positions/open_orders/account
+  or refresh_state before further actions.
+- Observability loop: stats, review_trades, execution_status, signal_breakdown,
+  open_hypotheses, update_working_memory to tighten future decisions.
 
 ═══ REQUIRED PARAMS (include ALL on first call) ═══
 trailing_stop: symbol, quantity, direction (LONG/SHORT), trail_percent

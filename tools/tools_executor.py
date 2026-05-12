@@ -74,7 +74,7 @@ ioc_order: {symbol, side, quantity, limit_price} -> Immediate-or-Cancel
 
 === ALGO ORDERS ===
 vwap_order: {symbol, side, quantity, start_time?, end_time?, max_pct_volume?=25} -> VWAP execution
-twap_order: {symbol, side, quantity, start_time?, end_time?, randomize_pct?=55} -> TWAP execution
+twap_order: {symbol, side, quantity, start_time?, end_time?} -> TWAP execution
 iceberg_order: {symbol, side, total_quantity, display_size, limit_price} -> hidden size
 snap_mid_order: {symbol, side, quantity} -> snap-to-midpoint pegged
 
@@ -591,6 +591,10 @@ class ToolExecutor:
                 return payload
 
             error_text = result.get("error")
+            if "success" in result and result.get("success") is False and error_text is None:
+                error_text = result.get("reason") or result.get("warning")
+            if "success" in result and result.get("success") is False and error_text is None:
+                error_text = "Order failed (no detail returned)"
             success = bool(result.get("success")) if "success" in result else (error_text is None)
             is_realtime = bool(result.pop("is_realtime", False)) if isinstance(result, dict) else False
             data_warning = result.pop("data_warning", None) if isinstance(result, dict) else None

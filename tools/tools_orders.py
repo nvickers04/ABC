@@ -437,8 +437,7 @@ async def handle_twap_order(executor, params: dict) -> Any:
         invoke=lambda: executor.gateway.place_twap(
             params["symbol"], params["side"].upper(), _safe_int(params["quantity"]),
             start_time=params.get("start_time"),
-            end_time=params.get("end_time"),
-            randomize_pct=_safe_float(params.get("randomize_pct", 55.0))),
+            end_time=params.get("end_time")),
         estimate_cash=_cost_quote(executor, params))
 
 

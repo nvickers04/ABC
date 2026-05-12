@@ -21,6 +21,27 @@ class SmokeContext:
     last: float | None = None
 
 
+async def run_preflight_open_orders(executor: ToolExecutor, *, symbol: str) -> dict[str, Any]:
+    """Connect-only check: summarize open orders (esp. for the smoke symbol)."""
+    tr = await executor.execute("open_orders", {})
+    inner = tr.data if isinstance(tr.data, dict) else {}
+    orders = inner.get("orders")
+    if not isinstance(orders, list):
+        orders = []
+    sym_u = symbol.strip().upper()
+    same = [o for o in orders if str(o.get("symbol", "")).upper() == sym_u]
+    return {
+        "preflight": True,
+        "symbol": sym_u,
+        "total_open_orders": len(orders),
+        "open_orders_for_symbol": len(same),
+        "hint": (
+            "Cancel working orders for this symbol in TWS before smoke_all_tools if IB returns "
+            "max working orders per side."
+        ),
+    }
+
+
 def _norm_exp(exp: str | None) -> str:
     if not exp:
         return ""
@@ -166,6 +187,22 @@ def _broker_soft_error(err: str | None) -> bool:
         "order_id",
         "no long position",
         "pdt",
+        # IB / account policy (smoke noise, not code defects)
+        "minimum of 15 orders",
+        "15 orders working",
+        "max working orders",
+        "equity with",
+        "loan value",
+        "margin requirements",
+        "available funds",
+        "both sides of the same us option",
+        "cannot have open orders on both sides",
+        "contract not found",
+        "no security definition",
+        "individual legs all failed",
+        "survived:",
+        "could not be cancelled",
+        "another client session",
     )
     return any(n in e for n in needles)
 
@@ -276,11 +313,12 @@ def params_for_broker_tool(
         return {"symbol": sym, "quantity": 1, "direction": "LONG", "trail_percent": 0.05}
 
     if name == "trailing_stop_limit":
+        # IB TRAIL LIMIT requires a dollar trail (aux); percent-only rejects with "enter a stop price".
         return {
             "symbol": sym,
             "quantity": 1,
             "direction": "LONG",
-            "trail_percent": 0.05,
+            "trail_amount": max(0.05, round(float(last) * 0.02, 2)),
             "limit_offset": 0.1,
         }
 
@@ -325,11 +363,12 @@ def params_for_broker_tool(
         return {"symbol": sym, "side": "BUY", "quantity": 1}
 
     if name == "iceberg_order":
+        # US stock round lot 100 — display_size must be a multiple for many symbols.
         return {
             "symbol": sym,
             "side": "BUY",
-            "total_quantity": 3,
-            "display_size": 1,
+            "total_quantity": 200,
+            "display_size": 100,
             "limit_price": far_limit,
         }
 
@@ -669,7 +708,9 @@ async def run_broker_phase(
         try:
             tr = await executor.execute(action, params)
             payload = tr.data if isinstance(tr.data, dict) else {}
-            err = payload.get("error") if isinstance(payload, dict) else None
+            err = None
+            if isinstance(payload, dict):
+                err = payload.get("error") or payload.get("reason")
             if action == "limit_order" and tr.success:
                 oid = payload.get("order_id") if isinstance(payload, dict) else None
                 if oid is not None:
@@ -693,7 +734,9 @@ async def run_broker_phase(
     if oid is not None:
         cx = await executor.execute("cancel_order", {"order_id": oid})
         if not cx.success:
-            err = (cx.data or {}).get("error") if isinstance(cx.data, dict) else None
+            err = None
+            if isinstance(cx.data, dict):
+                err = cx.data.get("error") or cx.data.get("reason")
             if err and not _broker_soft_error(str(err)):
                 failures.append(f"cancel_order(cleanup): {err}")
 

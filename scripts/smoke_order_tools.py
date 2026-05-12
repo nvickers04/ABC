@@ -2,9 +2,15 @@
 """
 Order-path smoke (paper): place a non-marketable BUY limit, verify open_orders, cancel.
 
-Uses NVDA (research universe). Pass a free API client id if another process uses IBKR:
+Prerequisites
+-------------
+- TWS/IB Gateway; unique ``--client-id`` if another process uses IBKR.
+- Default symbol is first ``RESEARCH_UNIVERSE`` name (typically NVDA).
 
+Commands
+--------
   python scripts/smoke_order_tools.py --client-id 11
+  python scripts/smoke_order_tools.py --client-id 11 --preflight   # open_orders only
 """
 
 from __future__ import annotations
@@ -29,6 +35,12 @@ async def main() -> int:
         default=None,
         help="IBKR API client id (must be unique vs other running connections)",
     )
+    parser.add_argument(
+        "--preflight",
+        action="store_true",
+        help="Only connect and print open_orders summary",
+    )
+    parser.add_argument("--symbol", default=None, help="Underlying (default: first RESEARCH_UNIVERSE name)")
     args = parser.parse_args()
 
     from dotenv import load_dotenv
@@ -45,9 +57,10 @@ async def main() -> int:
 
     try:
         from research.config import RESEARCH_UNIVERSE
-        sym = next((str(s).upper() for s in RESEARCH_UNIVERSE if isinstance(s, str)), "NVDA")
+        default_sym = next((str(s).upper() for s in RESEARCH_UNIVERSE if isinstance(s, str)), "NVDA")
     except Exception:
-        sym = "NVDA"
+        default_sym = "NVDA"
+    sym = (args.symbol or default_sym).upper()
 
     gateway = await create_gateway({})
     tools = ToolExecutor(
@@ -56,6 +69,19 @@ async def main() -> int:
         market_hours_provider=get_market_hours_provider(),
         cost_tracker=get_cost_tracker(),
     )
+
+    from tools.trader_smoke import run_preflight_open_orders
+
+    if args.preflight:
+        try:
+            out = await run_preflight_open_orders(tools, symbol=sym)
+            print(json.dumps({"symbol": sym, **out}, indent=2, default=str))
+            return 0
+        finally:
+            try:
+                await gateway.disconnect()
+            except Exception:
+                pass
 
     out: dict = {"symbol": sym, "steps": []}
 

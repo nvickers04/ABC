@@ -2,12 +2,23 @@
 """
 Paper-mode smoke: run every *safe* trader tool once (no placements / cancels).
 
-Requires: working .env, IBKR gateway for broker-backed reads, MarketData for quotes.
+Prerequisites
+-------------
+- TWS or IB Gateway listening (default paper port 7497 in .env).
+- ``IBKR_CLIENT_ID`` unique per running API process (``--client-id`` overrides .env).
+- MarketData / keys as needed for quotes and option chains.
+- Prefer a symbol from ``RESEARCH_UNIVERSE`` (default: first name, e.g. NVDA) so
+  universe guards do not block ``plan_order`` / ``enter_option``.
+- Before ``smoke_all_tools.py --all``, cancel stale working orders for the smoke
+  symbol in TWS; IB rejects too many concurrent orders per side.
 
+Commands
+--------
   python scripts/smoke_trader_tools.py
-  python scripts/smoke_trader_tools.py --symbol MSFT
+  python scripts/smoke_trader_tools.py --symbol NVDA
+  python scripts/smoke_trader_tools.py --preflight --client-id 11   # connect + open_orders only
   python scripts/smoke_trader_tools.py --with-research   # multi-agent research ($$$)
-  python scripts/smoke_trader_tools.py --client-id 11     # unique IBKR API client id
+  python scripts/smoke_trader_tools.py --client-id 11
 
 Full registry (safe + broker-mutating, except emergency tools):
 
@@ -41,6 +52,11 @@ async def main_async() -> int:
     parser.add_argument("--with-research", action="store_true", help="Include research() (multi-agent LLM cost)")
     parser.add_argument("--list-skipped", action="store_true", help="Print broker-mutating / never-test tools and exit")
     parser.add_argument("--client-id", type=int, default=None, help="IBKR API client id (unique vs other processes)")
+    parser.add_argument(
+        "--preflight",
+        action="store_true",
+        help="Only connect and print open_orders summary (no tool sweep)",
+    )
     parser.add_argument("-v", "--verbose", action="store_true")
     args = parser.parse_args()
 
@@ -74,7 +90,7 @@ async def main_async() -> int:
     from data.data_provider import get_data_provider
     from data.market_hours import get_market_hours_provider
     from tools.tools_executor import ToolExecutor
-    from tools.trader_smoke import SmokeContext, run_safe_phase, warm_option_samples
+    from tools.trader_smoke import SmokeContext, run_preflight_open_orders, run_safe_phase, warm_option_samples
 
     gateway = await create_gateway({})
     tools = ToolExecutor(
@@ -88,6 +104,17 @@ async def main_async() -> int:
         return "(smoke refresh_state — full agent snapshot unavailable without TradingAgent)"
 
     tools._state_builder = _minimal_state_builder
+
+    if args.preflight:
+        try:
+            out = await run_preflight_open_orders(tools, symbol=symbol)
+            print(json.dumps(out, indent=2, default=str))
+            return 0
+        finally:
+            try:
+                await gateway.disconnect()
+            except Exception:
+                pass
 
     ctx = SmokeContext(symbol=symbol)
     await warm_option_samples(tools, ctx)

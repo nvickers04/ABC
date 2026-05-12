@@ -943,6 +943,38 @@ class IBKROrdersMixin:
             pct = max(0.1, min(pct, 99.0))  # IBKR requires (0, 100)
             order_attrs['trailingPercent'] = pct
 
+        # TWS rejects TRAIL LIMIT without trailStopPrice ("Please enter a stop price").
+        contract = await self._prepare_contract(symbol)
+        if contract is None:
+            return {'error': 'Not connected'}
+        try:
+            t = self.ib.reqMktData(contract, '', True, False)
+            await _safe_sleep(1.0)
+            px = t.last or t.close
+            if (px is None or float(px) <= 0) and t.bid and t.ask and float(t.bid) > 0 and float(t.ask) > 0:
+                px = (float(t.bid) + float(t.ask)) / 2.0
+            if px and float(px) > 0:
+                px = float(px)
+                d = (direction or "LONG").upper()
+                if d == "LONG":
+                    order_attrs["trailStopPrice"] = round(px * 0.97, 2)
+                else:
+                    order_attrs["trailStopPrice"] = round(px * 1.03, 2)
+        except Exception as e:
+            logger.warning("place_trailing_stop_limit: could not seed trailStopPrice: %s", e)
+        finally:
+            try:
+                self.ib.cancelMktData(contract)
+            except Exception:
+                pass
+
+        if "trailStopPrice" not in order_attrs:
+            return {
+                "error": "Could not determine trailStopPrice (no quote). "
+                "Try again with live market data for the symbol.",
+                "symbol": symbol,
+            }
+
         return await self._place_order(
             symbol, action, quantity, 'TRAIL LIMIT', tif='GTC',
             aux_price=trail_amount if not trail_percent else None,

@@ -746,10 +746,17 @@ Account state above. Start by calling briefing() to assess research status."""
         self._last_step = "chat_create"
         self._last_step_ts = time.time()
         logger.info("CYCLE %d step=chat_create", self._cycle_id)
+        _system_content = SYSTEM_PROMPT
+        try:
+            from tools.tool_playbook import render_compact_playbook
+
+            _system_content = SYSTEM_PROMPT + "\n\n" + render_compact_playbook(4000)
+        except Exception as e:
+            logger.warning("tool playbook append failed: %s", e)
         chat = self.grok.client.chat.create(
             model=self.grok.model,
             messages=[
-                sdk_system(SYSTEM_PROMPT),
+                sdk_system(_system_content),
                 sdk_user(context),
             ],
             temperature=LLM_TEMPERATURE,

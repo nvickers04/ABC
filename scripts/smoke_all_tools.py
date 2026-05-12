@@ -4,10 +4,19 @@ Exercise the full trader tool registry: safe tools + broker-mutating tools.
 
 Does NOT run emergency tools (flatten_limits, cancel_all_orphans).
 
+Prerequisites
+-------------
+- Same as ``smoke_trader_tools.py``: TWS/Gateway, unique ``--client-id``, data keys.
+- Use a ``RESEARCH_UNIVERSE`` symbol (default first name) unless intentionally testing guards.
+- **Clear working orders for that symbol** before ``--all``; IB caps concurrent orders per side.
+
+Commands
+--------
+  python scripts/smoke_all_tools.py --client-id 11 --preflight   # open_orders summary only
   python scripts/smoke_all_tools.py --client-id 11 --all
   python scripts/smoke_all_tools.py --client-id 11 --all --with-research   # costly
   python scripts/smoke_all_tools.py --client-id 11 --all --allow-market
-  python scripts/smoke_all_tools.py --client-id 11 --all --allow-option-orders  # may place options
+  python scripts/smoke_all_tools.py --client-id 11 --all --allow-option-orders
 """
 
 from __future__ import annotations
@@ -37,10 +46,17 @@ async def main_async() -> int:
         action="store_true",
         help="Include buy_option / vertical_spread and other option placements",
     )
+    parser.add_argument(
+        "--preflight",
+        action="store_true",
+        help="Only connect and print open_orders summary (no --all required)",
+    )
     parser.add_argument("-v", "--verbose", action="store_true")
     args = parser.parse_args()
 
-    if not args.all:
+    if args.preflight:
+        pass  # handled below after dotenv
+    elif not args.all:
         parser.error("Pass --all to confirm full-registry smoke (safety gate).")
 
     logging.basicConfig(
@@ -65,7 +81,7 @@ async def main_async() -> int:
     from data.data_provider import get_data_provider
     from data.market_hours import get_market_hours_provider
     from tools.tools_executor import ToolExecutor
-    from tools.trader_smoke import SmokeContext, run_broker_phase, run_safe_phase, warm_option_samples
+    from tools.trader_smoke import SmokeContext, run_broker_phase, run_preflight_open_orders, run_safe_phase, warm_option_samples
 
     gateway = await create_gateway({})
     tools = ToolExecutor(
@@ -79,6 +95,17 @@ async def main_async() -> int:
         return "(smoke refresh_state — minimal)"
 
     tools._state_builder = _minimal_state_builder
+
+    if args.preflight:
+        try:
+            out = await run_preflight_open_orders(tools, symbol=symbol)
+            print(json.dumps(out, indent=2, default=str))
+            return 0
+        finally:
+            try:
+                await gateway.disconnect()
+            except Exception:
+                pass
 
     ctx = SmokeContext(symbol=symbol)
     await warm_option_samples(tools, ctx)

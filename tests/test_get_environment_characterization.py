@@ -249,3 +249,23 @@ class TestRegimeDurationAndPersistence:
         # No prior row matched -> duration stays at 1.
         assert env["vol_regime_duration"] == 1
         assert env["trend_regime_duration"] == 1
+
+
+class TestRoundNumPersistence:
+    def test_round_num_written_to_environment_snapshots(self, db):
+        from signals.scorer import _get_environment
+
+        cl = [100.0 + i for i in range(10)]
+        cmap = {s: _candles(cl) for s in ("AAPL", "MSFT", "NVDA")}
+        env = _get_environment(
+            dp=None,
+            universe=list(cmap.keys()),
+            candles_map=cmap,
+            round_num=185,
+        )
+        assert env is not None
+        row = db.execute(
+            "SELECT round_num FROM environment_snapshots ORDER BY id DESC LIMIT 1"
+        ).fetchone()
+        assert row is not None
+        assert row["round_num"] == 185

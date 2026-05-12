@@ -14,6 +14,7 @@ import bisect
 import json
 import logging
 import time
+from functools import partial
 from typing import Any
 
 from core.async_utils import safe_sleep
@@ -27,6 +28,7 @@ from research.config import (
     DEEP_SCAN_TOP_N,
     OPTION_CHAIN_DTE_RANGE,
     OPTION_CHAIN_STRIKE_LIMIT,
+    RESEARCH_UNIVERSE,
     ROUND_DELAY_SECS,
     TIER1_UNIVERSE_SIZE,
     TRADE_REC_TOP_N,
@@ -364,7 +366,9 @@ async def _scoring_round(dp, conn, round_num: int) -> int:
     # Environment snapshot
     # _get_environment makes sync dp.* calls (nest_asyncio-based) — run
     # in a worker thread so the main event loop is not blocked/patched.
-    env = await asyncio.to_thread(_get_environment, dp, universe, candles_map)
+    env = await asyncio.to_thread(
+        _get_environment, dp, universe, candles_map, round_num,
+    )
 
     # ── Tier 1: Score cheap signals (40 signals, full universe) ─
     # Skip signals that require an IBKR connection when this process
@@ -552,7 +556,17 @@ async def _scoring_round(dp, conn, round_num: int) -> int:
     write_recommendations(conn, recommendations)
 
     # ── Forward returns for prior-round scores ─────────────
-    await asyncio.to_thread(_compute_forward_returns, conn, dp, candles_by_res, now)
+    await asyncio.to_thread(
+        partial(
+            _compute_forward_returns,
+            universe_symbols=universe,
+            skip_subdaily=_skip_subdaily,
+        ),
+        conn,
+        dp,
+        candles_by_res,
+        now,
+    )
 
     logger.info(
         "Round %d: N_eff=%.1f, %d composites, %d recs, %d scorer_units",
@@ -662,7 +676,12 @@ def _build_symbol_data(
     return data
 
 
-def _get_environment(dp, universe: list[str], candles_map: dict) -> dict | None:
+def _get_environment(
+    dp,
+    universe: list[str],
+    candles_map: dict,
+    round_num: int | None = None,
+) -> dict | None:
     """Compute environment snapshot for this round."""
     try:
         import datetime
@@ -757,12 +776,13 @@ def _get_environment(dp, universe: list[str], candles_map: dict) -> dict | None:
             import datetime as _dt
             conn.execute(
                 """INSERT INTO environment_snapshots
-                   (ts, volatility_regime, trend_regime, breadth_regime,
+                   (ts, round_num, volatility_regime, trend_regime, breadth_regime,
                     momentum_regime, volume_regime, avg_atr_pct, dispersion,
                     raw_snapshot_json)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 (
                     _dt.datetime.now(_dt.timezone.utc).isoformat(),
+                    round_num,
                     env.get("volatility_regime"),
                     env.get("trend_regime"),
                     env.get("breadth_regime"),
@@ -814,6 +834,9 @@ def _compute_forward_returns(
     dp,
     candles_by_res: dict[str, dict],
     current_ts: float,
+    *,
+    universe_symbols: list[str] | None = None,
+    skip_subdaily: bool = False,
 ) -> None:
     """
     Compute forward returns for prior-round scores and write R(i,s) to signal_returns.
@@ -832,23 +855,47 @@ def _compute_forward_returns(
     so the freshest microstructure data lands in IC fastest).  Scores too
     old to ever mature (no candles for the symbol at the signal's resolution)
     are deleted at the top of the function.
+
+    ``universe_symbols`` and ``skip_subdaily`` are supplied by the scoring
+    round: the former keeps immature rows for tickers scored this cycle
+    (including focus names outside ``RESEARCH_UNIVERSE``); the latter skips
+    sub-daily resolution scans when MDA rationing omitted those bundles.
     """
     # ── Prune scores that can never mature ─────────────────────────
-    # Symbols absent from EVERY resolution's candle map are universe drift —
-    # we'll never re-fetch them.  Drop them so they don't dominate the
-    # per-resolution LIMIT budget below.
+    # Only delete rows for symbols that are not in the canonical research
+    # universe, not in this round's scored universe, and not present in any
+    # candle map we hold.  Using ``live_symbols`` alone was wrong: on
+    # focus-only rounds we still skip fetching the full base list, but those
+    # symbols' immature scores must survive until the next base-inclusive
+    # round — otherwise ``signal_returns`` / IC starve.
     live_symbols: set[str] = set()
     for cmap in candles_by_res.values():
-        live_symbols.update(cmap.keys())
-    if live_symbols:
-        placeholders = ",".join("?" * len(live_symbols))
+        for sym in cmap.keys():
+            if isinstance(sym, str) and sym.strip():
+                live_symbols.add(sym.strip().upper())
+
+    protected: set[str] = set()
+    for sym in RESEARCH_UNIVERSE:
+        if isinstance(sym, str) and sym.strip():
+            protected.add(sym.strip().upper())
+    if universe_symbols:
+        for sym in universe_symbols:
+            if isinstance(sym, str) and sym.strip():
+                protected.add(sym.strip().upper())
+    protected.update(live_symbols)
+
+    if protected:
+        placeholders = ",".join("?" * len(protected))
         n = conn.execute(
-            f"DELETE FROM signal_scores WHERE symbol NOT IN ({placeholders})",
-            tuple(live_symbols),
+            f"DELETE FROM signal_scores WHERE UPPER(symbol) NOT IN ({placeholders})",
+            tuple(sorted(protected)),
         ).rowcount
         if n > 0:
             conn.commit()
-            logger.info("Pruned %d orphan signal_scores (symbol no longer in any universe)", n)
+            logger.info(
+                "Pruned %d orphan signal_scores (symbol outside research+round+candles)",
+                n,
+            )
 
     # TTL purge: anything older than 30 days is past every signal's horizon
     # (longest horizon today = 10 trading days ≈ 14 calendar).  Without
@@ -907,6 +954,12 @@ def _compute_forward_returns(
     for res in res_order:
         sig_names = sigs_by_res.get(res)
         if not sig_names:
+            continue
+        # When MDA rationing skipped sub-daily fetches, those resolutions are
+        # absent from ``candles_by_res`` — do not scan thousands of rows that
+        # would all hit ``no_candles`` and starve the daily backlog.
+        if res != "D" and skip_subdaily and res not in candles_by_res:
+            per_res_log.append(f"{res}:skipped_mda_no_subdaily_bundle")
             continue
         cmap = candles_by_res.get(res, {})
         budget = BUDGET_BY_RES.get(res, 500)

@@ -51,6 +51,16 @@ for r in rows:
 print()
 checks: list[tuple[str, str, tuple | None]] = [
     (
+        "signal_returns (24h)",
+        "SELECT COUNT(*) AS n, MAX(ts) AS max_ts FROM signal_returns WHERE ts > ?",
+        (now - 86400,),
+    ),
+    (
+        "signal_returns (7d)",
+        "SELECT COUNT(*) AS n, MAX(ts) AS max_ts FROM signal_returns WHERE ts > ?",
+        (now - 7 * 86400,),
+    ),
+    (
         "signal_scores (24h)",
         "SELECT COUNT(*) AS n, MAX(ts) AS max_ts FROM signal_scores WHERE ts > ?",
         (now - 86400,),
@@ -77,6 +87,17 @@ for label, q, params in checks:
     else:
         r = db.execute(q, params).fetchone()
     print(f"{label}: {dict(r) if r else None}")
+
+print()
+try:
+    env_row = db.execute(
+        "SELECT id, ts, round_num FROM environment_snapshots ORDER BY id DESC LIMIT 1"
+    ).fetchone()
+    print("=== latest environment_snapshots row ===")
+    print(dict(env_row) if env_row else None)
+except Exception as e:
+    print("=== latest environment_snapshots row ===")
+    print("query failed:", e)
 
 print()
 sess = db.execute("SELECT current_user, session_user").fetchone()

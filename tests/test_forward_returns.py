@@ -202,3 +202,63 @@ class TestPruneAndTTL:
             "SELECT COUNT(*) FROM signal_scores WHERE ts=?", (ancient_ts,),
         ).fetchone()[0]
         assert n == 0, "scores older than 30d must be TTL-purged"
+
+
+class TestResearchUniverseProtectedFromFocusOnlyPrune:
+    """Scores for RESEARCH_UNIVERSE names must survive rounds that only
+    fetched candles for a subset (focus-style); otherwise IC starves."""
+
+    def test_nvda_score_retained_when_only_aapl_in_candle_maps(self, conn):
+        from signals.scorer import _compute_forward_returns
+        import signals.gamma_exposure  # noqa: F401
+
+        now = time.time()
+        ts = [now - (60 - i) * 86400 for i in range(60)]
+        closes = [100.0 + i for i in range(60)]
+        cmap = {"D": {"AAPL": _candles(ts, closes)}}
+
+        conn.execute(
+            "INSERT INTO signal_scores VALUES (?, ?, ?, ?)",
+            ("gamma_exposure", "NVDA", ts[50] + 100, 1.0),
+        )
+        conn.commit()
+
+        _compute_forward_returns(conn, dp=None, candles_by_res=cmap, current_ts=now)
+
+        n = conn.execute(
+            "SELECT COUNT(*) FROM signal_scores WHERE symbol='NVDA'"
+        ).fetchone()[0]
+        assert n == 1, "NVDA is in RESEARCH_UNIVERSE — must not orphan-prune"
+
+
+class TestSubdailySkipSkipsResolutionScan:
+    """When skip_subdaily is True and no sub-daily bundle exists, do not
+    scan the 1min backlog (all no_candles); leave rows for a later round."""
+
+    def test_quote_stability_row_survives_when_one_min_bundle_missing(self, conn):
+        from signals.scorer import _compute_forward_returns
+        import signals.quote_stability  # noqa: F401
+
+        now = time.time()
+        ts = [now - (60 - i) * 86400 for i in range(60)]
+        closes = [100.0 + i for i in range(60)]
+        cmap = {"D": {"AAPL": _candles(ts, closes)}}
+
+        conn.execute(
+            "INSERT INTO signal_scores VALUES (?, ?, ?, ?)",
+            ("quote_stability", "AAPL", ts[50] + 50, 0.3),
+        )
+        conn.commit()
+
+        _compute_forward_returns(
+            conn,
+            dp=None,
+            candles_by_res=cmap,
+            current_ts=now,
+            skip_subdaily=True,
+        )
+
+        n = conn.execute(
+            "SELECT COUNT(*) FROM signal_scores WHERE signal_name='quote_stability'"
+        ).fetchone()[0]
+        assert n == 1

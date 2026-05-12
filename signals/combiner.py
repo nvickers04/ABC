@@ -1175,13 +1175,50 @@ def _publish_ir_snapshot(
 
     gate_open = ir >= _IR_GATE_MIN
 
+    n_ic = len(ic_stats)
+    n_trusted = len(trusted)
+    if n_ic == 0:
+        est_reason = (
+            "no_ic_per_signal_stats signal_returns_empty_or_window_has_no_rows"
+        )
+    elif n_trusted == 0:
+        below_min_obs = sum(
+            1
+            for name, d in ic_stats.items()
+            if d["n"] < _min_obs_for(SIGNAL_REGISTRY.get(name))
+        )
+        below_noise = sum(
+            1
+            for name, d in ic_stats.items()
+            if d["n"] >= _min_obs_for(SIGNAL_REGISTRY.get(name))
+            and abs(d["ic"]) < _IC_NOISE_THRESHOLD
+        )
+        est_reason = (
+            f"no_trusted_ic n_ic={n_ic} below_min_obs={below_min_obs} "
+            f"below_noise_floor_ic={below_noise} mean_abs_ic={mean_ic:.4f} "
+            f"n_eff={n_eff:.2f} need_n_and_abs_ic_above_noise"
+        )
+    else:
+        est_reason = (
+            f"mean_abs_ic={mean_ic:.4f} n_eff={n_eff:.2f} n_trusted={n_trusted} "
+            f"ir={ir:.4f}"
+        )
+
+    if gate_open:
+        gate_reason = f"open_ir={ir:.4f}_meets_min_{_IR_GATE_MIN}"
+    else:
+        gate_reason = f"closed_ir={ir:.4f}_below_gate_min_{_IR_GATE_MIN}"
+
     try:
-        set_research_config(_IR_ESTIMATE_KEY, ir,
-                            reason=f"mean_abs_ic={mean_ic:.4f} n_eff={n_eff:.2f}")
-        set_research_config(_IR_GATE_OPEN_KEY, 1.0 if gate_open else 0.0,
-                            reason=f"ir={ir:.4f} min={_IR_GATE_MIN}")
-        set_research_config("ir_snapshot_ts", float(time.time()),
-                            reason="combiner round complete")
+        set_research_config(_IR_ESTIMATE_KEY, ir, reason=est_reason)
+        set_research_config(
+            _IR_GATE_OPEN_KEY, 1.0 if gate_open else 0.0, reason=gate_reason
+        )
+        set_research_config(
+            "ir_snapshot_ts",
+            float(time.time()),
+            reason="combiner_round_complete",
+        )
     except Exception as e:
         logger.debug("IR snapshot persistence failed: %s", e)
 

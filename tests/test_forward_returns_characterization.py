@@ -7,9 +7,11 @@ Locks in the R(i, s) writer's contract:
     timestamp (NOT the original score timestamp).
   * **Pending** - a score whose horizon has not elapsed is left in
     ``signal_scores`` for a future round (no row written, score retained).
-  * **Universe-drift prune** - any score whose symbol is missing from EVERY
-    resolution's candle map is deleted from ``signal_scores`` at the top
-    of the function.
+  * **Universe-drift prune** - scores for symbols outside the canonical
+    ``RESEARCH_UNIVERSE``, outside the optional ``universe_symbols`` set,
+    and absent from every candle map are deleted from ``signal_scores`` at
+    the top of the function (symbols in ``RESEARCH_UNIVERSE`` are kept
+    across focus-only rounds even when candles are not fetched that round).
   * **TTL purge** - scores older than 30 days are deleted unconditionally.
   * **R(i, s) value** - ``r_value = score * (exit_close / entry_close - 1)``,
     where entry is the most recent bar with ``ts <= score_ts`` and exit is
@@ -207,7 +209,7 @@ class TestForwardReturnsPruning:
         # AAPL row was consumed (matured -> wrote signal_returns row, then
         # deleted from signal_scores so it doesn't dominate the LIMIT
         # queue on subsequent rounds).  XYZZY was deleted as universe
-        # drift.
+        # drift (XYZZY is not in RESEARCH_UNIVERSE).
         assert remaining == []
 
         return_syms = sorted(

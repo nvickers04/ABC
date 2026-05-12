@@ -1,0 +1,31 @@
+# Research stack ONLY — scorer + heartbeat (and optional template evolution).
+#
+# Do NOT replace CMD with __main__.py: that starts the Grok trading agent (LLM $ + IBKR).
+#
+# Usage (from repo root):
+#   docker compose -f infra/runtime/docker-compose.research.yml --env-file .env up -d --build
+#
+# Postgres: point DATABASE_URL (or PG*) in .env at a reachable host (e.g. host.docker.internal
+# on Docker Desktop, or your Tailscale IP). This compose does not start Postgres.
+
+services:
+  abc-research:
+    build:
+      context: ../..
+      dockerfile: infra/runtime/Dockerfile.research
+    image: abc-research:latest
+    container_name: abc-research-daemon
+    restart: unless-stopped
+    env_file:
+      - ../../.env
+    environment:
+      IBKR_QUOTES_ENABLED: "0"
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    # If Postgres is another compose stack, attach the same external network and uncomment:
+    # networks:
+    #   - abc_net
+    # networks:
+    #   abc_net:
+    #     external: true
+    #     name: abc_default

@@ -11,6 +11,31 @@ Detailed host bootstrap commands live in `docs/POSTGRES_HOST_SETUP.md`.
 The memory layer now targets PostgreSQL only.
 Both machines must point at the same Postgres DB to share research/trading state.
 
+## Docker / Task Scheduler (avoid accidental Grok spend)
+
+On the **research host**, only one of these should run continuously:
+
+| Correct (research only) | Wrong (full trader + Grok) |
+|-------------------------|----------------------------|
+| `python research_daemon.py` | `python __main__.py` |
+| `.\scripts\run_research_daemon.ps1` | Any Docker `CMD` / scheduler action pointing at `__main__.py` |
+
+`__main__.py` starts **TradingAgent** and will call **Grok** every cycle (input tokens add up fast).  
+`research_daemon.py` does **not** call Grok (see header comment in that file).
+
+**Docker (recommended on the research machine):**
+
+```powershell
+cd C:\path\to\ABC
+docker compose -f infra/runtime/docker-compose.research.yml --env-file .env up -d --build
+```
+
+Ensure `.env` has a `DATABASE_URL` (or `PG*`) that the container can reach (`host.docker.internal` for Postgres on the same PC under Docker Desktop, or your DB host / Tailscale IP).
+
+**Windows Task Scheduler:** set **Program** to `powershell.exe` and **Arguments** to  
+`-ExecutionPolicy Bypass -File "C:\path\to\ABC\scripts\run_research_daemon.ps1"`  
+(or call `python` with an explicit full path to `research_daemon.py` — not `__main__.py`).
+
 ## Host machine (today)
 
 ### 1) Install and verify Docker

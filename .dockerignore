@@ -1,0 +1,14 @@
+.git
+.gitignore
+**/__pycache__
+**/*.pyc
+.pytest_cache
+.mypy_cache
+.ruff_cache
+.cursor
+*.log
+logs
+memory/*.db
+memory/*.db-*
+terminals
+.env.local

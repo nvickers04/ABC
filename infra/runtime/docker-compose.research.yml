@@ -2,11 +2,20 @@
 #
 # Do NOT replace CMD with __main__.py: that starts the Grok trading agent (LLM $ + IBKR).
 #
-# Usage (from repo root):
+# Usage (from repo root — rewrites 127.0.0.1 → abc-postgres for container DNS):
+#   .\scripts\docker_research_up.ps1
+#
+# Or manually (you must set DATABASE_URL host to abc-postgres if Postgres is the sibling container):
 #   docker compose -f infra/runtime/docker-compose.research.yml --env-file .env up -d --build
 #
-# Postgres: point DATABASE_URL (or PG*) in .env at a reachable host (e.g. host.docker.internal
-# on Docker Desktop, or your Tailscale IP). This compose does not start Postgres.
+# Postgres: this stack does not start Postgres. Attach `postgres_default` (see networks) so
+# `abc-postgres` resolves when DATABASE_URL uses that hostname.
+
+networks:
+  # Same network as `infra/postgres/docker-compose.yml` (container name `abc-postgres`).
+  # Lets DATABASE_URL use host `abc-postgres` instead of 127.0.0.1 (see scripts/docker_research_up.ps1).
+  postgres_default:
+    external: true
 
 services:
   abc-research:
@@ -22,10 +31,5 @@ services:
       IBKR_QUOTES_ENABLED: "0"
     extra_hosts:
       - "host.docker.internal:host-gateway"
-    # If Postgres is another compose stack, attach the same external network and uncomment:
-    # networks:
-    #   - abc_net
-    # networks:
-    #   abc_net:
-    #     external: true
-    #     name: abc_default
+    networks:
+      - postgres_default

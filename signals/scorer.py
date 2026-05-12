@@ -20,7 +20,7 @@ from typing import Any
 from core.async_utils import safe_sleep
 from core.runtime.mda_budget import (
     log_mda_round_status,
-    mda_cadence_multiplier,
+    mda_total_sleep_multiplier,
     persist_mda_snapshot_to_db,
     should_skip_subdaily_candle_fetches,
 )
@@ -160,6 +160,7 @@ async def run_research(*, verbose: bool = False, use_cadence: bool = False) -> N
     _import_all_signals()
 
     round_num = 0
+    round_mda_sleep_mult = 1.0
     while True:
         # Honour stop/pause controls between rounds.
         if _scorer_stop_event is not None and _scorer_stop_event.is_set():
@@ -169,6 +170,7 @@ async def run_research(*, verbose: bool = False, use_cadence: bool = False) -> N
             await asyncio.sleep(5)
             continue
         round_num += 1
+        round_mda_sleep_mult = 1.0
         try:
             t0 = time.time()
             # Run the round directly on the main loop. The per-loop
@@ -199,13 +201,14 @@ async def run_research(*, verbose: bool = False, use_cadence: bool = False) -> N
                 pass
             try:
                 usage = dp.get_mda_usage()
-                _mda_mult = mda_cadence_multiplier(usage)
-                persist_mda_snapshot_to_db(usage, _mda_mult)
+                round_mda_sleep_mult, _mda_burn_note = mda_total_sleep_multiplier(usage)
+                persist_mda_snapshot_to_db(usage, round_mda_sleep_mult)
                 log_mda_round_status(
                     round_num,
                     usage,
-                    _mda_mult,
+                    round_mda_sleep_mult,
                     should_skip_subdaily_candle_fetches(usage),
+                    burn_note=_mda_burn_note,
                 )
             except Exception:
                 pass
@@ -226,16 +229,15 @@ async def run_research(*, verbose: bool = False, use_cadence: bool = False) -> N
             if _USE_CADENCE:
                 from core.runtime.cadence import cadence_seconds
 
-                _u = dp.get_mda_usage()
                 _base = float(cadence_seconds())
-                _mult = mda_cadence_multiplier(_u)
-                _sleep_s = _base * _mult
-                if _mult > 1.0:
+                # Reuse multiplier from end of this round (burn state updates once per round).
+                _sleep_s = _base * round_mda_sleep_mult
+                if round_mda_sleep_mult > 1.01:
                     logger.info(
-                        "MDA pacing: sleep %.0fs (base %.0fs x %.1f low-credit stretch)",
+                        "MDA pacing: sleep %.0fs (base %.0fs x %.2f combined MDA stretch)",
                         _sleep_s,
                         _base,
-                        _mult,
+                        round_mda_sleep_mult,
                     )
                 await safe_sleep(_sleep_s)
             else:

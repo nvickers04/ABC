@@ -36,7 +36,8 @@ discovery is thin:
 
 That leaves ~56k credits of headroom for option-chain spikes (the dominant
 real-world cost), retry storms, and universe growth. The adaptive pacing
-layer (`core/runtime/mda_budget.py`) further stretches sleeps 2x/4x and skips
+layer (`core/runtime/mda_budget.py`) stretches sleeps using balance tiers,
+**time-to-reset runway**, **observed burn vs sustainable rate**, and skips
 sub-daily candle bundles when API headers show remaining credits dropping
 below configured fractions; the MDA client's circuit breaker is the final
 backstop once credits hit zero.

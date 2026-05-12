@@ -8,7 +8,8 @@ Usage:
     python __main__.py --account live   # Live trading (use with caution)
 
 Research (scoring + template evolution) lives in ``research_daemon.py``. This process
-only starts an in-process scorer when the daemon heartbeat is absent/stale.
+only starts an in-process scorer when the daemon heartbeat is absent/stale (unless
+``TRADER_IN_PROCESS_SCORER=never`` / ``--require-daemon``, which forbid that fallback).
 
 Built for Grok (xAI) — dynamic liquidity, overnight holds OK, configurable risk.
 """
@@ -127,6 +128,7 @@ def main():
     daemon_group.add_argument(
         "--require-daemon", action="store_true",
         help="Refuse to start unless research_daemon.py is alive (fresh heartbeat). "
+             "Same effect as TRADER_IN_PROCESS_SCORER=never for this flag alone. "
              "Use in production to guarantee the agent never silently runs the scorer in-process.",
     )
     daemon_group.add_argument(
@@ -183,22 +185,48 @@ def main():
     from core.agent import run_agent
 
     if not args.no_research:
-        # --require-daemon   → hard-fail if daemon isn't alive (production)
-        # --force-in-process → always run scorer in-process (dev/debug)
-        # default              → fresh daemon heartbeat → skip in-process scorer
+        # --require-daemon / TRADER_IN_PROCESS_SCORER=never → hard-fail if no fresh heartbeat
+        # --force-in-process → always run scorer in-process (dev/debug; wins over env gate)
+        # default (auto) → fresh daemon heartbeat → skip in-process scorer
         from core.runtime.heartbeat import is_daemon_alive, heartbeat_age_s
-        daemon_alive = is_daemon_alive()
+        from core.config import TRADER_IN_PROCESS_SCORER_NEVER
 
-        if args.require_daemon and not daemon_alive:
+        daemon_alive = is_daemon_alive()
+        require_daemon = bool(args.require_daemon or TRADER_IN_PROCESS_SCORER_NEVER)
+
+        if args.force_in_process:
+            from signals.scorer import run_research_threaded
+            if daemon_alive:
+                print(
+                    "Scoring: in-process (--force-in-process; double-writes vs daemon — "
+                    "dev/debug only).\n"
+                )
+                logger.warning("--force-in-process: in-process scorer running alongside live daemon")
+            else:
+                print(
+                    "Scoring: in-process (--force-in-process; no research_daemon heartbeat).\n"
+                )
+            run_research_threaded(verbose=args.verbose)
+        elif require_daemon and not daemon_alive:
             age = heartbeat_age_s()
             age_str = "never" if age == float("inf") else f"{age:.1f}s"
-            msg = (f"--require-daemon set but research_daemon heartbeat is stale "
-                   f"(age={age_str}). Start research_daemon.py first, or drop the flag.")
+            hint = ""
+            if TRADER_IN_PROCESS_SCORER_NEVER and not args.require_daemon:
+                hint = " (TRADER_IN_PROCESS_SCORER=never in .env)"
+            msg = (
+                f"Research scorer unavailable: no fresh research_daemon heartbeat "
+                f"(age={age_str}){hint}. Start ``python research_daemon.py`` on the research host, "
+                f"or pass --force-in-process for dev only."
+            )
+            if args.require_daemon and not TRADER_IN_PROCESS_SCORER_NEVER:
+                msg = (
+                    f"--require-daemon set but research_daemon heartbeat is stale "
+                    f"(age={age_str}). Start research_daemon.py first, or drop the flag."
+                )
             print(msg)
             logger.error(msg)
             sys.exit(2)
-
-        if daemon_alive and not args.force_in_process:
+        elif daemon_alive:
             age = heartbeat_age_s()
             print(
                 f"Scoring: remote (research_daemon heartbeat {age:.0f}s ago) — "
@@ -207,17 +235,10 @@ def main():
             logger.info("Research daemon alive (age=%.1fs); skipping in-process scorer", age)
         else:
             from signals.scorer import run_research_threaded
-            if args.force_in_process and daemon_alive:
-                print(
-                    "Scoring: in-process (--force-in-process; double-writes vs daemon — "
-                    "dev/debug only).\n"
-                )
-                logger.warning("--force-in-process: in-process scorer running alongside live daemon")
-            else:
-                print(
-                    "Scoring: in-process (no fresh research_daemon heartbeat). "
-                    "Prefer running python research_daemon.py for production.\n"
-                )
+            print(
+                "Scoring: in-process (no fresh research_daemon heartbeat). "
+                "Prefer running python research_daemon.py for production.\n"
+            )
             run_research_threaded(verbose=args.verbose)
     else:
         print(

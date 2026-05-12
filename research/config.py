@@ -70,10 +70,16 @@ OPTION_CHAIN_STRIKE_LIMIT = 20      # Max strikes per expiration (server-side fi
 # Uses X-Api-Ratelimit-* headers from responses (authoritative). Ratios
 # are credits_remaining / credits_limit. When unknown (before first HTTP),
 # the scorer runs normally until headers arrive.
-MDA_LOW_CREDIT_FRACTION = 0.20            # Below: double sleep between rounds
-MDA_CRITICAL_CREDIT_FRACTION = 0.10     # Below: 4x sleep (overrides low tier)
-MDA_SKIP_SUBDAILY_FRACTION = 0.15       # Below: skip 1m/5m/1h candle bundles (saves ~75 calls/round @ n=25)
+#
+# Thresholds were raised after field runs hit the daily cap: react earlier,
+# skip expensive bundles sooner, and combine with runway + burn heuristics
+# in core/runtime/mda_budget.py.
+MDA_SOFT_CREDIT_FRACTION = 0.48          # Below: 1.35x sleep (early cushion)
+MDA_LOW_CREDIT_FRACTION = 0.32         # Below: 2x sleep between rounds
+MDA_CRITICAL_CREDIT_FRACTION = 0.18    # Below: 4x sleep (overrides low tier)
+MDA_SKIP_SUBDAILY_FRACTION = 0.38       # Below: skip 1m/5m/1h candle bundles (saves ~75 calls/round @ n=25)
 MDA_DAILY_CREDIT_LIMIT_TYPICAL = 100_000  # Doc / sanity only; API headers are authoritative
+MDA_MAX_SLEEP_MULTIPLIER = 8.0          # Hard cap on combined cadence stretch
 
 # ── Options structure schemas ──────────────────────────────────
 # These are the REQUIRED fields for each options structure.

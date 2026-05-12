@@ -195,6 +195,7 @@ class MarketDataClient:
         self._credits_limit: Optional[int] = None
         self._credits_reset: Optional[int] = None  # UTC epoch seconds
         self._low_credit_warned: bool = False
+        self._mda_warned_35: bool = False
         self._breaker_warned: bool = False
 
         if not self.api_key:
@@ -381,9 +382,20 @@ class MarketDataClient:
             # Reset breaker-warned flag once credits recover (after reset)
             if self._credits_remaining is not None and self._credits_remaining > 0:
                 self._breaker_warned = False
-            # Warn once when credits drop below 10%
+            # Warn when credits drop below configured fractions (once per band).
             if self._credits_remaining is not None and self._credits_limit:
                 pct = self._credits_remaining / self._credits_limit
+                if pct < 0.35 and not getattr(self, "_mda_warned_35", False):
+                    logger.warning(
+                        "MDA credits moderate: %s / %s remaining (%.0f%%) — research daemon will "
+                        "pace harder and may skip sub-daily bundles",
+                        f"{self._credits_remaining:,}",
+                        f"{self._credits_limit:,}",
+                        100.0 * pct,
+                    )
+                    self._mda_warned_35 = True
+                elif pct >= 0.35:
+                    self._mda_warned_35 = False
                 if pct < 0.10 and not self._low_credit_warned:
                     logger.warning(
                         f"MDA credits low: {self._credits_remaining:,} / {self._credits_limit:,} remaining ({pct:.1%})"

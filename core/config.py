@@ -180,6 +180,17 @@ IBKR_QUOTES_ENABLED: bool = os.getenv("IBKR_QUOTES_ENABLED", "0") == "1"
 # subscriptions that share the same per-user budget.
 IBKR_QUOTE_LINE_BUDGET: int = int(os.getenv("IBKR_QUOTE_LINE_BUDGET", "90"))
 
+# ── Trader: in-process signal scorer (__main__.py + research_engine tool) ───
+# When TRADER_IN_PROCESS_SCORER=never (aliases: 0, false, off, remote_only, no),
+# the trader never starts ``signals.scorer`` in this process and **refuses to
+# start** unless ``research_daemon.py`` has a fresh DB heartbeat (same hard
+# gate as ``--require-daemon``). The ``research_engine`` tool cannot start or
+# resume the scorer. ``--force-in-process`` still overrides for dev/debug.
+_TRADER_IPS_RAW = os.getenv("TRADER_IN_PROCESS_SCORER", "auto").strip().lower()
+TRADER_IN_PROCESS_SCORER_NEVER: bool = _TRADER_IPS_RAW in (
+    "never", "0", "false", "off", "remote_only", "no",
+)
+
 # Backward compat alias
 MAX_RISK_PER_TRADE = RISK_PER_TRADE
 

@@ -781,6 +781,7 @@ async def handle_research_engine(executor, params: dict) -> dict:
     """
     from signals import scorer as _sc
     from signals import template_evolution as _te
+    from core.config import TRADER_IN_PROCESS_SCORER_NEVER
 
     action = str(params.get("action", "status")).lower().strip()
     scope = str(params.get("scope", "both")).lower().strip()
@@ -790,6 +791,11 @@ async def handle_research_engine(executor, params: dict) -> dict:
     result: dict[str, Any] = {}
     if action == "status":
         pass  # fall through to unified status report below
+    elif TRADER_IN_PROCESS_SCORER_NEVER and action in ("start", "resume") and want_scorer:
+        result["error"] = (
+            "In-process scorer is disabled (TRADER_IN_PROCESS_SCORER=never). "
+            "Run python research_daemon.py on the research host."
+        )
     elif action == "start":
         if want_scorer and not _sc.is_scorer_running():
             _sc.run_research_threaded(verbose=False)

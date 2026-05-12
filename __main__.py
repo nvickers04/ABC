@@ -145,6 +145,10 @@ def main():
     setup_logging(verbose=args.verbose)
 
     if args.test:
+        # Match validate_startup: load .env before reading GROK_API_KEY / XAI_API_KEY.
+        from dotenv import load_dotenv
+
+        load_dotenv(override=True)
         asyncio.run(test_grok())
         return
 

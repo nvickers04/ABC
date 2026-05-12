@@ -766,12 +766,18 @@ async def handle_open_hypotheses(executor, params: dict) -> Any:
         return {"error": str(e)}
 
 
+_EVOLUTION_DAEMON_ONLY = (
+    "Template evolution runs only in research_daemon.py — "
+    "not started or controlled from the trader process."
+)
+
+
 async def handle_research_engine(executor, params: dict) -> dict:
-    """Agent-controlled background scorer + template evolution.
+    """Agent-controlled in-process scorer only.
 
     params.action in {"status", "start", "pause", "resume", "stop"}.
-    Scope defaults to both subsystems; set scope='scorer' or 'evolution'
-    to control just one.
+    scope='scorer' | 'both' affects the scorer. scope='evolution' is ignored for
+    control actions (evolution is owned by research_daemon.py); status still reports policy.
     """
     from signals import scorer as _sc
     from signals import template_evolution as _te
@@ -788,27 +794,23 @@ async def handle_research_engine(executor, params: dict) -> dict:
         if want_scorer and not _sc.is_scorer_running():
             _sc.run_research_threaded(verbose=False)
             result["scorer_started"] = True
-        if want_evo and not _te.is_evolution_running():
-            try:
-                _te.start_evolution_task()
-                result["evolution_started"] = True
-            except Exception as e:
-                result["evolution_error"] = str(e)
+        if want_evo:
+            result["evolution_note"] = _EVOLUTION_DAEMON_ONLY
     elif action == "pause":
         if want_scorer:
             result["scorer_paused"] = _sc.pause_scorer()
         if want_evo:
-            result["evolution_paused"] = _te.pause_evolution()
+            result["evolution_note"] = _EVOLUTION_DAEMON_ONLY
     elif action == "resume":
         if want_scorer:
             result["scorer_resumed"] = _sc.resume_scorer()
         if want_evo:
-            result["evolution_resumed"] = _te.resume_evolution()
+            result["evolution_note"] = _EVOLUTION_DAEMON_ONLY
     elif action == "stop":
         if want_scorer:
             result["scorer_stopped"] = _sc.stop_scorer()
         if want_evo:
-            result["evolution_stopped"] = _te.stop_evolution()
+            result["evolution_note"] = _EVOLUTION_DAEMON_ONLY
     else:
         return {"error": f"unknown action '{action}'. Use: status|start|pause|resume|stop"}
 
@@ -817,8 +819,9 @@ async def handle_research_engine(executor, params: dict) -> dict:
         "paused": _sc.is_scorer_paused(),
     }
     result["evolution"] = {
-        "running": _te.is_evolution_running(),
-        "paused": _te.is_evolution_paused(),
+        "running_in_trader_process": _te.is_evolution_running(),
+        "paused_in_trader_process": _te.is_evolution_paused(),
+        "policy": _EVOLUTION_DAEMON_ONLY,
     }
     return result
 

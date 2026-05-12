@@ -625,6 +625,7 @@ def init_db():
             target_price REAL,
             stop_price REAL,
             legs_json TEXT,
+            track_record_json TEXT,
             PRIMARY KEY (symbol, ts)
         );
 
@@ -730,6 +731,7 @@ def init_db():
     # Idempotent column adds. Legacy `live_signals.slot` migration was removed
     # along with the table itself.
     _ensure_column(conn, "trade_feedback", "template_name", "TEXT")
+    _ensure_column(conn, "template_recommendations", "track_record_json", "TEXT")
 
     # Continuous env metrics
     _env_continuous_cols = [

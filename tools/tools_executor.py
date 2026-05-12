@@ -330,6 +330,50 @@ def _parse_option_symbol(sym: str) -> dict | None:
 # Backward compat alias
 _parse_occ_symbol = _parse_option_symbol
 
+
+def merge_bare_stock_entry_advisory(action: str, params: dict | None, result: Any) -> Any:
+    """Attach ``data_warning`` when a stock market/limit entry bypasses ``plan_order`` context.
+
+    Advisory only — never blocks execution. Disable with env
+    ``DISABLE_BARE_STOCK_ENTRY_ADVISORY=true``.
+    """
+    if os.environ.get("DISABLE_BARE_STOCK_ENTRY_ADVISORY", "").lower() in ("1", "true", "yes"):
+        return result
+    if action not in ("market_order", "limit_order"):
+        return result
+    if not isinstance(result, dict):
+        return result
+    if result.get("error"):
+        return result
+    if result.get("success") is False:
+        return result
+    params = params or {}
+    sym_raw = params.get("symbol")
+    if not isinstance(sym_raw, str) or not sym_raw.strip():
+        return result
+    sym = sym_raw.strip().upper()
+    if _parse_option_symbol(sym):
+        return result
+    intent = str(params.get("intent") or "entry").lower()
+    if intent in ("exit", "close", "trim", "reduce", "rotation", "protect"):
+        return result
+    try:
+        from memory import get_pending_order_context
+
+        if get_pending_order_context(sym):
+            return result
+    except Exception:
+        pass
+    msg = (
+        "Advisory: stock market/limit order without a recent plan_order context for this symbol. "
+        "Prefer plan_order or bracket_order for day-trade entries so size/stop intent is explicit."
+    )
+    out = dict(result)
+    prev = out.get("data_warning")
+    out["data_warning"] = f"{prev}; {msg}" if prev else msg
+    return out
+
+
 # Inline order action names (replaces deleted tool_registry dependency)
 _ORDER_ACTIONS = {
     "market_order", "limit_order", "stop_order", "stop_limit",
@@ -1916,4 +1960,5 @@ class ToolExecutor:
                 "hint": "Use plan_order for entries/exits. Use market_order/limit_order for direct execution.",
                 "valid_actions": valid,
             }
-        return await handler(self, params)
+        result = await handler(self, params)
+        return merge_bare_stock_entry_advisory(action, params, result)

@@ -23,22 +23,7 @@ import pytest
 
 
 # ── Fixtures ─────────────────────────────────────────────────────
-
-@pytest.fixture(autouse=True)
-def _isolated_db(tmp_path, monkeypatch):
-    """Redirect memory module to a fresh temp DB for every test."""
-    import memory
-    db_path = tmp_path / "test.db"
-    monkeypatch.setattr(memory, "_DB_PATH", db_path)
-    monkeypatch.setattr(memory, "_connection", None)
-    monkeypatch.setattr(memory, "_calibration_version", 0)
-    memory._pending_graduated_params.clear()
-    memory._pending_order_context.clear()
-    memory.init_db()
-    yield
-    if memory._connection:
-        memory._connection.close()
-    monkeypatch.setattr(memory, "_connection", None)
+# DB isolation: use ``tests/conftest.py`` autouse ``_isolated_db`` (reset_state + init_db).
 
 
 @pytest.fixture
@@ -662,15 +647,29 @@ class TestTemplateBoundaries:
                 "target_price": 155.0,
                 "stop_price": 147.0,
                 "legs_json": None,
+                "vol_regime": "high",
+                "template_track_record": {
+                    "win_rate": 0.6,
+                    "trades": 10,
+                    "avg_return_pct": 0.12,
+                    "sharpe": 1.1,
+                },
             }
         ]
         write_recommendations(db, recs)
         row = db.execute(
-            "SELECT symbol, direction, composite_score FROM template_recommendations"
+            "SELECT symbol, direction, composite_score, track_record_json "
+            "FROM template_recommendations"
         ).fetchone()
         assert row is not None
-        assert row[0] == "AAPL"
-        assert row[1] == "long"
+        assert row["symbol"] == "AAPL"
+        assert row["direction"] == "long"
+        assert row["track_record_json"] is not None
+
+        snap = json.loads(row["track_record_json"])
+        assert snap["trades"] == 10
+        assert snap["win_pct"] == 60.0
+        assert snap["regime_key"] == "high"
 
 
 # ═════════════════════════════════════════════════════════════════

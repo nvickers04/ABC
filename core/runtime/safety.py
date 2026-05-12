@@ -147,7 +147,7 @@ class SafetyController:
         """Run all checks; return a :class:`SafetyVerdict`.
 
         Order of priority (matches inline agent logic):
-        daily-loss → intraday-drawdown → LLM-cost.
+        daily-loss → intraday-drawdown → LLM token buckets → LLM-cost.
         """
         verdict = SafetyVerdict()
 
@@ -164,6 +164,14 @@ class SafetyController:
                 f"Intraday drawdown: -{verdict.drawdown_pct:.1f}% from session high"
             )
             return verdict
+
+        check_tok = getattr(self.cost_tracker, "check_daily_token_limits", None)
+        if callable(check_tok):
+            tok = check_tok()
+            if tok:
+                verdict.triggered = True
+                verdict.reason = f"LLM token daily limit: {tok}"
+                return verdict
 
         if self.check_llm_cost():
             verdict.triggered = True

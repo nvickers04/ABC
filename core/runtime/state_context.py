@@ -292,16 +292,16 @@ class StateContextBuilder:
         except Exception as e:
             logger.debug(f"Portfolio risk summary failed: {e}")
 
-        # ── Research engine status (scorer + template evolution) ──
+        # ── Research engine status (in-process scorer; evolution is research_daemon-only) ──
         try:
             from signals import scorer as _sc
             from signals import template_evolution as _te
             sc_state = "off"
             if _sc.is_scorer_running():
                 sc_state = "paused" if _sc.is_scorer_paused() else "running"
-            te_state = "off"
+            te_local = "off"
             if _te.is_evolution_running():
-                te_state = "paused" if _te.is_evolution_paused() else "running"
+                te_local = "paused" if _te.is_evolution_paused() else "running"
 
             # IR snapshot freshness — tells the agent whether briefing.edge
             # is current or stale. Stale edge can still be used but the agent
@@ -326,10 +326,12 @@ class StateContextBuilder:
 
             lines.append("")
             lines.append(
-                f"═══ RESEARCH ENGINE ═══ scorer={sc_state}  evolution={te_state}  "
+                f"═══ RESEARCH ENGINE ═══ scorer={sc_state}  "
+                f"evolution_in_this_process={te_local}  "
+                f"(template evolution runs in research_daemon.py)  "
                 f"edge_snapshot={age_str}"
             )
-            lines.append("(control via research_engine action=start|pause|resume|stop)")
+            lines.append("(scorer control via research_engine; evolution is not on the trader)")
         except Exception as e:
             logger.debug(f"Engine status failed: {e}")
 

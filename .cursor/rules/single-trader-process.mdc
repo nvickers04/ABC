@@ -1,0 +1,49 @@
+---
+description: Integrated Terminal + transcript visibility; single trader; split-host use --require-daemon; no silent in-process scorer
+alwaysApply: true
+---
+
+# Process visibility and single-trader guardrails
+
+## Visibility — applies to **all** agent-started shell processes
+
+Cursor agent **background** shell jobs often **do not** show up as a normal Terminal tab, so the user cannot see what is running, cannot Ctrl+C cleanly, and duplicate jobs stack unnoticed.
+
+**Rules for any command run on behalf of the user (tests, installs, scripts, servers, one-liners — everything):**
+
+1. **Never** use agent **background** / non-blocking shell execution for **any** process unless the user **explicitly** asked for that specific command to run in the background **and** you warn that they may not see it in their usual terminal.
+2. **Default:** run shell commands **foreground** so **the full command and full output** appear in the Cursor transcript (tool output). That counts as visible for normal, bounded commands.
+3. **Interactive, long-lived, or spendy** jobs (traders, daemons, dev servers, watch mode, anything using LLM/IBKR keys, anything expected to run until stopped): do **not** rely on agent-only or hidden execution. Give the user the **exact command** to run in **Cursor’s integrated Terminal** (**Terminal → New Terminal** / the bottom panel). That is the **default** place they should run and watch the process (live output, **Ctrl+C**). Do **not** spawn a separate OS window via `Start-Process powershell`, `Start-Process cmd`, etc. **unless** the user explicitly asks for an external window.
+4. **Never** start a process the user cannot observe or correlate with a command they recognize.
+
+## Single trader / daemon (duplicate prevention)
+
+Running **multiple** `python __main__.py` (Grok trader) or parallel **research** long-runners multiplies **xAI spend**, **IBKR client IDs**, and confusing logs.
+
+When the user (or you) asks to **run**, **start**, **try again**, or start the Grok trader, `__main__.py`, `research_daemon.py`, or any process that calls the LLM and/or IBKR for an extended session:
+
+1. **Inventory first** (do not spawn another copy blindly). On Windows, list `python.exe` processes whose command line includes `__main__.py`, `research_daemon`, or this repo’s path, e.g. `Get-CimInstance Win32_Process -Filter "name = 'python.exe'"` and inspect `CommandLine`.
+2. **If more than one matching process exists**, or any match when the user wanted a **clean single run**:
+   - Tell the user **how many** and **which PIDs** are running the same entrypoint.
+   - **Do not** start another instance until duplicates are resolved **or** the user explicitly says they want multiple instances (rare).
+3. **Default remediation** when the user wants “the trader” running: **stop redundant processes**, keep **at most one** trader for this workspace (or stop all, then start one fresh). Use explicit `Stop-Process -Id <pid> -Force` only for PIDs you listed and that match the trader/daemon command line—never guess.
+4. **After** cleanup (or if count was 0), **at most one** new trader run, started in a **user-visible** way per the visibility rules above (integrated Terminal preferred).
+
+## Research host + trader machine (shared Postgres)
+
+This repo supports **one research machine** (Postgres + `research_daemon.py`) and a **separate trader machine** (`__main__.py`). Both use the **same** Postgres (`DATABASE_URL` / `PG*`) so the daemon’s heartbeat row is visible to the trader.
+
+- **Bug to avoid:** `python __main__.py` **without** `--require-daemon` will start an **in-process scorer** whenever the daemon heartbeat is **missing or stale**. That is a **second scorer** next to `research_daemon.py` — duplicate cadence and **double-writes** into shared tables. That **breaks** the split-host model.
+- **Do not** suggest or run bare `python __main__.py` / `python __main__.py --verbose` for **production** on the trader box when scoring is owned by a remote daemon. Prefer:
+  - **`python __main__.py --verbose --require-daemon`** — refuse to start unless the daemon heartbeat is fresh (fix daemon or DB if it exits).
+  - **`--no-research`** only when the operator explicitly wants no auto-scorer on the trader (still understand tool/agent paths).
+  - **`--force-in-process`** only when the user **explicitly** wants dev single-process mode (never default).
+- If the user’s setup is split-host, **call this out** whenever starting the trader so they never silently fall back to in-process scoring.
+
+## Shell on Windows
+
+Use PowerShell-safe separators (`;` or separate commands), not `&&`, unless the user’s shell is known to support `&&`. The integrated Terminal may be PowerShell or Command Prompt depending on the user’s profile—either is fine.
+
+## Summary for the user
+
+**No hidden background processes.** **All** shell work: visible transcript and/or the **integrated Terminal** for long-lived jobs (not external pop-out shells unless requested). **Never** stack duplicate traders.

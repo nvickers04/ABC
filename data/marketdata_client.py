@@ -37,6 +37,45 @@ _MDA_MAX_CONCURRENT = 45  # MDA hard limit is 50; keep 5 headroom
 
 # US regular session length used to convert "calendar lookback days" → bar count.
 _RTH_MINUTES = 390  # ~6.5h
+
+
+def _normalize_mda_api_key(raw: Optional[str]) -> Optional[str]:
+    """Strip whitespace; drop accidental ``Bearer `` prefix; trim wrapping quotes.
+
+    A literal ``Bearer abc`` in ``.env`` would otherwise become
+    ``Authorization: Bearer Bearer abc`` → HTTP 403 from MarketData.app.
+    """
+    if raw is None:
+        return None
+    s = str(raw).strip()
+    if not s:
+        return None
+    low = s.lower()
+    if low.startswith("bearer "):
+        s = s[7:].strip()
+    if len(s) >= 2 and s[0] == s[-1] and s[0] in "\"'":
+        s = s[1:-1].strip()
+    return s or None
+
+
+def _format_mda_denied_body(response: httpx.Response) -> str:
+    """Best-effort parse of MDA JSON error (e.g. multi-IP policy) for logs."""
+    try:
+        data = response.json()
+    except Exception:
+        return (response.text or "")[:500]
+    if not isinstance(data, dict):
+        return str(data)[:500]
+    parts: List[str] = []
+    if data.get("errmsg"):
+        parts.append(str(data["errmsg"]))
+    if data.get("authorizedIP") is not None or data.get("blockedIP") is not None:
+        parts.append(
+            f"authorizedIP={data.get('authorizedIP')!r} blockedIP={data.get('blockedIP')!r}"
+        )
+    if data.get("troubleshootingGuide"):
+        parts.append(str(data["troubleshootingGuide"]))
+    return " | ".join(parts) if parts else str(data)[:500]
 # API hard limit: intraday range ≤ 1 year; keep a generous cap on countback.
 _MAX_INTRADAY_COUNTBACK = 80_000
 
@@ -134,7 +173,11 @@ class MarketDataClient:
         Args:
             api_key: API key (uses MARKETDATA_TOKEN env var if not provided)
         """
-        self.api_key = api_key or os.environ.get('MARKETDATA_TOKEN') or os.environ.get('MARKETDATA_API_KEY')
+        self.api_key = _normalize_mda_api_key(
+            api_key
+            or os.environ.get("MARKETDATA_TOKEN")
+            or os.environ.get("MARKETDATA_API_KEY")
+        )
         # Per-loop HTTP clients and semaphores keyed by id(loop).
         # A single shared client bound to one loop is unsafe when worker
         # threads (asyncio.to_thread) run nested asyncio.run / run_until_complete
@@ -260,6 +303,8 @@ class MarketDataClient:
                     async with self._get_global_semaphore():
                         response = await client.get(path, params=params)
                     self._parse_rate_headers(response)
+                    if response.status_code in (401, 403):
+                        self._log_http_denied(response, label)
                     if response.status_code not in _OPTIONS_RETRY_STATUSES or attempt == _OPTIONS_RETRY_ATTEMPTS - 1:
                         return response
                     logger.debug(
@@ -348,6 +393,23 @@ class MarketDataClient:
                     self._low_credit_warned = False
         except (ValueError, TypeError):
             pass
+
+    def _log_http_denied(self, response: httpx.Response, label: str) -> None:
+        """Log 401/403 with MarketData.app body when present (multi-IP, bad token, etc.)."""
+        detail = _format_mda_denied_body(response)
+        if detail:
+            logger.warning(
+                "MarketData.app HTTP %s for %s — %s",
+                response.status_code,
+                label,
+                detail,
+            )
+        else:
+            logger.warning(
+                "MarketData.app HTTP %s for %s (empty body)",
+                response.status_code,
+                label,
+            )
 
     def _track_request(self) -> bool:
         """

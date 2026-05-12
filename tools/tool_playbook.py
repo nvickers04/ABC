@@ -5,9 +5,9 @@ from __future__ import annotations
 # Nuanced one-liners (override pattern defaults).
 _PRECISE: dict[str, str] = {
     "research": "Deep web/X discovery when cheap tools cannot answer; cost=llm.",
-    "research_engine": "Scorer/evolution control; use action=status|start|pause|resume|stop.",
+    "research_engine": "In-process scorer only; evolution lives in research_daemon.py.",
     "prior_research": "Pull cached multi-agent runs; cost=free (reads DB).",
-    "briefing": "Layered internal snapshot; cost=free.",
+    "briefing": "Default summary includes template OOS track_record on ACTION_REQUIRED + template_leaderboard; detail=strategies for full table.",
     "plan_order": "Size/type/stop plan before any live order; universe guard on entries.",
     "enter_option": "Contract pick + optional execute; prefer after plan_order/chain.",
     "calculate_size": "Risk-based share count; needs fresh quote; use before limits.",

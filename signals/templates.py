@@ -304,6 +304,7 @@ def select_template(
         "legs_json": None,  # Populated by options leg builder if options template
         "composite_score": composite_score,
         "template_track_record": track,
+        "vol_regime": vol_regime,
     }
 
 
@@ -342,6 +343,27 @@ def _get_track_record(
     return {"win_rate": 0.5, "trades": 0, "avg_return_pct": 0.0, "sharpe": None}
 
 
+def _track_record_snapshot_json(rec: dict) -> str | None:
+    """Serialize template OOS snapshot for ``template_recommendations.track_record_json``."""
+    track = rec.get("template_track_record")
+    vol = str(rec.get("vol_regime") or "normal").strip() or "normal"
+    if not isinstance(track, dict):
+        return None
+    trades = int(track.get("trades") or 0)
+    if trades <= 0:
+        return None
+    win_rate = float(track.get("win_rate") or 0.0)
+    sh = track.get("sharpe")
+    payload = {
+        "trades": trades,
+        "win_pct": round(win_rate * 100.0, 1),
+        "avg_return_pct": round(float(track.get("avg_return_pct") or 0.0), 4),
+        "sharpe": round(float(sh), 2) if sh is not None else None,
+        "regime_key": vol,
+    }
+    return json.dumps(payload)
+
+
 def write_recommendations(
     db_conn,
     recommendations: list[dict],
@@ -350,6 +372,7 @@ def write_recommendations(
     now = time.time()
     rows = []
     for rec in recommendations:
+        tr_json = _track_record_snapshot_json(rec)
         rows.append((
             rec["symbol"],
             now,
@@ -361,13 +384,14 @@ def write_recommendations(
             rec.get("target_price"),
             rec.get("stop_price"),
             json.dumps(rec.get("legs_json")) if rec.get("legs_json") else None,
+            tr_json,
         ))
     if rows:
         db_conn.executemany(
             "INSERT OR REPLACE INTO template_recommendations "
             "(symbol, ts, template_name, direction, composite_score, order_type, "
-            "entry_price, target_price, stop_price, legs_json) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            "entry_price, target_price, stop_price, legs_json, track_record_json) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             rows,
         )
         db_conn.commit()

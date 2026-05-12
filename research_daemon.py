@@ -76,9 +76,11 @@ async def _run(*, verbose: bool, run_evolution: bool) -> None:
         try:
             from signals.template_evolution import run_template_evolution_threaded
             run_template_evolution_threaded()
-            logger.info("Template evolution thread started")
+            logger.info("Template evolution thread started (default on; matches trader split)")
         except Exception as e:
             logger.warning("Template evolution failed to start: %s", e)
+    else:
+        logger.info("Template evolution disabled (--no-evolution)")
 
     # Run the scorer on this loop directly with cadence mode on.
     from signals.scorer import run_research
@@ -129,7 +131,9 @@ def main() -> None:
     except Exception as e:
         logger.warning("Could not override IBKR_QUOTES_ENABLED: %s", e)
 
-    print("Research daemon starting (Ctrl+C to stop)\n")
+    print("=== Research daemon ===")
+    print("This process: tiered signal scorer + template evolution (use --no-evolution to turn evolution off).")
+    print("No Grok/LLM, no IBKR orders. Ctrl+C to stop.\n")
 
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)

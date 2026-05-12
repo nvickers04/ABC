@@ -7,6 +7,9 @@ Usage:
     python __main__.py --verbose        # Debug logging
     python __main__.py --account live   # Live trading (use with caution)
 
+Research (scoring + template evolution) lives in ``research_daemon.py``. This process
+only starts an in-process scorer when the daemon heartbeat is absent/stale.
+
 Built for Grok (xAI) — dynamic liquidity, overnight holds OK, configurable risk.
 """
 
@@ -120,9 +123,6 @@ def main():
     parser.add_argument("--no-research", action="store_true",
                         help="Don't pre-start the background scorer "
                              "(agent can still start it via research_engine tool)")
-    parser.add_argument("--no-evolution", action="store_true",
-                        help="Don't pre-start template evolution "
-                             "(agent can still start it via research_engine tool)")
     daemon_group = parser.add_mutually_exclusive_group()
     daemon_group.add_argument(
         "--require-daemon", action="store_true",
@@ -160,16 +160,32 @@ def main():
 
     validate_startup()
 
-    print(f"\nStarting Grok Trader (account={args.account})...")
-    print("Press Ctrl+C to stop\n")
+    from core import config as _budget_cfg
+
+    print(
+        "\nLLM / API spend guardrails (this app’s estimates — xAI console may differ):\n"
+        f"  • MAX_DAILY_LLM_COST ≈ ${_budget_cfg.MAX_DAILY_LLM_COST:.2f} tracked USD/day → agent halts\n"
+        f"  • research() cap ≈ ${_budget_cfg.MAX_DAILY_MULTI_AGENT_RESEARCH_USD:.2f} tracked USD/day\n"
+        "  • Daily token caps per bucket — see core/config.py / .env\n"
+        "  Match these to your prepaid balance; export MAX_DAILY_LLM_COST=… if needed.\n"
+    )
+    logger.info(
+        "Budget defaults: MAX_DAILY_LLM_COST=%s MAX_DAILY_MULTI_AGENT_RESEARCH_USD=%s",
+        _budget_cfg.MAX_DAILY_LLM_COST,
+        _budget_cfg.MAX_DAILY_MULTI_AGENT_RESEARCH_USD,
+    )
+
+    print(f"\n=== Grok Trader ({args.account}) ===")
+    print("This process: Grok agent, IBKR, memory — not template evolution.")
+    print("Template evolution runs only in research_daemon.py (default there).")
+    print("Press Ctrl+C to stop.\n")
 
     from core.agent import run_agent
 
     if not args.no_research:
-        # Three modes:
-        #   --require-daemon   → hard-fail if daemon isn't alive (production)
-        #   --force-in-process → always run scorer in-process (dev/debug)
-        #   default            → detect daemon via heartbeat; fall back if stale
+        # --require-daemon   → hard-fail if daemon isn't alive (production)
+        # --force-in-process → always run scorer in-process (dev/debug)
+        # default              → fresh daemon heartbeat → skip in-process scorer
         from core.runtime.heartbeat import is_daemon_alive, heartbeat_age_s
         daemon_alive = is_daemon_alive()
 
@@ -184,24 +200,32 @@ def main():
 
         if daemon_alive and not args.force_in_process:
             age = heartbeat_age_s()
-            print(f"Research daemon detected (last heartbeat {age:.1f}s ago) — "
-                  f"agent will not spawn its own scorer.\n")
+            print(
+                f"Scoring: remote (research_daemon heartbeat {age:.0f}s ago) — "
+                "no in-process scorer here.\n"
+            )
             logger.info("Research daemon alive (age=%.1fs); skipping in-process scorer", age)
         else:
             from signals.scorer import run_research_threaded
             if args.force_in_process and daemon_alive:
-                print("--force-in-process set: running scorer in-process despite live daemon "
-                      "(this will double-write — use only for dev/debug)\n")
+                print(
+                    "Scoring: in-process (--force-in-process; double-writes vs daemon — "
+                    "dev/debug only).\n"
+                )
                 logger.warning("--force-in-process: in-process scorer running alongside live daemon")
             else:
-                print("Research scorer running in-process (no daemon heartbeat)\n")
+                print(
+                    "Scoring: in-process (no fresh research_daemon heartbeat). "
+                    "Prefer running python research_daemon.py for production.\n"
+                )
             run_research_threaded(verbose=args.verbose)
+    else:
+        print(
+            "Scoring: not auto-started (--no-research). "
+            "Use research_daemon.py or research_engine tool for scorer only.\n"
+        )
 
     tasks = [run_agent()]
-    if not args.no_evolution:
-        from signals.template_evolution import run_template_evolution_threaded
-        run_template_evolution_threaded()
-        print("Template evolution running (agent can pause/stop via research_engine tool)\n")
 
     async def _heartbeat():
         """Log a heartbeat every 60s with each known component's last activity.

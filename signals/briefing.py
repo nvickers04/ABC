@@ -127,14 +127,27 @@ def query_briefing_data() -> dict:
         if latest_ts:
             recs = db.execute(
                 """SELECT symbol, template_name, direction, composite_score,
-                          order_type, entry_price, target_price, stop_price, legs_json
+                          order_type, entry_price, target_price, stop_price, legs_json,
+                          track_record_json
                    FROM template_recommendations
                    WHERE ts = ?
                    ORDER BY ABS(composite_score) DESC""",
                 (latest_ts,),
             ).fetchall()
             if recs:
-                result["recommendations"] = [dict(r) for r in recs]
+                out_recs = []
+                for r in recs:
+                    row = dict(r)
+                    tj = row.pop("track_record_json", None)
+                    if tj:
+                        try:
+                            parsed = json.loads(tj) if isinstance(tj, str) else tj
+                            if isinstance(parsed, dict):
+                                row["track_record"] = parsed
+                        except Exception as e:
+                            logger.debug("track_record_json parse failed: %s", e)
+                    out_recs.append(row)
+                result["recommendations"] = out_recs
     except Exception:
         pass
 
@@ -168,12 +181,91 @@ def query_briefing_data() -> dict:
     return result
 
 
+def _pick_template_perf_row(
+    template_name: str,
+    vol_regime: str | None,
+    rows: list[dict],
+) -> dict | None:
+    """Pick the best template_performance row for a template name.
+
+    Prefer ``regime_key`` matching current volatility regime, then ``all``,
+    else the row with the most trades.
+    """
+    cands = [r for r in rows if r.get("template_name") == template_name]
+    if not cands:
+        return None
+    if vol_regime:
+        for r in cands:
+            if r.get("regime_key") == vol_regime:
+                return dict(r)
+    for r in cands:
+        if r.get("regime_key") == "all":
+            return dict(r)
+    return dict(max(cands, key=lambda r: int(r.get("trades") or 0)))
+
+
+def _track_record_from_row(row: dict | None, min_trades: int) -> dict | None:
+    """OOS stats for briefing JSON; None if insufficient sample.
+
+    Accepts a ``template_performance`` row (``wins``) or a persisted snapshot
+    (``win_pct``) from ``template_recommendations.track_record_json``.
+    """
+    if not row:
+        return None
+    trades = int(row.get("trades") or 0)
+    if trades < min_trades:
+        return None
+    if row.get("win_pct") is not None:
+        win_pct = round(float(row["win_pct"]), 1)
+    else:
+        wins = int(row.get("wins") or 0)
+        win_pct = round(wins / max(trades, 1) * 100.0, 1)
+    sh = row.get("sharpe")
+    return {
+        "trades": trades,
+        "win_pct": win_pct,
+        "avg_return_pct": round(float(row.get("avg_return_pct") or 0.0), 4),
+        "sharpe": round(float(sh), 2) if sh is not None else None,
+        "regime_key": row.get("regime_key"),
+    }
+
+
+def _build_template_leaderboard(
+    rows: list[dict],
+    vol_regime: str | None,
+    min_trades: int,
+    max_k: int,
+) -> list[dict]:
+    """Top templates by OOS Sharpe (then trades), one row per template_name."""
+    names = sorted({str(r["template_name"]) for r in rows if r.get("template_name")})
+    out: list[dict] = []
+    for tn in names:
+        picked = _pick_template_perf_row(tn, vol_regime, rows)
+        tr = _track_record_from_row(picked, min_trades)
+        if tr:
+            entry = {"template": tn, **tr}
+            out.append(entry)
+    out.sort(
+        key=lambda e: (
+            float(e["sharpe"]) if e.get("sharpe") is not None else float("-inf"),
+            e["trades"],
+        ),
+        reverse=True,
+    )
+    return out[:max_k]
+
+
 # ---------------------------------------------------------------------------
 # Layer 1: Signal quality
 # ---------------------------------------------------------------------------
 
 def briefing_summary(data: dict) -> dict:
     """Layers 1-3: signal quality, top composites, and recommended trades."""
+    from core.config import (
+        BRIEFING_MIN_TEMPLATE_TRADES,
+        BRIEFING_TEMPLATE_LEADERBOARD_K,
+    )
+
     env = data.get("env")
     weights = data.get("weights", [])
     composites = data.get("composites", [])
@@ -206,6 +298,10 @@ def briefing_summary(data: dict) -> dict:
             logger.debug(f"Failed to parse signal_breakdown_json for {comp.get('symbol')}: {e}")
             pass
         top_composites.append(entry)
+
+    template_perf_rows: list[dict] = list(data.get("template_perf") or [])
+    vol_regime_raw = (env or {}).get("volatility_regime") if env else None
+    vol_regime = str(vol_regime_raw).strip() if vol_regime_raw else None
 
     # Recommended trades
     actionable = []
@@ -240,7 +336,27 @@ def briefing_summary(data: dict) -> dict:
         }
         if legs:
             item["legs"] = legs
+
+        tname = item.get("template")
+        if tname:
+            tr = None
+            persisted = rec.get("track_record")
+            if isinstance(persisted, dict):
+                tr = _track_record_from_row(persisted, BRIEFING_MIN_TEMPLATE_TRADES)
+            if tr is None:
+                prow = _pick_template_perf_row(str(tname), vol_regime, template_perf_rows)
+                tr = _track_record_from_row(prow, BRIEFING_MIN_TEMPLATE_TRADES)
+            if tr:
+                item["track_record"] = tr
+
         actionable.append(item)
+
+    template_leaderboard = _build_template_leaderboard(
+        template_perf_rows,
+        vol_regime,
+        BRIEFING_MIN_TEMPLATE_TRADES,
+        BRIEFING_TEMPLATE_LEADERBOARD_K,
+    )
 
     fb_line = None
     if feedback:
@@ -290,6 +406,12 @@ def briefing_summary(data: dict) -> dict:
         "gate_min_reference": ir_min,
         "gate_open": bool(gate_open),
         "history_rows": history_rows,
+        "n_eff": round(float(n_eff), 2) if n_eff is not None else None,
+        "note": (
+            "Reason from numbers (estimated_ir vs gate_min_reference, gate_open, history_rows, "
+            "n_eff, driving_signals ic/t/n, each ACTION_REQUIRED.composite and track_record). "
+            "strength is a coarse bucket, not a veto - moderate/weak never means skip candidates by label."
+        ),
     }
     if top_ic:
         edge_block["driving_signals"] = [
@@ -350,6 +472,7 @@ def briefing_summary(data: dict) -> dict:
         "edge": edge_block,
         "top_composites": top_composites,
         "ACTION_REQUIRED": actionable,
+        "template_leaderboard": template_leaderboard,
         "instruction": action_instruction,
         "feedback": fb_line,
     }

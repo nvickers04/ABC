@@ -147,7 +147,24 @@ INTRADAY_DRAWDOWN_PCT = 3.0     # Peak-to-trough drawdown limit within a session
 EOD_FLATTEN_MINUTES = 5         # Flatten all positions N minutes before close
 OPEN_GAP_GUARD_PCT = 2.0        # Skip entries if overnight gap exceeds this %
 OPEN_GUARD_DELAY_MINUTES = 15   # Wait N minutes after open if gap guard triggers
-MAX_DAILY_LLM_COST = 50.0      # LLM cost ceiling per day
+MAX_DAILY_LLM_COST: float = float(
+    os.getenv("MAX_DAILY_LLM_COST", "4.5")
+)  # Tracked USD/day (halt agent); default under a small prepaid top-up; raise in .env.
+
+# Multi-agent research() tool (4–16 Grok agents + web_search + x_search) — the
+# largest surprise xAI bill. Tracked separately in research_config; see tools_multiagent.
+MAX_DAILY_MULTI_AGENT_RESEARCH_USD: float = float(
+    os.getenv("MAX_DAILY_MULTI_AGENT_RESEARCH_USD", "0.75")
+)
+MULTI_AGENT_RESEARCH_ENABLED: bool = os.getenv(
+    "MULTI_AGENT_RESEARCH_ENABLED", "1"
+).strip().lower() not in ("0", "false", "no", "off")
+
+# First-cycle pre-scan: when True, the prompt nudges immediate research(); default False
+# so the agent uses briefing / calendar / prior_research first (cheap).
+PRESCAN_PROMPT_EXPENSIVE_RESEARCH: bool = (
+    os.getenv("PRESCAN_PROMPT_EXPENSIVE_RESEARCH", "0").strip() == "1"
+)
 
 # ── Quote source (real-time vs. delayed) ───────────────────────────────────
 # When IBKR_QUOTES_ENABLED is True, get_quote()/get_quotes_bulk() route to
@@ -170,6 +187,38 @@ MAX_RISK_PER_TRADE = RISK_PER_TRADE
 LLM_TEMPERATURE = 0.0           # Deterministic — no creativity in money decisions
 LLM_SEED = 42                   # Reproducibility
 LLM_MAX_TOKENS = 8192           # Generous reasoning space
+
+# Prompt budget (reasoning model): every ReAct ``chat.sample()`` resends the full
+# conversation, so oversized tool JSON dominates prompt_tokens. Playbook is appended
+# to the system message (see ``core.agent``).
+TOOL_PLAYBOOK_MAX_CHARS: int = int(os.getenv("TOOL_PLAYBOOK_MAX_CHARS", "1200"))
+AGENT_TOOL_FEEDBACK_MAX_CHARS: int = int(os.getenv("AGENT_TOOL_FEEDBACK_MAX_CHARS", "4500"))
+
+# briefing_summary(): min template_performance trades before surfacing OOS stats; top-K leaderboard.
+BRIEFING_MIN_TEMPLATE_TRADES: int = int(os.getenv("BRIEFING_MIN_TEMPLATE_TRADES", "5"))
+BRIEFING_TEMPLATE_LEADERBOARD_K: int = int(os.getenv("BRIEFING_TEMPLATE_LEADERBOARD_K", "8"))
+
+# Daily xAI token ceilings (hard stop via cost_tracker.check_daily_token_limits).
+# Defaults are tight — loosen via env once you trust spend; xAI UI can exceed our tracker.
+MAX_DAILY_LLM_NONCACHED_PROMPT_TEXT_TOKENS: int = int(
+    os.getenv("MAX_DAILY_LLM_NONCACHED_PROMPT_TEXT_TOKENS", "350000")
+)
+MAX_DAILY_LLM_CACHED_PROMPT_TEXT_TOKENS: int = int(
+    os.getenv("MAX_DAILY_LLM_CACHED_PROMPT_TEXT_TOKENS", "999999999")
+)
+MAX_DAILY_LLM_PROMPT_IMAGE_TOKENS: int = int(
+    os.getenv("MAX_DAILY_LLM_PROMPT_IMAGE_TOKENS", "50000")
+)
+MAX_DAILY_LLM_COMPLETION_TOKENS: int = int(
+    os.getenv("MAX_DAILY_LLM_COMPLETION_TOKENS", "80000")
+)
+MAX_DAILY_LLM_REASONING_TOKENS: int = int(
+    os.getenv("MAX_DAILY_LLM_REASONING_TOKENS", "120000")
+)
+# Output-priced = completion + reasoning (billed at output rate); cap mirrors reasoning-heavy days.
+MAX_DAILY_LLM_OUTPUT_PRICED_TOKENS: int = int(
+    os.getenv("MAX_DAILY_LLM_OUTPUT_PRICED_TOKENS", "150000")
+)
 
 # ── System Prompt ───────────────────────────────────────────────────────────
 SYSTEM_PROMPT = f"""You are an optimistic, truth-seeking trader. You look for opportunity, but
@@ -194,8 +243,14 @@ You are the portfolio manager. You have full tool access and full decision autho
 real constraints listed at the bottom. The research subsystem gives you *information*, not orders:
 
 - A ~50-signal quantitative stack is scored continuously and combined via the Fundamental Law of
-  Active Management (IR = IC × sqrt(N_eff)). Its output reaches you as `briefing.edge` with a
-  strength label (strong / moderate / weak / marginal) and `ACTION_REQUIRED` candidate trades.
+  Active Management (IR = IC × sqrt(N_eff)). Its output reaches you as `briefing.edge` with numeric
+  fields (estimated_ir, gate_min_reference, gate_open, history_rows, n_eff, driving_signals ic/t/n)
+  plus a coarse `strength` label (strong / moderate / weak / marginal / warming) and
+  `ACTION_REQUIRED` candidate trades (each with numeric `composite` and optional track_record counts).
+- Prefer reasoning from those numbers and from your own research. Treat `strength` as a rough
+  conviction dial, not a permission bit: moderate or weak edge does **not** mean "do not trade
+  mid-tier names" — it means the stack's measured IR is lower, so evidence and sizing should match
+  that fact; a strong independent thesis can still justify a trade at appropriate size.
 - The edge strength is a conviction multiplier, not a permission slip. When edge is strong, lean in.
   When edge is marginal, the measured signal has little info — your own research may still produce
   a thesis worth acting on, but size smaller and have a clear reason.
@@ -209,8 +264,11 @@ real constraints listed at the bottom. The research subsystem gives you *informa
 - PORTFOLIO RISK: long stock $, cash %, option contract counts, top-3 concentration. For option
   Greeks aggregated by book call `position_greeks()`.
 - OPEN ORDERS: working orders with type/price.
-- briefing(): regime, edge strength + IR, driving signals by IC, ACTION_REQUIRED, feedback summary.
-- briefing(detail='signals'|'strategies'|'feedback'|'environment'): deeper views.
+- briefing(): regime, edge (numeric IR + gates + n_eff + IC drivers + coarse strength label),
+  ACTION_REQUIRED (numeric composite per row; optional track_record: OOS trades/win_pct/avg_return/sharpe),
+  template_leaderboard (compact top tested templates), feedback summary.
+- briefing(detail='signals'|'strategies'|'feedback'|'environment'): deeper views (use strategies
+  only for a full performance-table audit, not every cycle).
 - research(): multi-agent web + X search. Your primary discovery tool for fresh information.
 - Standard market tools: quote, candles, atr, iv_info, option_chain, fundamentals, earnings, news,
   analysts, economic_calendar, extended_fundamentals, institutional_data, insider_data.
@@ -271,6 +329,16 @@ Minimum before a directional stock/option entry: one chart read + one context re
 iv_info OR fundamentals) + sizing via calculate_size or plan_order. Skipping this is guessing.
 Hedges and position trims can be faster — those are risk management, not new theses.
 
+═══ DAY TRADE / FULL TRADE (STOCKS) ═══
+- Before market_order or limit_order on stock for an intraday / day-trade idea: use plan_order
+  or bracket_order first so stop + target (or a declared time/session exit) are explicit. Do not
+  open on a bare quote and "figure exits later."
+- Use chart_intraday + atr to confirm the symbol can move enough vs friction; avoid dead-tape
+  probes with no articulated invalidation.
+- EOD flatten in HARD RAILS is a safety net, not the primary exit plan for day trades.
+- When done adds risk this cycle, the done summary must state the exit trigger (stop, time, or
+  structure), not only why you entered.
+
 If you enter on a bare quote, `review_trades` will flag the trade as "thin thesis". That is not
 a block — it is a mirror. A run of thin-thesis entries with poor outcomes is a signal to slow
 down. A thin-thesis winner is luck, not skill; it teaches nothing.
@@ -313,10 +381,9 @@ RESEARCH:  research($$$, deep=$$$$), quote($), atr($), economic_calendar($), mar
 CHARTS:    chart_quick($), chart_intraday($$), chart_swing($$), chart_full($$$)
 SELF-REVIEW: execution_status($), open_hypotheses($), review_trades($$)
 ENGINE:    research_engine(action=status|start|pause|resume|stop, scope=both|scorer|evolution)
-           — the background signal scorer + template evolution. Not running at boot unless
-           you start them. Scorer feeds briefing() edge math (~66 MDA credits/round, ~3min/round).
-           Evolution tunes template boundaries. Both optional; you decide when fresh IR is worth
-           the credits.
+           — controls the in-process signal scorer only. Template evolution runs in
+           research_daemon.py, not here. Scorer feeds briefing() edge math (~66 MDA credits/round,
+           ~3min/round). At boot the trader skips in-process scoring when the daemon heartbeat is fresh.
 ACCOUNT:   account($), positions($), open_orders($), get_position($), refresh_state($),
            position_greeks($$)
 ORDERS:    bracket_order, market_order, limit_order, stop_order, stop_limit, trailing_stop,
@@ -331,12 +398,12 @@ SIZING:    calculate_size($), plan_order($$), enter_option($$), instrument_selec
 ═══ TOOL INTENT (smoke-checked in paper; see scripts/smoke_trader_tools.py) ═══
 - plan_order / enter_option: planning and contract selection in-handler — follow with the concrete
   order tool (limits on spreads) using the suggested params.
-- research(): multi-agent web/X — costly; screen with cheaper tools first. The smoke script skips it
-  unless you pass --with-research.
-- trader_rules(): read background scorer/evolution state. Prefer empty params for
+- research(): multi-agent web/X — costly; hard-capped per day (MAX_DAILY_MULTI_AGENT_RESEARCH_USD);
+  screen with cheaper tools first. The smoke script skips it unless you pass --with-research.
+- trader_rules(): read background scorer state (and evolution policy). Prefer empty params for
   status to avoid nested `action` key collisions in JSON tool calls.
 - trader_rules(action=pause|resume|stop): only when you explicitly intend to change
-  scorer/evolution runtime state.
+  in-process scorer runtime state (evolution is not on the trader).
 - refresh_state: broker + session bundle as narrative text (same hook the live agent uses).
 - flatten_limits / cancel_all_orphans: emergency / operator-only — not routine hygiene.
 - cancel_stops / cancel_order: use when you intentionally remove working risk; name the symbol/order.
@@ -440,10 +507,12 @@ def validate_config() -> list[str]:
       * ``EOD_FLATTEN_MINUTES`` is positive.
       * ``OPEN_GAP_GUARD_PCT`` is non-negative.
       * ``OPEN_GUARD_DELAY_MINUTES`` is non-negative.
-      * ``MAX_DAILY_LLM_COST`` is positive.
+      * ``MAX_DAILY_LLM_NONCACHED_PROMPT_TEXT_TOKENS`` (and related daily token caps) are non-negative.
       * ``CYCLE_SLEEP_SECONDS`` is positive.
       * ``LLM_TEMPERATURE`` is in [0, 2].
       * ``LLM_MAX_TOKENS`` is positive.
+      * ``TOOL_PLAYBOOK_MAX_CHARS`` and ``AGENT_TOOL_FEEDBACK_MAX_CHARS`` are
+        positive (tool feedback truncation avoids ReAct prompt blow-ups).
       * Live-mode safety: live trading must use risk <= 2% per trade.
     """
     errors: list[str] = []
@@ -493,6 +562,12 @@ def validate_config() -> list[str]:
             f"MAX_DAILY_LLM_COST={MAX_DAILY_LLM_COST} must be positive"
         )
 
+    if MAX_DAILY_MULTI_AGENT_RESEARCH_USD < 0:
+        errors.append(
+            f"MAX_DAILY_MULTI_AGENT_RESEARCH_USD={MAX_DAILY_MULTI_AGENT_RESEARCH_USD} "
+            f"must be non-negative (use MULTI_AGENT_RESEARCH_ENABLED=0 to disable)"
+        )
+
     if CYCLE_SLEEP_SECONDS <= 0:
         errors.append(
             f"CYCLE_SLEEP_SECONDS={CYCLE_SLEEP_SECONDS} must be positive"
@@ -505,6 +580,26 @@ def validate_config() -> list[str]:
 
     if LLM_MAX_TOKENS <= 0:
         errors.append(f"LLM_MAX_TOKENS={LLM_MAX_TOKENS} must be positive")
+
+    if TOOL_PLAYBOOK_MAX_CHARS <= 0:
+        errors.append(
+            f"TOOL_PLAYBOOK_MAX_CHARS={TOOL_PLAYBOOK_MAX_CHARS} must be positive"
+        )
+    if AGENT_TOOL_FEEDBACK_MAX_CHARS < 500:
+        errors.append(
+            f"AGENT_TOOL_FEEDBACK_MAX_CHARS={AGENT_TOOL_FEEDBACK_MAX_CHARS} must be >= 500"
+        )
+
+    for name, val in (
+        ("MAX_DAILY_LLM_NONCACHED_PROMPT_TEXT_TOKENS", MAX_DAILY_LLM_NONCACHED_PROMPT_TEXT_TOKENS),
+        ("MAX_DAILY_LLM_CACHED_PROMPT_TEXT_TOKENS", MAX_DAILY_LLM_CACHED_PROMPT_TEXT_TOKENS),
+        ("MAX_DAILY_LLM_PROMPT_IMAGE_TOKENS", MAX_DAILY_LLM_PROMPT_IMAGE_TOKENS),
+        ("MAX_DAILY_LLM_COMPLETION_TOKENS", MAX_DAILY_LLM_COMPLETION_TOKENS),
+        ("MAX_DAILY_LLM_REASONING_TOKENS", MAX_DAILY_LLM_REASONING_TOKENS),
+        ("MAX_DAILY_LLM_OUTPUT_PRICED_TOKENS", MAX_DAILY_LLM_OUTPUT_PRICED_TOKENS),
+    ):
+        if val < 0:
+            errors.append(f"{name}={val} must be non-negative")
 
     # Live-mode safety guard: prevent operator from running live with the
     # aggressive_paper risk default by mistake.

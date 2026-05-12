@@ -9,7 +9,9 @@ Reuses existing simulator infrastructure — no new simulation code.
 from __future__ import annotations
 
 import asyncio
+import bisect
 import copy
+import json
 import logging
 import random
 import time
@@ -34,6 +36,9 @@ from signals.templates import (
 )
 
 logger = logging.getLogger(__name__)
+
+# Min matched trades before writing a volatility-regime slice (aggregate "all" always written).
+_REGIME_SLICE_MIN_TRADES = 5
 
 # Mutation ranges for boundary parameters
 _MUTATION_DELTA = {
@@ -238,8 +243,7 @@ async def _evolution_round(conn) -> None:
 
         # Evaluate current boundaries on OOS and persist baseline metrics.
         # This keeps template_performance populated even when no mutation wins.
-        current_oos_metrics = _evaluate_boundaries(tname, current_b, oos_data)
-        _upsert_performance_metrics(conn, tname, current_oos_metrics)
+        _persist_template_performance_slices(conn, tname, current_b, oos_data)
 
         # Generate and test mutations
         best_mutation = None
@@ -373,6 +377,13 @@ def _evaluate_boundaries(
     # Composite fitness: balanced metric capped at 5.0
     fitness = min(5.0, sharpe * 0.4 + win_rate * 2.0 + min(pf, 3.0) * 0.5)
 
+    # Anti-chop: penalize "good" fitness driven by tiny mean moves vs return volatility.
+    if len(trades_arr) >= 10:
+        mean_abs = float(np.mean(np.abs(trades_arr)))
+        edge_ratio = mean_abs / max(std_ret, 1e-9)
+        if edge_ratio < 0.15:
+            fitness *= 0.85
+
     return {
         "search_fitness": max(0.0, fitness),
         "trades": len(trades),
@@ -386,6 +397,79 @@ def _evaluate_boundaries(
 # ---------------------------------------------------------------------------
 # Data loading & persistence
 # ---------------------------------------------------------------------------
+
+def _coerce_ts_float(ts: Any) -> float | None:
+    if ts is None:
+        return None
+    if isinstance(ts, (int, float)):
+        return float(ts)
+    if isinstance(ts, str):
+        s = ts.strip()
+        try:
+            return float(s)
+        except ValueError:
+            try:
+                from datetime import datetime
+
+                return datetime.fromisoformat(s.replace("Z", "+00:00")).timestamp()
+            except Exception:
+                return None
+    return None
+
+
+def _load_env_snapshots_sorted(conn) -> list[tuple[float, str | None, str | None]]:
+    """Rows ``(ts, volatility_regime, trend_regime)`` sorted by ``ts``."""
+    rows: list[tuple[float, str | None, str | None]] = []
+    try:
+        cur = conn.execute(
+            "SELECT ts, volatility_regime, trend_regime "
+            "FROM environment_snapshots ORDER BY id"
+        )
+        for r in cur.fetchall():
+            t = _coerce_ts_float(r[0])
+            if t is None:
+                continue
+            rows.append((t, r[1], r[2]))
+    except Exception as e:
+        logger.debug("env snapshots for template evolution unavailable: %s", e)
+    rows.sort(key=lambda x: x[0])
+    return rows
+
+
+def _attach_env_to_entries(
+    entries: list[dict],
+    env_rows: list[tuple[float, str | None, str | None]],
+) -> None:
+    if not env_rows or not entries:
+        return
+    ts_list = [r[0] for r in env_rows]
+    for e in entries:
+        ct = _coerce_ts_float(e.get("ts"))
+        if ct is None:
+            continue
+        i = bisect.bisect_right(ts_list, ct) - 1
+        if i >= 0:
+            e["volatility_regime"] = env_rows[i][1]
+            e["trend_regime"] = env_rows[i][2]
+
+
+def _iv_rank_from_breakdown_json(breakdown_json: Any) -> float | None:
+    if not breakdown_json:
+        return None
+    try:
+        d = json.loads(breakdown_json) if isinstance(breakdown_json, str) else breakdown_json
+    except Exception:
+        return None
+    if not isinstance(d, dict):
+        return None
+    v = d.get("iv_rank")
+    if isinstance(v, (int, float)):
+        return float(v)
+    for k, val in d.items():
+        if isinstance(k, str) and "iv_rank" in k.lower() and isinstance(val, (int, float)):
+            return float(val)
+    return None
+
 
 def _load_historical_composites(conn) -> list[dict]:
     """Load composite scores + forward returns for evolution."""
@@ -408,6 +492,7 @@ def _load_historical_composites(conn) -> list[dict]:
             "symbol": sym,
             "ts": ts,
             "composite_score": float(comp_score),
+            "signal_breakdown_json": breakdown_json,
         })
 
     # For forward returns, use signal_returns averages as proxy.
@@ -430,19 +515,29 @@ def _load_historical_composites(conn) -> list[dict]:
     for sym, entries in by_symbol.items():
         sym_fwds = fwd_by_symbol.get(sym, [])
         for entry in entries:
-            comp_ts = entry["ts"]
-            # Find the latest signal ts <= comp_ts
+            ct = _coerce_ts_float(entry.get("ts"))
+            if ct is None:
+                continue
+            # Find the latest signal ts <= composite ts (sym_fwds sorted by ts).
             best_fwd = None
             for sig_ts, fwd in sym_fwds:
-                if sig_ts <= comp_ts:
+                if sig_ts <= ct:
                     best_fwd = fwd
                 else:
                     break
             if best_fwd is not None:
                 entry["forward_return"] = best_fwd
+                entry["ts"] = ct
                 composites.append(entry)
 
-    composites.sort(key=lambda x: x["ts"])
+    composites.sort(key=lambda x: float(x.get("ts") or 0.0))
+
+    env_rows = _load_env_snapshots_sorted(conn)
+    _attach_env_to_entries(composites, env_rows)
+
+    for entry in composites:
+        entry["iv_rank"] = _iv_rank_from_breakdown_json(entry.get("signal_breakdown_json"))
+
     return composites
 
 
@@ -452,14 +547,53 @@ def _update_performance(
     oos_data: list[dict],
     boundaries: dict[str, float],
 ) -> None:
-    """Update template_performance table with OOS metrics."""
-    metrics = _evaluate_boundaries(template_name, boundaries, oos_data)
-    _upsert_performance_metrics(conn, template_name, metrics)
+    """Update template_performance table with OOS metrics (all + per-vol slices)."""
+    _persist_template_performance_slices(conn, template_name, boundaries, oos_data)
 
 
-def _upsert_performance_metrics(conn, template_name: str, metrics: dict[str, float]) -> None:
-    """Persist template OOS metrics to template_performance."""
+def _distinct_vol_regimes(entries: list[dict]) -> list[str]:
+    keys: set[str] = set()
+    for e in entries:
+        v = e.get("volatility_regime")
+        if v is None:
+            continue
+        s = str(v).strip()
+        if s:
+            keys.add(s)
+    return sorted(keys)
+
+
+def _persist_template_performance_slices(
+    conn,
+    template_name: str,
+    boundaries: dict[str, float],
+    oos_data: list[dict],
+) -> None:
+    """Write aggregate ``all`` plus per-``volatility_regime`` rows when sample size allows."""
+    _upsert_performance_metrics(conn, template_name, "all", "all", _evaluate_boundaries(template_name, boundaries, oos_data))
+    for rk in _distinct_vol_regimes(oos_data):
+        sub = [
+            e for e in oos_data
+            if str(e.get("volatility_regime") or "").strip() == rk
+        ]
+        if len(sub) < _REGIME_SLICE_MIN_TRADES:
+            continue
+        metrics = _evaluate_boundaries(template_name, boundaries, sub)
+        _upsert_performance_metrics(conn, template_name, rk, "all", metrics)
+    conn.commit()
+
+
+def _upsert_performance_metrics(
+    conn,
+    template_name: str,
+    regime_key: str,
+    composite_bucket: str,
+    metrics: dict[str, float],
+) -> None:
+    """Persist template OOS metrics to template_performance for one regime bucket."""
     now = time.time()
+    trades = int(metrics.get("trades", 0) or 0)
+    wins = int(round(float(metrics.get("win_rate", 0.0) or 0.0) * trades))
     conn.execute(
         "INSERT OR REPLACE INTO template_performance "
         "(template_name, regime_key, composite_bucket, trades, wins, "
@@ -467,13 +601,12 @@ def _upsert_performance_metrics(conn, template_name: str, metrics: dict[str, flo
         "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
         (
             template_name,
-            "all",  # Aggregate across regimes for now
-            "all",
-            metrics.get("trades", 0),
-            int(metrics.get("win_rate", 0) * metrics.get("trades", 0)),
+            regime_key,
+            composite_bucket,
+            trades,
+            wins,
             metrics.get("avg_return_pct", 0.0),
             metrics.get("sharpe"),
             now,
         ),
     )
-    conn.commit()

@@ -469,8 +469,17 @@ class IBKRConnector(IBKROrdersMixin, IBKROptionsMixin, IBKRQueriesMixin):
 
     # ========== CONNECTION ==========
 
-    async def connect(self, max_retries: int = 3) -> bool:
-        """Connect to IBKR TWS/Gateway."""
+    async def connect(self, max_retries: Optional[int] = None) -> bool:
+        """Connect to IBKR TWS/Gateway.
+
+        Tries ``IBKR_CLIENT_ID + attempt`` for ``attempt`` in ``0 .. max_retries-1`` so a
+        stale or competing session on the base id does not block connect. Default span is
+        controlled by ``IBKR_CONNECT_MAX_ATTEMPTS`` (1–50, default 12). After success,
+        ``self.client_id`` is set to the working id for this process.
+        """
+        if max_retries is None:
+            max_retries = max(1, min(50, int(os.environ.get("IBKR_CONNECT_MAX_ATTEMPTS", "12"))))
+
         if self.connected:
             return True
 

@@ -36,6 +36,9 @@ from core.config import (
     TRADING_MODE,
     PAPER_AGGRESSIVE,
     MIN_RR_RATIO,
+    PRESCAN_PROMPT_EXPENSIVE_RESEARCH,
+    TOOL_PLAYBOOK_MAX_CHARS,
+    AGENT_TOOL_FEEDBACK_MAX_CHARS,
 )
 from xai_sdk.chat import system as sdk_system, user as sdk_user
 
@@ -52,6 +55,17 @@ from data.market_hours import get_market_hours_provider
 from tools.tools_executor import ToolExecutor
 
 logger = logging.getLogger(__name__)
+
+
+def _truncate_for_react_context(text: str, max_chars: int) -> str:
+    """Bound tool payloads re-appended each ReAct turn (full history is re-sent)."""
+    if max_chars <= 0 or len(text) <= max_chars:
+        return text
+    marker = "\n... [truncated for prompt budget]\n"
+    room = max_chars - len(marker)
+    if room < 200:
+        return text[:max_chars]
+    return text[:room] + marker
 
 
 # ── Research Cache Entry ────────────────────────────────────────
@@ -214,6 +228,13 @@ class TradingAgent:
     def _check_llm_cost(self) -> bool:
         """Delegate to :meth:`SafetyController.check_llm_cost`."""
         return self._safety.check_llm_cost()
+
+    def _check_llm_token_limits(self) -> Optional[str]:
+        """Return a reason string if any daily token bucket is exhausted."""
+        fn = getattr(self.cost_tracker, "check_daily_token_limits", None)
+        if callable(fn):
+            return fn()
+        return None
 
     def record_trade(self, symbol: str, side: str, pnl: float, held_minutes: int = 0):
         """Record a closed trade into the research memory DB."""
@@ -462,10 +483,9 @@ If no changes warranted: []"""
                                 raise
 
                     usage = response.usage
-                    self.cost_tracker.log_llm_call(
-                        model=self.grok.model,
-                        tokens_in=usage.prompt_tokens,
-                        tokens_out=usage.completion_tokens,
+                    self.cost_tracker.log_llm_usage(
+                        self.grok.model,
+                        usage=usage,
                         purpose="execution_analysis",
                     )
 
@@ -617,12 +637,19 @@ If no changes warranted: []"""
             today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
             if self._pre_scan_date != today:
                 self._pre_scan_date = today
-                pre_scan_prompt = (
-                    "\n🔍 PRE-SCAN: New trading day. Before placing any trades, run research() "
-                    "on today's macro outlook (e.g. 'market outlook today earnings economic data') "
-                    "and check economic_calendar(). Review briefing(detail='environment') for regime context. "
-                    "This primes your thesis with fresh data before committing capital.\n"
-                )
+                if PRESCAN_PROMPT_EXPENSIVE_RESEARCH:
+                    pre_scan_prompt = (
+                        "\n🔍 PRE-SCAN: New trading day. Before placing any trades, run research() "
+                        "on today's macro outlook (e.g. 'market outlook today earnings economic data') "
+                        "and check economic_calendar(). Review briefing(detail='environment') for regime context. "
+                        "This primes your thesis with fresh data before committing capital.\n"
+                    )
+                else:
+                    pre_scan_prompt = (
+                        "\n🔍 PRE-SCAN: New trading day. Use cheap tools first: market_hours, "
+                        "economic_calendar, briefing(), prior_research — not research() (multi-agent web/X) "
+                        "unless cheaper sources are insufficient. research() is capped per day in config.\n"
+                    )
                 logger.info("Pre-scan prompt injected for new trading day")
 
         # Open volatility guard: detect overnight gap and delay entries
@@ -670,6 +697,12 @@ If no changes warranted: []"""
         # Check LLM cost
         if self._check_llm_cost():
             logger.warning(f"LLM cost ceiling ${MAX_DAILY_LLM_COST} reached — halting")
+            self._halted = True
+            return 999999
+
+        tok_reason = self._check_llm_token_limits()
+        if tok_reason:
+            logger.warning("LLM token daily limit (%s) reached — halting", tok_reason)
             self._halted = True
             return 999999
 
@@ -750,9 +783,18 @@ Account state above. Start by calling briefing() to assess research status."""
         try:
             from tools.tool_playbook import render_compact_playbook
 
-            _system_content = SYSTEM_PROMPT + "\n\n" + render_compact_playbook(4000)
+            _system_content = SYSTEM_PROMPT + "\n\n" + render_compact_playbook(TOOL_PLAYBOOK_MAX_CHARS)
         except Exception as e:
             logger.warning("tool playbook append failed: %s", e)
+        logger.info(
+            "CYCLE %d prompt sizes: system_chars=%d user_context_chars=%d "
+            "(playbook_max=%d tool_feedback_max=%d)",
+            self._cycle_id,
+            len(_system_content),
+            len(context),
+            TOOL_PLAYBOOK_MAX_CHARS,
+            AGENT_TOOL_FEEDBACK_MAX_CHARS,
+        )
         chat = self.grok.client.chat.create(
             model=self.grok.model,
             messages=[
@@ -786,6 +828,14 @@ Account state above. Start by calling briefing() to assess research status."""
                 response = None
                 for _api_attempt in range(3):
                     try:
+                        lim = self._check_llm_token_limits()
+                        if lim:
+                            logger.warning(
+                                "Stopping ReAct mid-cycle: token limit %s hit before sample",
+                                lim,
+                            )
+                            self._halted = True
+                            return 999999
                         response = await chat.sample()
                         break
                     except Exception as api_err:
@@ -800,18 +850,30 @@ Account state above. Start by calling briefing() to assess research status."""
 
                 # Log cost
                 usage = response.usage
-                self.cost_tracker.log_llm_call(
-                    model=self.grok.model,
-                    tokens_in=usage.prompt_tokens,
-                    tokens_out=usage.completion_tokens,
+                self.cost_tracker.log_llm_usage(
+                    self.grok.model,
+                    usage=usage,
                     purpose="agent_loop",
                 )
                 cost_summary = self.cost_tracker.get_budget_summary()
-                reasoning_tok = getattr(usage, 'reasoning_tokens', 0) or 0
+                reasoning_tok = getattr(usage, "reasoning_tokens", 0) or 0
+                cached_tok = getattr(usage, "cached_prompt_text_tokens", 0) or 0
                 logger.info(
-                    f"LLM {usage.prompt_tokens}+{usage.completion_tokens} tok "
-                    f"(reasoning: {reasoning_tok}) | ${cost_summary.today_llm_cost:.4f} today"
+                    "LLM prompt=%s completion=%s reasoning=%s cached_text=%s | $%.4f today",
+                    usage.prompt_tokens,
+                    usage.completion_tokens,
+                    reasoning_tok,
+                    cached_tok,
+                    cost_summary.today_llm_cost,
                 )
+                lim2 = self._check_llm_token_limits()
+                if lim2:
+                    logger.warning(
+                        "Stopping after sample: token limit %s exceeded (logged this call)",
+                        lim2,
+                    )
+                    self._halted = True
+                    return 999999
 
                 # Log what the model actually said
                 logger.info(f"Grok -> {(raw or '(empty)')[:500]}")
@@ -932,8 +994,11 @@ Account state above. Start by calling briefing() to assess research status."""
                     chat.append(response)
                     # State is provided once at cycle start; agent calls
                     # refresh_state tool when it needs an updated snapshot.
+                    _fb = _truncate_for_react_context(
+                        str(last_result), AGENT_TOOL_FEEDBACK_MAX_CHARS
+                    )
                     chat.append(sdk_user(
-                        f"TOOL RESULT:\n{last_result}\n\nWhat's your next action?"
+                        f"TOOL RESULT:\n{_fb}\n\nWhat's your next action?"
                     ))
 
             except Exception as e:

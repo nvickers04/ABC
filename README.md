@@ -113,6 +113,8 @@ TRADING_MODE=live python __main__.py
 - Turn limit: nudge at turn 8, hard max at turn 10 per cycle
 - Rolling context summary every 5 turns to keep reasoning sharp
 
+**Production**: See `docs/PRODUCTION_LAUNCH_CHECKLIST.md` (pre-flight, Docker, live gate, monitoring, rollback). Use `--require-daemon` + separate research host for best isolation. Full Docker trader support added in `infra/runtime/`.
+
 ## Model
 
 The trader uses **Grok** (xAI) via the native SDK (`xai-sdk >= 1.8.0`). Exact API

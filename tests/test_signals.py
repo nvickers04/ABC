@@ -946,7 +946,7 @@ class TestSizingRegression:
 
 
 # ═════════════════════════════════════════════════════════════════
-# 9. N_eff circuit breaker (todo Phase 6)
+# 9. N_eff circuit breaker (TODO: Clarify purpose of N_eff circuit breaker - kept because user may have specific intent for future signal quality control)
 # ═════════════════════════════════════════════════════════════════
 
 class TestNEffCircuitBreaker:
@@ -996,7 +996,7 @@ class TestNEffCircuitBreaker:
 
 
 # ═════════════════════════════════════════════════════════════════
-# 10. IV history percentile helper (todo Phase 5 — hybrid IV rank)
+# 10. IV history percentile helper (TODO: Clarify purpose of hybrid IV rank helper - kept because user may have specific intent)
 # ═════════════════════════════════════════════════════════════════
 
 class TestIVHistoryPercentile:

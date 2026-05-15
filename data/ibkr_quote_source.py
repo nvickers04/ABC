@@ -12,8 +12,8 @@ DESIGN
        reads return latest tick instantly. Used for the active universe.
     2. Snapshot:  reqMktData(snapshot=True), one-shot, releases the
        line in ~11s.  Used for one-off lookups outside the universe.
-    3. (NOT IMPLEMENTED YET) regulatorySnapshot for cold-start when
-       no Network A/B/C subscription exists.
+    3. regulatorySnapshot=False is explicitly passed to reqMktData (no regulatory
+       snapshot mode is used; cold-start uses regular streaming or snapshot).
 - Imbalance feed piggybacks on stock streams via genericTickList='588'
   (NYSE / ARCA / MKT order imbalances).  Costs zero additional lines.
 - LRU eviction: when the streaming budget is full, promote() boots

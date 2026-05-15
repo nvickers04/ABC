@@ -12,24 +12,9 @@ import pytest
 # ── Fixtures ─────────────────────────────────────────────────────
 
 
-@pytest.fixture(autouse=True)
-def _isolated_db(tmp_path, monkeypatch):
-    """Fresh temp DB per test; reset WorkingMemory singleton."""
-    import memory
-    from memory import working_memory as wm_mod
-    db_path = tmp_path / "test.db"
-    monkeypatch.setattr(memory, "_DB_PATH", db_path)
-    monkeypatch.setattr(memory, "_connection", None)
-    monkeypatch.setattr(memory, "_calibration_version", 0)
-    memory._pending_graduated_params.clear()
-    memory._pending_order_context.clear()
-    wm_mod.reset_working_memory_for_tests()
-    memory.init_db()
-    yield
-    if memory._connection:
-        memory._connection.close()
-    monkeypatch.setattr(memory, "_connection", None)
-    wm_mod.reset_working_memory_for_tests()
+# Uses the shared robust _isolated_db from tests/conftest.py
+# (loads .env, calls reset_state + init_db, graceful skip on unreachable Postgres).
+# Old copy-pasted fixture removed to eliminate AttributeError on _connection after memory Postgres migration.
 
 
 @pytest.fixture

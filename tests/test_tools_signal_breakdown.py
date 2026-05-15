@@ -8,21 +8,8 @@ import time
 import pytest
 
 
-@pytest.fixture(autouse=True)
-def _isolated_db(tmp_path, monkeypatch):
-    import memory
-    db_path = tmp_path / "test.db"
-    monkeypatch.setattr(memory, "_DB_PATH", db_path)
-    monkeypatch.setattr(memory, "_connection", None)
-    monkeypatch.setattr(memory, "_calibration_version", 0)
-    memory._pending_graduated_params.clear()
-    memory._pending_order_context.clear()
-    memory.init_db()
-    yield
-    if memory._connection:
-        memory._connection.close()
-    monkeypatch.setattr(memory, "_connection", None)
-
+# Local _isolated_db removed — now uses the single robust version from tests/conftest.py
+# which does .env load + reset_state + init_db + graceful pytest.skip on Postgres connection/permission errors.
 
 @pytest.fixture
 def db():

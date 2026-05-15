@@ -137,14 +137,24 @@ _register(
 # ---------------------------------------------------------------------------
 
 def load_boundaries(db_conn) -> dict[str, dict[str, float]]:
-    """Load current boundary parameters from template_boundaries table."""
+    """Load current boundary parameters from template_boundaries table.
+
+    Also loads generation and fitness (as _generation and _fitness) so the
+    evolution system can track progress across restarts.
+    """
     boundaries: dict[str, dict[str, float]] = {}
     cur = db_conn.execute(
-        "SELECT template_name, param_name, param_value FROM template_boundaries"
+        "SELECT template_name, param_name, param_value, generation, fitness "
+        "FROM template_boundaries"
     )
     for row in cur.fetchall():
-        tname, pname, pval = row
-        boundaries.setdefault(tname, {})[pname] = float(pval)
+        tname, pname, pval, gen, fit = row
+        t = boundaries.setdefault(tname, {})
+        t[pname] = float(pval)
+        if gen is not None:
+            t["_generation"] = int(gen)
+        if fit is not None:
+            t["_fitness"] = float(fit)
     return boundaries
 
 

@@ -243,6 +243,7 @@ async def _evolution_round(conn) -> None:
 
         # Evaluate current boundaries on OOS and persist baseline metrics.
         # This keeps template_performance populated even when no mutation wins.
+        current_oos_metrics = _evaluate_boundaries(tname, current_b, oos_data)
         _persist_template_performance_slices(conn, tname, current_b, oos_data)
 
         # Generate and test mutations

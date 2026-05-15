@@ -160,6 +160,19 @@ MULTI_AGENT_RESEARCH_ENABLED: bool = os.getenv(
     "MULTI_AGENT_RESEARCH_ENABLED", "1"
 ).strip().lower() not in ("0", "false", "no", "off")
 
+# ── Researcher Machine Hard Boundaries (two-machine production) ─────────────
+# The research_daemon (scorer + template evolution) on the dedicated researcher
+# host must NEVER run unbounded. MDA streaming must be healthy, and total daily
+# research activity (MDA credits / equivalent "tokens") is capped at 100k.
+# Enforced early in research_daemon.py and per-round in signals/scorer.py.
+RESEARCHER_DAILY_TOKEN_CAP: int = int(
+    os.getenv("RESEARCHER_DAILY_TOKEN_CAP", "100000")
+)
+RESEARCHER_MDA_HEALTH_CHECK_ENABLED: bool = (
+    os.getenv("RESEARCHER_MDA_HEALTH_CHECK_ENABLED", "1").strip().lower()
+    not in ("0", "false", "no", "off")
+)
+
 # First-cycle pre-scan: when True, the prompt nudges immediate research(); default False
 # so the agent uses briefing / calendar / prior_research first (cheap).
 PRESCAN_PROMPT_EXPENSIVE_RESEARCH: bool = (

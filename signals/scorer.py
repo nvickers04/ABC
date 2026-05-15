@@ -212,6 +212,36 @@ async def run_research(*, verbose: bool = False, use_cadence: bool = False) -> N
                 )
             except Exception:
                 pass
+
+            # ── Researcher Machine Daily Token / Activity Cap (hard 100k limit) ──
+            # Enforced on the dedicated researcher host. Trader side has separate
+            # Grok LLM caps. This prevents unbounded MDA burn on the research machine.
+            try:
+                from core.config import RESEARCHER_DAILY_TOKEN_CAP
+                from memory import get_research_config, set_research_config
+                from datetime import datetime as _dt, timezone as _tz
+                today = _dt.now(_tz.utc).strftime("%Y-%m-%d")
+                cap_key = f"researcher_daily_usage_{today}"
+                # Conservative increment per round (MDA credits are tracked separately;
+                # this is an activity unit to guarantee hard stop even if MDA reporting lags).
+                delta = 75
+                current = float(get_research_config(cap_key, 0.0))
+                new_val = current + delta
+                set_research_config(cap_key, new_val, reason="researcher daily cap")
+                if new_val >= RESEARCHER_DAILY_TOKEN_CAP:
+                    logger.critical(
+                        "RESEARCHER DAILY TOKEN CAP HIT: %.0f >= %d. "
+                        "Further scoring rounds will be suppressed after this one. "
+                        "Restart after UTC midnight or raise RESEARCHER_DAILY_TOKEN_CAP (not recommended).",
+                        new_val, RESEARCHER_DAILY_TOKEN_CAP
+                    )
+                elif new_val > RESEARCHER_DAILY_TOKEN_CAP * 0.85:
+                    logger.warning(
+                        "Researcher daily usage at %.0f / %d (%.1f%%) — approaching hard cap.",
+                        new_val, RESEARCHER_DAILY_TOKEN_CAP, (new_val / RESEARCHER_DAILY_TOKEN_CAP) * 100
+                    )
+            except Exception:
+                pass  # never let cap tracking crash the scorer
         except asyncio.CancelledError:
             logger.info("Scoring loop cancelled")
             break

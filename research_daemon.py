@@ -131,6 +131,55 @@ def main() -> None:
     except Exception as e:
         logger.warning("Could not override IBKR_QUOTES_ENABLED: %s", e)
 
+    # ── Mandatory Researcher Machine Boundaries (two-machine production) ─────
+    # 1. MDA streaming must be healthy before any scoring starts.
+    # 2. Hard daily cap RESEARCHER_DAILY_TOKEN_CAP (default 100k) — no unbounded research.
+    #    Early shutdown + clear logging if approaching / exceeding limit.
+    try:
+        from core.config import (
+            RESEARCHER_DAILY_TOKEN_CAP,
+            RESEARCHER_MDA_HEALTH_CHECK_ENABLED,
+        )
+        from data.data_provider import get_data_provider
+        from memory import get_research_config, set_research_config
+
+        if RESEARCHER_MDA_HEALTH_CHECK_ENABLED:
+            dp = get_data_provider()
+            try:
+                # Cheap health probe (liquid name, minimal credits)
+                quote = dp.get_quote("SPY")
+                if not quote or quote.get("last") is None:
+                    raise RuntimeError("MDA health probe returned no usable quote")
+                logger.info("MDA health check PASSED (SPY quote OK)")
+            except Exception as mda_err:
+                logger.critical("MDA HEALTH CHECK FAILED: %s", mda_err)
+                logger.critical("Research daemon refusing to start — Market Data streaming is not healthy.")
+                logger.critical("Fix MDA token / connectivity on this researcher host, then restart.")
+                sys.exit(3)
+
+        # Daily token / activity cap (persisted in research_config)
+        today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+        cap_key = f"researcher_daily_usage_{today}"
+        current_usage = float(get_research_config(cap_key, 0.0))
+        if current_usage >= RESEARCHER_DAILY_TOKEN_CAP:
+            logger.critical(
+                "RESEARCHER DAILY TOKEN CAP EXCEEDED: %.0f >= %d (key=%s). "
+                "Shutting down for the remainder of the UTC day to prevent unbounded research.",
+                current_usage, RESEARCHER_DAILY_TOKEN_CAP, cap_key
+            )
+            sys.exit(4)
+        if current_usage > RESEARCHER_DAILY_TOKEN_CAP * 0.8:
+            logger.warning(
+                "RESEARCHER TOKEN USAGE APPROACHING CAP: %.0f / %d (%.1f%%). "
+                "Will hard-stop at limit.",
+                current_usage, RESEARCHER_DAILY_TOKEN_CAP, (current_usage / RESEARCHER_DAILY_TOKEN_CAP) * 100
+            )
+        logger.info("Researcher boundaries OK (daily usage=%.0f / cap=%d)", current_usage, RESEARCHER_DAILY_TOKEN_CAP)
+    except SystemExit:
+        raise
+    except Exception as bound_err:
+        logger.warning("Researcher boundary check encountered non-fatal issue: %s (proceeding with caution)", bound_err)
+
     print("=== Research daemon ===")
     print("This process: tiered signal scorer + template evolution (use --no-evolution to turn evolution off).")
     print("No Grok/LLM, no IBKR orders. Ctrl+C to stop.\n")

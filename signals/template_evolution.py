@@ -50,6 +50,12 @@ _MUTATION_DELTA = {
     "atr_pct_max": 0.2,
 }
 
+# Evolution tuning (polish for better search without changing core architecture)
+EVOLUTION_MUTATIONS_PER_TEMPLATE = 10          # More attempts = better chance of finding improvements
+EVOLUTION_EXPLORATION_RATE = 0.18              # Probability of accepting a slightly worse mutation
+EVOLUTION_WORSE_ACCEPT_TOLERANCE = 0.07        # Accept mutations up to ~7% worse for exploration
+EVOLUTION_DIRECTED_MUTATION_PROB = 0.35        # Chance to do a "smart" directed mutation (widen/narrow/shift)
+
 
 def _normalize_boundary_pairs(params: dict[str, float]) -> dict[str, float]:
     """Ensure *_min/*_max pairs are ordered after mutation."""
@@ -250,7 +256,7 @@ async def _evolution_round(conn) -> None:
         best_mutation = None
         best_fitness = current_oos_metrics.get("search_fitness", 0.0)
 
-        for _ in range(5):  # 5 mutations per template per round
+        for _ in range(EVOLUTION_MUTATIONS_PER_TEMPLATE):
             mutated = _mutate_boundaries(tname, current_b, tdef)
 
             # Quick reject on training data
@@ -262,7 +268,21 @@ async def _evolution_round(conn) -> None:
             oos_metrics = _evaluate_boundaries(tname, mutated, oos_data)
             mutation_fitness = oos_metrics.get("search_fitness", 0.0)
 
+            accept = False
             if mutation_fitness > best_fitness:
+                accept = True
+            elif random.random() < EVOLUTION_EXPLORATION_RATE:
+                # Exploration: occasionally accept a slightly worse mutation
+                relative = mutation_fitness / max(best_fitness, 1e-6)
+                if relative > (1.0 - EVOLUTION_WORSE_ACCEPT_TOLERANCE):
+                    accept = True
+                    logger.debug(
+                        "Template %s accepted exploratory worse mutation "
+                        "(%.3f vs current %.3f)",
+                        tname, mutation_fitness, best_fitness
+                    )
+
+            if accept:
                 best_fitness = mutation_fitness
                 best_mutation = mutated
 
@@ -276,14 +296,16 @@ async def _evolution_round(conn) -> None:
             _update_performance(conn, tname, oos_data, best_mutation)
             improved += 1
             logger.info(
-                "Template %s evolved (gen %d, fitness %.3f)",
-                tname, generation, best_fitness,
+                "Template %s evolved (gen %d, fitness %.3f)  [was %.3f]",
+                tname, generation, best_fitness, current_oos_metrics.get("search_fitness", 0.0),
             )
 
     elapsed = time.time() - t0
     logger.info(
-        "Evolution round complete: %d/%d templates improved in %.1fs",
+        "Evolution round complete: %d/%d templates improved in %.1fs "
+        "(mutations=%d, exploration_rate=%.2f)",
         improved, len(TEMPLATE_DEFS), elapsed,
+        EVOLUTION_MUTATIONS_PER_TEMPLATE, EVOLUTION_EXPLORATION_RATE,
     )
 
 
@@ -296,26 +318,59 @@ def _mutate_boundaries(
     current: dict[str, float],
     tdef: Any,
 ) -> dict[str, float]:
-    """Generate a mutated copy of boundary parameters."""
+    """Generate a mutated copy of boundary parameters.
+
+    Occasionally performs "directed" mutations (widen range, narrow range, or shift)
+    for better exploration instead of pure random walk.
+    """
     mutated = dict(current)
-
-    # Pick 1-3 parameters to mutate
     params = [k for k in current if not k.startswith("_")]
-    n_mutations = random.randint(1, min(3, len(params)))
-    targets = random.sample(params, n_mutations)
 
-    for pname in targets:
-        delta = _MUTATION_DELTA.get(pname, 0.05)
-        change = random.uniform(-delta, delta)
-        new_val = mutated[pname] + change
-
-        # Clamp to valid range from template def
-        bounds = tdef.default_boundaries.get(pname)
-        if bounds:
-            lo, hi = bounds
-            new_val = max(lo, min(hi, new_val))
-
-        mutated[pname] = round(new_val, 4)
+    # Decide mutation style
+    if random.random() < EVOLUTION_DIRECTED_MUTATION_PROB and len(params) >= 2:
+        style = random.choice(["widen", "narrow", "shift"])
+        if style == "widen":
+            # Make the allowed range larger
+            for pname in params:
+                if "min" in pname:
+                    delta = _MUTATION_DELTA.get(pname, 0.05)
+                    mutated[pname] = max(0.0, mutated[pname] - random.uniform(0, delta))
+                elif "max" in pname:
+                    delta = _MUTATION_DELTA.get(pname, 0.05)
+                    mutated[pname] = mutated[pname] + random.uniform(0, delta)
+        elif style == "narrow":
+            # Make the allowed range smaller (more selective)
+            for pname in params:
+                if "min" in pname:
+                    delta = _MUTATION_DELTA.get(pname, 0.05)
+                    mutated[pname] = mutated[pname] + random.uniform(0, delta * 0.6)
+                elif "max" in pname:
+                    delta = _MUTATION_DELTA.get(pname, 0.05)
+                    mutated[pname] = mutated[pname] - random.uniform(0, delta * 0.6)
+        else:
+            # Shift the whole window
+            shift = random.uniform(-0.08, 0.08)
+            for pname in params:
+                delta = _MUTATION_DELTA.get(pname, 0.05)
+                new_val = mutated[pname] + (shift * (delta / 0.05))
+                bounds = tdef.default_boundaries.get(pname)
+                if bounds:
+                    lo, hi = bounds
+                    new_val = max(lo, min(hi, new_val))
+                mutated[pname] = round(new_val, 4)
+    else:
+        # Standard random walk
+        n_mutations = random.randint(1, min(3, len(params)))
+        targets = random.sample(params, n_mutations)
+        for pname in targets:
+            delta = _MUTATION_DELTA.get(pname, 0.05)
+            change = random.uniform(-delta, delta)
+            new_val = mutated[pname] + change
+            bounds = tdef.default_boundaries.get(pname)
+            if bounds:
+                lo, hi = bounds
+                new_val = max(lo, min(hi, new_val))
+            mutated[pname] = round(new_val, 4)
 
     return _normalize_boundary_pairs(mutated)
 

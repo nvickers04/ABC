@@ -1,15 +1,43 @@
 # Research stack ONLY — scorer + heartbeat (and optional template evolution).
 #
-# Do NOT replace CMD with __main__.py: that starts the Grok trading agent (LLM $ + IBKR).
+# IMPORTANT: This is the RESEARCHER machine compose file.
+# It must run on a dedicated machine (or at least a dedicated Docker context)
+# that has good MarketData.app connectivity. It must NEVER run the trader (__main__.py).
 #
-# Usage (from repo root — rewrites 127.0.0.1 → abc-postgres for container DNS):
-#   .\scripts\docker_research_up.ps1
+# ─────────────────────────────────────────────────────────────────────────────
+# FIRST TIME SETUP ON A NEW RESEARCH MACHINE (do this once)
+# ─────────────────────────────────────────────────────────────────────────────
+# 1. Make sure Postgres is reachable from this machine (usually via Tailscale/VPN).
+#    Your .env must contain a valid DATABASE_URL or PGHOST/PGUSER/etc.
 #
-# Or manually (you must set DATABASE_URL host to abc-postgres if Postgres is the sibling container):
-#   docker compose -f infra/runtime/docker-compose.research.yml --env-file .env up -d --build
+# 2. (Recommended) Create the shared Docker network once:
+#    docker network create postgres_default
 #
-# Postgres: this stack does not start Postgres. Attach `postgres_default` (see networks) so
-# `abc-postgres` resolves when DATABASE_URL uses that hostname.
+# 3. Start the researcher:
+#    docker compose -f infra/runtime/docker-compose.research.yml --env-file .env up -d --build
+#
+# 4. Check status (this is the explicit way to see if it started correctly):
+#    docker compose -f infra/runtime/docker-compose.research.yml ps
+#    docker compose -f infra/runtime/docker-compose.research.yml logs -f abc-research
+#
+#    Look for:
+#      - "MDA health check PASSED"
+#      - "Researcher boundaries OK"
+#      - No "MDA HEALTH CHECK FAILED" or "DAILY TOKEN CAP" errors.
+#
+# If the container shows as "unhealthy", check the logs — it almost always means
+# either Postgres is unreachable or Market Data streaming is not working from this host.
+#
+# ─────────────────────────────────────────────────────────────────────────────
+# Normal usage (after first setup)
+#   docker compose -f infra/runtime/docker-compose.research.yml --env-file .env up -d
+#
+# Do NOT replace CMD with __main__.py — that starts the trading agent + Grok calls.
+# ─────────────────────────────────────────────────────────────────────────────
+
+# Postgres: this stack does not start Postgres itself.
+# The network `postgres_default` must exist (created above or by the postgres compose).
+# Use `host.docker.internal` in DATABASE_URL when Postgres runs directly on the host.
 
 networks:
   # Same network as `infra/postgres/docker-compose.yml` (container name `abc-postgres`).
@@ -33,3 +61,20 @@ services:
       - "host.docker.internal:host-gateway"
     networks:
       - postgres_default
+    # The healthcheck is defined in the Dockerfile.
+    # This makes `docker compose ps` show a clear healthy/unhealthy status
+    # instead of the container just saying "running" while failing internally.
+    healthcheck:
+      test: ["CMD", "python", "-c", "
+import os, sys
+from dotenv import load_dotenv
+load_dotenv(override=False)
+from data.data_provider import get_data_provider
+dp = get_data_provider()
+q = dp.get_quote('SPY')
+sys.exit(0 if (q and q.get('last')) else 1)
+"]
+      interval: 60s
+      timeout: 20s
+      retries: 3
+      start_period: 60s

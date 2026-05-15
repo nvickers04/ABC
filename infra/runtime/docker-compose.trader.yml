@@ -1,0 +1,59 @@
+# Trader stack — Grok ReAct agent + IBKR execution (paper or live).
+# Do NOT run alongside research on same container (LLM spend + IBKR client_id conflict).
+# Research daemon (scorer + evolution) runs on research host or separate compose.
+#
+# Requires:
+# - .env with GROK_API_KEY, IBKR_*, DATABASE_URL (or PG*) pointing at shared Postgres.
+# - TWS or IB Gateway running on host (or another machine) with API enabled on 7497/7496.
+# - For Docker Desktop on Windows: host.docker.internal resolves to host.
+#
+# Start:
+#   docker compose -f infra/runtime/docker-compose.trader.yml --env-file .env up -d --build
+#
+# Logs: docker logs -f abc-trader
+# Stop: docker compose -f infra/runtime/docker-compose.trader.yml down
+#
+# For full research + trader on one host (dev only): use two separate compose files
+# (research + trader) sharing the postgres_default network.
+networks:
+  postgres_default:
+    external: true   # created by infra/postgres/docker-compose.yml
+
+services:
+  abc-trader:
+    build:
+      context: ../..
+      dockerfile: infra/runtime/Dockerfile.trader
+    image: abc-trader:latest
+    container_name: abc-trader
+    restart: unless-stopped
+    env_file:
+      - ../../.env
+    environment:
+      # Ensure IBKR host resolves inside container to the Windows host running TWS
+      IBKR_HOST: host.docker.internal
+      # Production safety: never fall back to in-process scorer
+      TRADER_IN_PROCESS_SCORER: never
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    networks:
+      - postgres_default
+    # No ports exposed (IBKR is outbound to host TWS; no inbound API)
+    healthcheck:
+      test: ["CMD", "python", "-c", "
+import os
+from dotenv import load_dotenv
+load_dotenv(override=False)
+from core.config import validate_config
+errs = validate_config()
+exit(1 if errs else 0)
+"]
+      interval: 60s
+      timeout: 10s
+      retries: 3
+      start_period: 45s
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "5"

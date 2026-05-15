@@ -7,26 +7,10 @@ import time
 import pytest
 
 
-# ── Fixtures (mirror tests/test_signals.py / test_per_symbol_ic.py) ──
-
-@pytest.fixture(autouse=True)
-def _isolated_db(tmp_path, monkeypatch):
-    """Fresh temp DB per test; reset WorkingMemory singleton."""
-    import memory
-    from memory import working_memory as wm_mod
-    db_path = tmp_path / "test.db"
-    monkeypatch.setattr(memory, "_DB_PATH", db_path)
-    monkeypatch.setattr(memory, "_connection", None)
-    monkeypatch.setattr(memory, "_calibration_version", 0)
-    memory._pending_graduated_params.clear()
-    memory._pending_order_context.clear()
-    wm_mod.reset_working_memory_for_tests()
-    memory.init_db()
-    yield
-    if memory._connection:
-        memory._connection.close()
-    monkeypatch.setattr(memory, "_connection", None)
-    wm_mod.reset_working_memory_for_tests()
+# ── Fixtures ──
+# Use the shared modern _isolated_db from tests/conftest.py (reset_state + init_db).
+# The old fixture below was removed because it poked non-existent private attrs
+# (_connection) and used sqlite_master after the memory layer migrated to Postgres.
 
 
 @pytest.fixture
@@ -44,8 +28,11 @@ def wm(db):
 # ── Schema ───────────────────────────────────────────────────────
 
 def test_working_memory_table_exists(db):
+    # Postgres-compatible table existence check (information_schema).
+    # init_db in the autouse fixture guarantees the table is present.
     cur = db.execute(
-        "SELECT name FROM sqlite_master WHERE type='table' AND name='working_memory'"
+        "SELECT 1 FROM information_schema.tables "
+        "WHERE table_schema = 'public' AND table_name = 'working_memory'"
     )
     assert cur.fetchone() is not None
 

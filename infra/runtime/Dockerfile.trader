@@ -1,0 +1,39 @@
+# Trader image: runs the full Grok ReAct agent (__main__.py) with IBKR + LLM.
+# Requires host TWS/Gateway (paper 7497 or live 7496) reachable via host-gateway.
+# Pairs with research daemon on same or separate host sharing Postgres.
+# Usage: docker compose -f infra/runtime/docker-compose.trader.yml --env-file .env up -d --build
+FROM python:3.11-slim-bookworm
+
+ENV PYTHONUNBUFFERED=1 \
+    PYTHONDONTWRITEBYTECODE=1 \
+    # Default to require-daemon for production (override in .env or compose for dev)
+    TRADER_IN_PROCESS_SCORER=never
+
+WORKDIR /app
+
+COPY requirements.txt .
+RUN pip install --no-cache-dir --upgrade pip \
+    && pip install --no-cache-dir -r requirements.txt
+
+COPY . .
+
+# Healthcheck: simple Python check that config loads and (if possible) heartbeat/DB reachable.
+# In production the operator monitors logs + research_daemon heartbeat.
+HEALTHCHECK --interval=60s --timeout=10s --start-period=30s --retries=3 \
+    CMD python -c "
+import os, sys
+try:
+    from dotenv import load_dotenv; load_dotenv(override=False)
+    from core.config import validate_config, TRADING_MODE
+    errs = validate_config()
+    if errs: 
+        print('Config errors:', errs, file=sys.stderr)
+        sys.exit(1)
+    print(f'Trader health OK (mode={TRADING_MODE})')
+except Exception as e:
+    print('Healthcheck failed:', e, file=sys.stderr)
+    sys.exit(1)
+" || exit 1
+
+# Default: require clean daemon handoff (production). Use --require-daemon explicitly too.
+CMD ["python", "__main__.py", "--require-daemon"]

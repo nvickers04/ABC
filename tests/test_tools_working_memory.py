@@ -7,23 +7,8 @@ import asyncio
 import pytest
 
 
-@pytest.fixture(autouse=True)
-def _isolated_db(tmp_path, monkeypatch):
-    import memory
-    from memory import working_memory as wm_mod
-    db_path = tmp_path / "test.db"
-    monkeypatch.setattr(memory, "_DB_PATH", db_path)
-    monkeypatch.setattr(memory, "_connection", None)
-    monkeypatch.setattr(memory, "_calibration_version", 0)
-    memory._pending_graduated_params.clear()
-    memory._pending_order_context.clear()
-    wm_mod.reset_working_memory_for_tests()
-    memory.init_db()
-    yield
-    if memory._connection:
-        memory._connection.close()
-    monkeypatch.setattr(memory, "_connection", None)
-    wm_mod.reset_working_memory_for_tests()
+# Local _isolated_db removed — uses the robust shared one from tests/conftest.py
+# (with .env load + graceful Postgres skip on connection/permission failure).
 
 
 def _run(coro):

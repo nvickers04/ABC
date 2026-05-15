@@ -133,3 +133,74 @@ Tool interfaces are normalized for Grok tool-calling usage:
 - Options pre-validation checks expiration/strike existence before IBKR placement and returns clean contract-not-found errors.
 - Tool outputs are standardized to: `success`, `data`, `error`, `is_realtime`, `data_warning`.
 - Cash-only order failures return explicit `CASH-ONLY: insufficient cash` with available cash shown.
+
+## Two-Machine Production Deployment (Mandatory for Live)
+
+The system is designed for **strict separation** between a dedicated **Researcher machine** and a **Trader machine** sharing a Postgres database.
+
+### Researcher Machine (Market Data + Signals + Evolution)
+- Runs **only** `research_daemon.py` (never `__main__.py`).
+- Always starts the scorer + template evolution automatically.
+- Primary data source: MarketData.app (real-time, high credit burn).
+- **Hard boundaries enforced**:
+  - MDA streaming health check at startup (SPY quote probe). Daemon exits with code 3 if unhealthy.
+  - Hard daily cap `RESEARCHER_DAILY_TOKEN_CAP=100000` (default). Tracks activity per UTC day in `research_config`. Approaching 85% → warning; hitting cap → critical shutdown (exit 4). No unbounded research allowed.
+- Docker (recommended):
+  ```bash
+  docker compose -f infra/runtime/docker-compose.research.yml --env-file .env up -d --build
+  ```
+- Manual: `python research_daemon.py` (or with `--no-evolution` only for debugging).
+- Environment: Set `IBKR_QUOTES_ENABLED=0` (enforced internally). Never run trader code here.
+
+### Trader Machine (Grok ReAct + IBKR Execution)
+- Runs only `__main__.py`.
+- **Completely independent** — reads everything (signals, hypotheses, briefings, working memory) from shared Postgres.
+- **Default is fully decoupled**: `TRADER_IN_PROCESS_SCORER=never` (or in Docker compose). Trader **refuses** to start an in-process scorer and hard-exits if no fresh research_daemon heartbeat.
+- Use `--require-daemon` (or the env var) for production. `--force-in-process` is **dev only**.
+- Docker (recommended):
+  ```bash
+  docker compose -f infra/runtime/docker-compose.trader.yml --env-file .env up -d --build
+  ```
+- Manual production launch:
+  ```bash
+  TRADER_IN_PROCESS_SCORER=never python __main__.py --require-daemon
+  ```
+- IBKR streaming (stocks + options) is managed here with line-budget protection, LRU eviction, explicit `cancelMktData`, and reconnection handling. Researcher never holds IBKR market data lines.
+
+### Exact Launch Commands (Production)
+
+**Researcher host** (one terminal / systemd / Docker):
+```bash
+# Docker (preferred)
+docker compose -f infra/runtime/docker-compose.research.yml --env-file .env up -d --build
+
+# Or direct
+python research_daemon.py
+```
+
+**Trader host** (separate machine / container):
+```bash
+# Docker (preferred — defaults to fully decoupled)
+docker compose -f infra/runtime/docker-compose.trader.yml --env-file .env up -d --build
+
+# Or direct (production)
+TRADER_IN_PROCESS_SCORER=never python __main__.py --require-daemon --verbose
+```
+
+**Monitoring token / MDA usage on researcher**:
+- Watch logs for "RESEARCHER DAILY TOKEN USAGE APPROACHING CAP" and "MDA HEALTH CHECK".
+- Query: `SELECT key, value FROM research_config WHERE key LIKE 'researcher_daily_usage_%';`
+- The daemon will not start new heavy rounds once the 100k cap is reached.
+
+This architecture guarantees the researcher can run 24/7 on one host (with its own MDA token) while the trader runs on another (with IBKR + Grok) with zero risk of double-writes or silent in-process scorer fallback.
+
+## Risk Rules
+
+- Max **RISK_PER_TRADE%** of cash balance per trade (mode-dependent, overridable in `.env`)
+- **Cash-only** — no margin, no short selling (use long puts for bearish views)
+- **15%** daily loss → emergency flatten
+- **$50** daily LLM cost ceiling → halt
+- Turn limit: nudge at turn 8, hard max at turn 10 per cycle
+- Rolling context summary every 5 turns to keep reasoning sharp
+
+## Model

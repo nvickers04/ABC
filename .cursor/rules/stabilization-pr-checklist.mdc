@@ -1,5 +1,5 @@
 ---
-description: Enforce stabilization PR checklist for planning and code changes
+description: Stabilization PR quality gate for ABC trader
 alwaysApply: true
 ---
 
@@ -7,7 +7,7 @@ alwaysApply: true
 
 When asked to plan, implement, refactor, or review changes in this project:
 
-1. Use `docs/stabilization-pr-checklist.md` as the default quality gate.
+1. Use `docs/engineering.md` (Stabilization PR checklist section) as the default quality gate.
 2. Explicitly evaluate hotspot risk when touching:
    - `core/agent.py`
    - `signals/scorer.py`

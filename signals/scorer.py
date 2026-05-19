@@ -101,7 +101,7 @@ def run_research_threaded(*, verbose: bool = False, use_cadence: bool = False) -
 
     When ``use_cadence`` is True the loop sleeps according to the
     session-aware cadence (regular/extended/overnight) instead of the
-    fixed ``ROUND_DELAY_SECS``.  Used by ``research_daemon.py``.
+    fixed ``ROUND_DELAY_SECS``.  Used by ``python -m research``.
 
     Idempotent: if the scorer is already running this is a no-op.
     """

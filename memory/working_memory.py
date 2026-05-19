@@ -22,7 +22,7 @@ Eviction at cap: oldest-expires-first.  Persistence: the
 startup we restore today's still-valid entries; older rows are
 considered stale and purged.
 
-Design discipline (mirrors docs/PLAN_COGNITIVE_ARCHITECTURE.md §2):
+Design discipline:
 - Tools never silently write to working memory; the agent writes
   through explicit tool calls.
 - We do not cache market data here.
@@ -183,8 +183,7 @@ class WorkingMemory:
 
         Returns the assigned entry id.  ``entry`` is rendered verbatim
         in the prompt; keep it under ~200 tokens for ``open_theses``,
-        ~80 for ``recent_verdicts``, etc. (caps in
-        docs/PLAN_COGNITIVE_ARCHITECTURE.md §2).
+        ~80 for ``recent_verdicts``, etc. (see ``SECTION_CAPS``).
         """
         _validate_section(section)
         text = (entry or "").strip()

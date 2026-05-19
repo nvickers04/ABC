@@ -29,15 +29,15 @@ function Get-PythonExe {
     return $null
 }
 
-Write-Host "== Research daemon process (python + research_daemon) =="
+Write-Host "== Research host process (python -m research) =="
 $procs = Get-CimInstance Win32_Process -ErrorAction SilentlyContinue |
     Where-Object {
         $_.Name -match '^python(3(\.\d+)?)?\.exe$' -and
         $_.CommandLine -and
-        ($_.CommandLine -match 'research_daemon\.py')
+        ($_.CommandLine -match '-m\s+research\b')
     }
 if (-not $procs) {
-    Write-Host "(none found - daemon may use a different Python executable name)"
+    Write-Host "(none found - process may use a different Python executable name)"
 }
 else {
     $procs | Select-Object ProcessId, CommandLine | Format-Table -AutoSize
@@ -64,7 +64,7 @@ else {
 
 Write-Host ""
 if (-not $NoTail) {
-    $logPath = Join-Path $RepoRoot "logs\research_daemon.log"
+    $logPath = Join-Path $RepoRoot "logs\research.log"
     if (-not (Test-Path -LiteralPath $logPath)) {
         throw "Log file not found: $logPath"
     }

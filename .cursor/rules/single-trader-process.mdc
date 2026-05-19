@@ -20,9 +20,9 @@ Cursor agent **background** shell jobs often **do not** show up as a normal Term
 
 Running **multiple** `python __main__.py` (Grok trader) or parallel **research** long-runners multiplies **xAI spend**, **IBKR client IDs**, and confusing logs.
 
-When the user (or you) asks to **run**, **start**, **try again**, or start the Grok trader, `__main__.py`, `research_daemon.py`, or any process that calls the LLM and/or IBKR for an extended session:
+When the user (or you) asks to **run**, **start**, **try again**, or start the Grok trader, `__main__.py`, `python -m research`, or any process that calls the LLM and/or IBKR for an extended session:
 
-1. **Inventory first** (do not spawn another copy blindly). On Windows, list `python.exe` processes whose command line includes `__main__.py`, `research_daemon`, or this repo’s path, e.g. `Get-CimInstance Win32_Process -Filter "name = 'python.exe'"` and inspect `CommandLine`.
+1. **Inventory first** (do not spawn another copy blindly). On Windows, list `python.exe` processes whose command line includes `__main__.py`, `-m research`, or this repo’s path, e.g. `Get-CimInstance Win32_Process -Filter "name = 'python.exe'"` and inspect `CommandLine`.
 2. **If more than one matching process exists**, or any match when the user wanted a **clean single run**:
    - Tell the user **how many** and **which PIDs** are running the same entrypoint.
    - **Do not** start another instance until duplicates are resolved **or** the user explicitly says they want multiple instances (rare).
@@ -31,11 +31,11 @@ When the user (or you) asks to **run**, **start**, **try again**, or start the G
 
 ## Research host + trader machine (shared Postgres)
 
-This repo supports **one research machine** (Postgres + `research_daemon.py`) and a **separate trader machine** (`__main__.py`). Both use the **same** Postgres (`DATABASE_URL` / `PG*`) so the daemon’s heartbeat row is visible to the trader.
+This repo supports **one research machine** (Postgres + `python -m research`) and a **separate trader machine** (`__main__.py`). Both use the **same** Postgres (`DATABASE_URL` / `PG*`) so the daemon’s heartbeat row is visible to the trader.
 
-- **Bug to avoid:** `python __main__.py` **without** `--require-daemon` will start an **in-process scorer** whenever the daemon heartbeat is **missing or stale**. That is a **second scorer** next to `research_daemon.py` — duplicate cadence and **double-writes** into shared tables. That **breaks** the split-host model.
-- **Do not** suggest or run bare `python __main__.py` / `python __main__.py --verbose` for **production** on the trader box when scoring is owned by a remote daemon. Prefer:
-  - **`python __main__.py --verbose --require-daemon`** — refuse to start unless the daemon heartbeat is fresh (fix daemon or DB if it exits).
+- **Bug to avoid:** `python __main__.py` **without** `--require-daemon` will start an **in-process scorer** whenever the research host heartbeat is **missing or stale**. That is a **second scorer** next to `python -m research` — duplicate cadence and **double-writes** into shared tables. That **breaks** the split-host model.
+- **Do not** suggest or run bare `python __main__.py` / `python __main__.py --verbose` for **production** on the trader box when scoring is owned by a remote research host. Prefer:
+  - **`python __main__.py --verbose --require-daemon`** — refuse to start unless the research host heartbeat is fresh (fix `python -m research` or DB if it exits).
   - **`--no-research`** only when the operator explicitly wants no auto-scorer on the trader (still understand tool/agent paths).
   - **`--force-in-process`** only when the user **explicitly** wants dev single-process mode (never default).
 - If the user’s setup is split-host, **call this out** whenever starting the trader so they never silently fall back to in-process scoring.

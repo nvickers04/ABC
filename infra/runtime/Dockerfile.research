@@ -13,8 +13,8 @@ RUN pip install --no-cache-dir --upgrade pip \
 
 COPY . .
 
-# research_daemon.py disables IBKR quote routing internally; no TWS in this container.
-CMD ["python", "research_daemon.py"]
+# research.daemon disables IBKR quote routing internally; no TWS in this container.
+CMD ["python", "-m", "research"]
 
 # Healthcheck: verifies that Market Data streaming is reachable (the hard gate
 # the researcher daemon enforces at startup). This makes `docker compose ps`

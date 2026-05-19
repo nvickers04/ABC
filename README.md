@@ -24,46 +24,70 @@ Grok (ReAct Brain)  →  Tools (thin wrappers)  →  IBKR Execution
 ## Structure
 
 ```
-├── core/           # The brain
-│   ├── agent.py    # Pure ReAct loop
-│   ├── grok_llm.py # xAI API wrapper
-│   └── config.py   # System prompt + risk constants (reads .env)
-├── tools/          # Thin tool wrappers (account, orders, research, options, etc.)
-├── data/           # Market data client, data provider, cost tracker, broker gateway
-├── execution/      # IBKR core, orders, options, queries
-├── research/       # Autoresearch-style strategy evolution package
-├── __main__.py     # Entry point
-├── .env.template   # Copy to .env and fill in
-├── requirements.txt
-└── pyproject.toml
+├── core/              # Agent loop, config, runtime, quality policy
+│   ├── agent.py       # ReAct cycle
+│   ├── quality/       # QualityMatrix (risk, tool gates, provenance)
+│   └── runtime/       # Safety, scheduler, operating context, WM routing
+├── tools/             # Thin tool wrappers (account, orders, research, …)
+├── memory/            # Postgres persistence, working memory, migrations
+├── data/              # Market data, broker gateway, cost tracker
+├── execution/         # IBKR orders and queries
+├── research/          # Universe config, simulator; daemon in research/daemon.py
+├── signals/           # Scorers, combiner, templates (used by research host)
+├── docs/              # Ops and engineering (see docs/README.md)
+├── scripts/           # run_research.ps1, health.py, smoke_tools.py, verify_trader_db.py
+├── __main__.py        # Trader: python __main__.py  (Grok + IBKR)
+└── pyproject.toml     # Pytest config; research host: python -m research
 ```
+
+**Documentation:** [docs/README.md](docs/README.md) · **[Entry points](docs/entry-points.md)** (what to run on each host)
+
+## Entry points (summary)
+
+| Role | Production command | Code |
+|------|------------------|------|
+| **Research host** | `python -m research` | `research/daemon.py` |
+| **Trader** | `python __main__.py --require-daemon` | `__main__.py` → `core/agent.py` |
+| **Health** | `python scripts/health.py` | `scripts/health.py` |
+
+Details, dev single-machine modes, Docker, and scripts: **[docs/entry-points.md](docs/entry-points.md)**.
 
 ## Quick Start
 
 ```bash
-# 1. Clone and install
 git clone https://github.com/nvickers04/ABC.git
 cd ABC
 pip install -r requirements.txt
-
-# 2. Configure
 cp .env.template .env
-# Edit .env: fill GROK_API_KEY + IBKR credentials
-# Adjust RISK_PER_TRADE (default 1.0% — set 0.5 for ultra-conservative, 2.0 for testing)
+# Edit .env: GROK_API_KEY, IBKR credentials, DATABASE_URL (Postgres)
+```
 
-# 3. Start TWS or IB Gateway (paper trading on port 7497)
+Start **TWS or IB Gateway** (paper port 7497) before the trader.
 
-# 4. Run (paper mode by default)
-python __main__.py
+### Local development (two terminals, recommended)
 
-# Test Grok connection first:
-python __main__.py --test
+Matches production: research host scores; trader reads Postgres and runs Grok.
 
-# Verbose logging:
+```bash
+# Terminal 1 — research host (no Grok, no IBKR orders)
+python -m research
+
+# Terminal 2 — trader (paper)
 python __main__.py --verbose
+```
 
-# Live trading (when ready):
-python __main__.py --account live
+Health: `python scripts/health.py`
+
+### Production (two machines)
+
+See **[docs/entry-points.md](docs/entry-points.md)** — research: `python -m research`; trader: `python __main__.py --require-daemon` with `TRADER_IN_PROCESS_SCORER=never`.
+
+### Trader-only shortcuts
+
+```bash
+python __main__.py --test          # Grok connection only
+python __main__.py                 # trader (in-process scorer if no research heartbeat)
+python __main__.py --account live  # live — use launch checklist first
 ```
 
 ## Environment Variables
@@ -113,7 +137,7 @@ TRADING_MODE=live python __main__.py
 - Turn limit: nudge at turn 8, hard max at turn 10 per cycle
 - Rolling context summary every 5 turns to keep reasoning sharp
 
-**Production**: See `docs/PRODUCTION_LAUNCH_CHECKLIST.md` (pre-flight, Docker, live gate, monitoring, rollback). Use `--require-daemon` + separate research host for best isolation. Full Docker trader support added in `infra/runtime/`.
+**Production**: [docs/operations/launch-checklist.md](docs/operations/launch-checklist.md) · [docs/operations/deployment.md](docs/operations/deployment.md)
 
 ## Model
 
@@ -134,73 +158,12 @@ Tool interfaces are normalized for Grok tool-calling usage:
 - Tool outputs are standardized to: `success`, `data`, `error`, `is_realtime`, `data_warning`.
 - Cash-only order failures return explicit `CASH-ONLY: insufficient cash` with available cash shown.
 
-## Two-Machine Production Deployment (Mandatory for Live)
+## Two-machine production
 
-The system is designed for **strict separation** between a dedicated **Researcher machine** and a **Trader machine** sharing a Postgres database.
+Research host runs `python -m research` only (never `__main__.py`).
+Trader host runs `python __main__.py --require-daemon` with `TRADER_IN_PROCESS_SCORER=never`.
+Both share one **PostgreSQL** database.
 
-### Researcher Machine (Market Data + Signals + Evolution)
-- Runs **only** `research_daemon.py` (never `__main__.py`).
-- Always starts the scorer + template evolution automatically.
-- Primary data source: MarketData.app (real-time, high credit burn).
-- **Hard boundaries enforced**:
-  - MDA streaming health check at startup (SPY quote probe). Daemon exits with code 3 if unhealthy.
-  - Hard daily cap `RESEARCHER_DAILY_TOKEN_CAP=100000` (default). Tracks activity per UTC day in `research_config`. Approaching 85% → warning; hitting cap → critical shutdown (exit 4). No unbounded research allowed.
-- Docker (recommended):
-  ```bash
-  docker compose -f infra/runtime/docker-compose.research.yml --env-file .env up -d --build
-  ```
-- Manual: `python research_daemon.py` (or with `--no-evolution` only for debugging).
-- Environment: Set `IBKR_QUOTES_ENABLED=0` (enforced internally). Never run trader code here.
+Full runbooks: **[docs/operations/deployment.md](docs/operations/deployment.md)** · [postgres](docs/operations/postgres.md) · [independent mode](docs/operations/independent-mode.md)
 
-### Trader Machine (Grok ReAct + IBKR Execution)
-- Runs only `__main__.py`.
-- **Completely independent** — reads everything (signals, hypotheses, briefings, working memory) from shared Postgres.
-- **Default is fully decoupled**: `TRADER_IN_PROCESS_SCORER=never` (or in Docker compose). Trader **refuses** to start an in-process scorer and hard-exits if no fresh research_daemon heartbeat.
-- Use `--require-daemon` (or the env var) for production. `--force-in-process` is **dev only**.
-- Docker (recommended):
-  ```bash
-  docker compose -f infra/runtime/docker-compose.trader.yml --env-file .env up -d --build
-  ```
-- Manual production launch:
-  ```bash
-  TRADER_IN_PROCESS_SCORER=never python __main__.py --require-daemon
-  ```
-- IBKR streaming (stocks + options) is managed here with line-budget protection, LRU eviction, explicit `cancelMktData`, and reconnection handling. Researcher never holds IBKR market data lines.
-
-### Exact Launch Commands (Production)
-
-**Researcher host** (one terminal / systemd / Docker):
-```bash
-# Docker (preferred)
-docker compose -f infra/runtime/docker-compose.research.yml --env-file .env up -d --build
-
-# Or direct
-python research_daemon.py
-```
-
-**Trader host** (separate machine / container):
-```bash
-# Docker (preferred — defaults to fully decoupled)
-docker compose -f infra/runtime/docker-compose.trader.yml --env-file .env up -d --build
-
-# Or direct (production)
-TRADER_IN_PROCESS_SCORER=never python __main__.py --require-daemon --verbose
-```
-
-**Monitoring token / MDA usage on researcher**:
-- Watch logs for "RESEARCHER DAILY TOKEN USAGE APPROACHING CAP" and "MDA HEALTH CHECK".
-- Query: `SELECT key, value FROM research_config WHERE key LIKE 'researcher_daily_usage_%';`
-- The daemon will not start new heavy rounds once the 100k cap is reached.
-
-This architecture guarantees the researcher can run 24/7 on one host (with its own MDA token) while the trader runs on another (with IBKR + Grok) with zero risk of double-writes or silent in-process scorer fallback.
-
-## Risk Rules
-
-- Max **RISK_PER_TRADE%** of cash balance per trade (mode-dependent, overridable in `.env`)
-- **Cash-only** — no margin, no short selling (use long puts for bearish views)
-- **15%** daily loss → emergency flatten
-- **$50** daily LLM cost ceiling → halt
-- Turn limit: nudge at turn 8, hard max at turn 10 per cycle
-- Rolling context summary every 5 turns to keep reasoning sharp
-
-## Model
+Quick health: `python scripts/health.py`

@@ -5,7 +5,8 @@ This package isolates concerns previously mixed inside ``core.agent``:
 * ``interfaces``       — Protocol-style adapter contracts (broker / market hours / cost).
 * ``state_context``    — :class:`StateContextBuilder` (extracted from agent).
 * ``safety``           — :class:`SafetyController` (loss / drawdown / cost gates).
-* ``operating_context`` — :class:`OperatingContext` + :class:`QualityMatrix` (PR2 orchestration driver: risk, model config, tool policy, provenance).
+* ``operating_context`` — :class:`OperatingContext` (researcher mode, context quality).
+* ``working_memory_access`` — routes WM to Postgres or local JSON fallback.
 
 Future additions (per stabilization plan): ``coordinator``, ``scheduler``.
 
@@ -29,10 +30,6 @@ from core.runtime.operating_context import (
     QualityMatrix,
     get_operating_context,
 )
-
-# Note: ToolUsageSnapshot removed (PR1 unification: superseded by ToolUsageRecord +
-# DecisionProvenanceSnapshot in core.quality.quality_matrix). Old references should
-# migrate to the canonical provenance types.
 
 __all__ = [
     "AccountSummary",

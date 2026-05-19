@@ -8,8 +8,7 @@ Two tools:
 There is intentionally NO read tool.  The rendered WORKING MEMORY block
 is auto-injected into every cycle prompt (see core/agent.py), so a read
 tool would only tempt the agent to burn a turn fetching information it
-already has.  See docs/PLAN_COGNITIVE_ARCHITECTURE.md §3 for the
-rationale.
+already has.
 """
 
 from __future__ import annotations

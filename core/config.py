@@ -161,10 +161,10 @@ MULTI_AGENT_RESEARCH_ENABLED: bool = os.getenv(
 ).strip().lower() not in ("0", "false", "no", "off")
 
 # ── Researcher Machine Hard Boundaries (two-machine production) ─────────────
-# The research_daemon (scorer + template evolution) on the dedicated researcher
+# The research host (python -m research: scorer + template evolution) on the researcher machine
 # host must NEVER run unbounded. MDA streaming must be healthy, and total daily
 # research activity (MDA credits / equivalent "tokens") is capped at 100k.
-# Enforced early in research_daemon.py and per-round in signals/scorer.py.
+# Enforced early in research.daemon and per-round in signals/scorer.py.
 RESEARCHER_DAILY_TOKEN_CAP: int = int(
     os.getenv("RESEARCHER_DAILY_TOKEN_CAP", "100000")
 )
@@ -196,7 +196,7 @@ IBKR_QUOTE_LINE_BUDGET: int = int(os.getenv("IBKR_QUOTE_LINE_BUDGET", "90"))
 # ── Trader: in-process signal scorer (__main__.py + research_engine tool) ───
 # When TRADER_IN_PROCESS_SCORER=never (aliases: 0, false, off, remote_only, no),
 # the trader never starts ``signals.scorer`` in this process and **refuses to
-# start** unless ``research_daemon.py`` has a fresh DB heartbeat (same hard
+# start** unless ``python -m research`` has a fresh DB heartbeat (same hard
 # gate as ``--require-daemon``). The ``research_engine`` tool cannot start or
 # resume the scorer. ``--force-in-process`` still overrides for dev/debug.
 _TRADER_IPS_RAW = os.getenv("TRADER_IN_PROCESS_SCORER", "auto").strip().lower()
@@ -406,8 +406,8 @@ CHARTS:    chart_quick($), chart_intraday($$), chart_swing($$), chart_full($$$)
 SELF-REVIEW: execution_status($), open_hypotheses($), review_trades($$)
 ENGINE:    research_engine(action=status|start|pause|resume|stop, scope=both|scorer|evolution)
            — controls the in-process signal scorer only. Template evolution runs in
-           research_daemon.py, not here. Scorer feeds briefing() edge math (~66 MDA credits/round,
-           ~3min/round). At boot the trader skips in-process scoring when the daemon heartbeat is fresh.
+           python -m research, not here. Scorer feeds briefing() edge math (~66 MDA credits/round,
+           ~3min/round). At boot the trader skips in-process scoring when the research host heartbeat is fresh.
 ACCOUNT:   account($), positions($), open_orders($), get_position($), refresh_state($),
            position_greeks($$)
 ORDERS:    bracket_order, market_order, limit_order, stop_order, stop_limit, trailing_stop,
@@ -419,7 +419,7 @@ OPTIONS:   option_chain($$$), option_quote($), option_greeks($), buy_option, ver
            close_option, close_spread, roll_option
 SIZING:    calculate_size($), plan_order($$), enter_option($$), instrument_selector($$)
 
-═══ TOOL INTENT (smoke-checked in paper; see scripts/smoke_trader_tools.py) ═══
+═══ TOOL INTENT (smoke-checked in paper; see scripts/smoke_tools.py) ═══
 - plan_order / enter_option: planning and contract selection in-handler — follow with the concrete
   order tool (limits on spreads) using the suggested params.
 - research(): multi-agent web/X — costly; hard-capped per day (MAX_DAILY_MULTI_AGENT_RESEARCH_USD);

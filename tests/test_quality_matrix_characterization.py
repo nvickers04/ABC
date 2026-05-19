@@ -1,4 +1,4 @@
-"""PR1 Characterization test for QualityMatrix core (hybrid design).
+"""Characterization tests for QualityMatrix core.
 
 Pins the deterministic behavior of population from trade_feedback,
 tool recording, decision provenance snapshots, to_prompt_block and

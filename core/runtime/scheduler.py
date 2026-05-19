@@ -140,7 +140,6 @@ class CycleScheduler:
         try:
             wait_seconds = await self.agent.run_cycle()
             logger.info(f"Cooldown: up to {wait_seconds}s (event-driven)")
-            # PR2 wiring: surface QualityMatrix state at scheduler boundary (orchestration visibility)
             try:
                 from core.runtime.operating_context import get_operating_context
                 _qctx = get_operating_context()

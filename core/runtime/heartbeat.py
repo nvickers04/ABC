@@ -1,14 +1,12 @@
 """
-Research daemon heartbeat helpers.
+Research host heartbeat helpers.
 
-Stores the daemon's last-round timestamp in the existing
-``research_config`` key/value table under
-``HEARTBEAT_KEY = "daemon_heartbeat_ts"``.
+Stores the research host's last scoring-round timestamp in ``research_config``
+under ``HEARTBEAT_KEY`` (``daemon_heartbeat_ts`` — key name is historical).
 
-The trading agent reads ``is_daemon_alive(stale_after_s)`` on startup
-and once per cycle.  When fresh, the agent skips spawning its own
-in-process scorer — the daemon owns that work.  When stale, the agent
-falls back to single-process mode.
+The trader reads ``is_daemon_alive(stale_after_s)`` on startup and each cycle.
+When fresh, the trader skips its in-process scorer. When stale, it may fall back
+to single-process scoring (unless ``--require-daemon`` / ``TRADER_IN_PROCESS_SCORER=never``).
 """
 
 from __future__ import annotations
@@ -22,20 +20,18 @@ logger = logging.getLogger(__name__)
 
 HEARTBEAT_KEY: str = "daemon_heartbeat_ts"
 
-# Hard floor used when no cadence is supplied — long enough that a
-# regular-hours round (~75s effective cycle) is still considered fresh,
-# short enough that a truly dead daemon is detected within ~3 minutes.
+# Hard floor when no cadence is supplied — regular-hours rounds stay fresh;
+# a dead research host is detected within ~3 minutes.
 DEFAULT_STALE_AFTER_S: float = 180.0
 
 
 def write_heartbeat(now: Optional[float] = None) -> float:
-    """Write the current timestamp to the research_config key.  Returns
-    the timestamp written.  Fail-soft: logs DEBUG and returns 0.0 on
-    error so a transient DB hiccup never crashes the daemon."""
+    """Write the current timestamp to research_config. Returns ts written."""
     ts = float(now) if now is not None else time.time()
     try:
         from memory import set_research_config
-        set_research_config(HEARTBEAT_KEY, ts, reason="research_daemon round")
+
+        set_research_config(HEARTBEAT_KEY, ts, reason="research_host round")
     except Exception as e:
         logger.debug("heartbeat write failed: %s", e)
         return 0.0
@@ -58,10 +54,8 @@ def is_daemon_alive(stale_after_s: Optional[float] = None,
 
     When ``stale_after_s`` is None (the common case) the threshold is
     derived from the current cadence: ``3 × cadence_seconds() + 60``,
-    floored at ``DEFAULT_STALE_AFTER_S``.  This means a daemon sleeping
-    overnight at 1800s cadence won't be falsely flagged dead between
-    rounds, while a daemon that's actually crashed during regular hours
-    is still detected within ~3 minutes.
+    floored at ``DEFAULT_STALE_AFTER_S``.  Overnight long cadence avoids false
+    negatives; a crashed research host during regular hours is detected quickly.
 
     Pass an explicit value to opt out of the cadence-aware default.
     """

@@ -776,7 +776,7 @@ async def handle_open_hypotheses(executor, params: dict) -> Any:
 
 
 _EVOLUTION_DAEMON_ONLY = (
-    "Template evolution runs only in research_daemon.py — "
+    "Template evolution runs only in python -m research — "
     "not started or controlled from the trader process."
 )
 
@@ -786,7 +786,7 @@ async def handle_research_engine(executor, params: dict) -> dict:
 
     params.action in {"status", "start", "pause", "resume", "stop"}.
     scope='scorer' | 'both' affects the scorer. scope='evolution' is ignored for
-    control actions (evolution is owned by research_daemon.py); status still reports policy.
+    control actions (evolution is owned by python -m research); status still reports policy.
     """
     from signals import scorer as _sc
     from signals import template_evolution as _te
@@ -803,7 +803,7 @@ async def handle_research_engine(executor, params: dict) -> dict:
     elif TRADER_IN_PROCESS_SCORER_NEVER and action in ("start", "resume") and want_scorer:
         result["error"] = (
             "In-process scorer is disabled (TRADER_IN_PROCESS_SCORER=never). "
-            "Run python research_daemon.py on the research host."
+            "Run python -m research on the research host."
         )
     elif action == "start":
         if want_scorer and not _sc.is_scorer_running():
@@ -868,32 +868,8 @@ async def handle_context_quality(executor, params: dict) -> dict:
     }
 
 
-# ── PR3: Quality Inspection Tools (Tool-Provenance Heavy + Balanced polish) ────
-#
-# Exactly three canonical read-only inspect-only tools (plus legacy compat):
-#   quality_status()             -> system-wide + full canonical QualityMatrix snapshot + policy
-#   quality_for_symbol(symbol)   -> per-symbol execution conviction + local quality_score
-#   provenance_audit(window?, symbol?) -> heavy tool-usage provenance + decision snapshots
-#
-# All three are pure inspection (never mutate state, never cause side-effects).
-# They give the agent (especially in Independent Mode) first-class visibility into:
-#   - Current risk posture and host policy (from QualityMatrix)
-#   - Name-specific execution track record
-#   - Exact recent ToolUsageRecords and DecisionProvenanceSnapshots (the provenance signal)
-#
-# Enforcement (should_allow_tool, get_scaled_quantity, llm config overrides, blocks)
-# stays exclusively in the host (PR2 wiring in executor + agent + QualityMatrixService).
-# The tools surface the state so the LLM can reason and self-limit voluntarily.
-#
-# Strong Independent Mode support: these three are the primary "what do I actually know
-# and what tools were live when decisions were made?" mechanism.
-# Follows the Tool-Provenance Heavy winner (light Balanced polish via compat layer).
-#
-# See core/quality/quality_matrix.py for the dataclass + service contract.
-# See core/agent.py for the INDEPENDENT MODE RULES that mandate early calls to these tools.
-
-from core.runtime.operating_context import get_operating_context
-from datetime import datetime as _dt_datetime, timezone as _tz
+# ── Quality inspection tools (read-only; enforcement is host-side) ─────────────
+# quality_status, quality_for_symbol, provenance_audit — see docs/operations/independent-mode.md
 
 
 def _validate_symbol(raw: Any) -> str | None:
@@ -930,11 +906,7 @@ def _recent_feedback_for_symbol(sym: str, limit: int = 30) -> list[dict]:
 
 
 def _maybe_refresh_matrix(svc) -> None:
-    """Lightweight freshness helper for the PR3 inspect tools.
-    If the matrix last_populated is >5min old, trigger populate() so the agent
-    calling quality_status / provenance_audit in Independent Mode sees current data.
-    Non-fatal best-effort only (populate reuses existing sources and is cheap).
-    """
+    """Re-populate matrix if older than five minutes (best-effort)."""
     try:
         from datetime import datetime as _dt, timezone as _tz
         m = svc.get_matrix()
@@ -946,10 +918,7 @@ def _maybe_refresh_matrix(svc) -> None:
 
 
 async def handle_quality_status(executor, params: dict) -> dict:
-    """PR3 canonical read-only inspect tool: quality_status()
-
-    Returns a rich snapshot of system quality posture driven by the canonical
-    QualityMatrixService (PR1) plus legacy operating context for compat.
+    """Read-only system quality snapshot from QualityMatrix + operating context.
 
     Primary fields (authoritative from QualityMatrix when available):
       - overall_quality, risk_multiplier, blocked_tool_categories,
@@ -1000,14 +969,13 @@ async def handle_quality_status(executor, params: dict) -> dict:
 
     last_age = None
     if q.last_research_update:
-        last_age = (_dt_datetime.now(_tz.utc) - q.last_research_update).total_seconds() / 60
+        last_age = (dt_datetime.now(_tz.utc) - q.last_research_update).total_seconds() / 60
 
-    # PR2 Strong: also surface the canonical core QualityMatrix (the real policy engine)
     matrix_enrichment: dict[str, Any] = {}
     try:
         from core.quality.quality_matrix import get_quality_matrix_service
         svc = get_quality_matrix_service()
-        _maybe_refresh_matrix(svc)  # PR3: give the agent a fresh view when it inspects
+        _maybe_refresh_matrix(svc)
         m = svc.get_matrix()
         pol = m.recommended_policies()
         llm_cfg = m.get_llm_call_config()
@@ -1027,7 +995,7 @@ async def handle_quality_status(executor, params: dict) -> dict:
             "matrix_recent_tool_count": len(m.recent_tool_usage),
             "matrix_global_exec_quality": getattr(m, "global_execution_quality", None),
             "matrix_last_populated_minutes_ago": round(
-                (_dt_datetime.now(_tz.utc) - m.last_populated).total_seconds() / 60, 1
+                (dt_datetime.now(_tz.utc) - m.last_populated).total_seconds() / 60, 1
             ),
         }
         # Prefer matrix values for the primary keys when available (source of truth)
@@ -1052,17 +1020,14 @@ async def handle_quality_status(executor, params: dict) -> dict:
         "summary": summary_block,
         "matrix": matrix_enrichment or {"note": "core matrix unavailable this call (fallback to legacy context)"},
         "enforcement_note": (
-            "Hard controls (model config via get_llm_call_config, tool blocks via should_allow_tool, "
-            "quantity scaling via get_scaled_quantity) live exclusively in the host QualityMatrix and executor. "
-            "This tool + provenance_audit give the agent full visibility for voluntary self-adaptation. "
-            "Call provenance_audit() for the actual recent tool call + decision history."
+            "Host enforces model config, tool blocks, and quantity scaling via QualityMatrix. "
+            "Use provenance_audit() for recent tool and decision history."
         ),
-        "pr3_note": "quality_status + quality_for_symbol + provenance_audit are the three official PR3 inspect tools.",
     }
 
 
 async def handle_quality_for_symbol(executor, params: dict) -> dict:
-    """PR3 canonical read-only inspect tool: quality_for_symbol({symbol})
+    """Read-only per-symbol quality from recent trade_feedback.
 
     Returns per-symbol quality metrics derived from trade_feedback (the same source
     that feeds SymbolQuality in the canonical matrix).
@@ -1135,9 +1100,9 @@ async def handle_quality_for_symbol(executor, params: dict) -> dict:
 
 
 async def handle_current_constraints(executor, params: dict) -> dict:
-    """Legacy / Balanced-polish constraints summary (kept for backward compat).
+    """Legacy constraints summary; prefer quality_status and provenance_audit.
 
-    New code and Independent Mode prompts should prefer the three PR3 tools
+    New code and Independent Mode prompts should prefer the quality inspect tools
     (quality_status for full matrix policy, quality_for_symbol for per-name, and
     especially provenance_audit for the heavy tool-usage + decision history).
     This is a lightweight derived view only.
@@ -1166,17 +1131,14 @@ async def handle_current_constraints(executor, params: dict) -> dict:
             if is_ind
             else "Full research context available."
         ),
-        "enforcement_note": "Legacy view. Use quality_status() + provenance_audit() for the authoritative QualityMatrix state and tool provenance.",
-        "pr3_note": "Prefer the three canonical tools for PR3 Tool-Provenance Heavy experience.",
+        "enforcement_note": "Legacy view. Use quality_status() + provenance_audit() for authoritative policy and provenance.",
     }
 
 
 async def handle_provenance_audit(executor, params: dict) -> dict:
-    """PR3 canonical read-only inspect tool: provenance_audit({window?, symbol?})
+    """Read-only audit of recent tool usage and decision provenance snapshots.
 
-    The Tool-Provenance Heavy flagship tool.
-
-    Returns two rich arrays directly from the canonical QualityMatrix (populated
+    Returns two arrays from QualityMatrix (populated
     by record_tool_usage + record_decision_snapshot calls throughout the host):
 
     recent_tool_usage: list of ToolUsageRecord dicts
@@ -1267,25 +1229,20 @@ async def handle_provenance_audit(executor, params: dict) -> dict:
             "recent_tool_usage": tool_records,
             "recent_provenance": prov_records,
             "summary": (
-                f"Provenance audit (Tool-Provenance Heavy): {len(tool_records)} tool calls + "
-                f"{len(prov_records)} decision snapshots (filtered to {sym_filter or 'all'}, last {window}). "
-                "High context_quality + diverse tools_used = stronger historical backing for current decisions."
+                f"{len(tool_records)} tool calls + {len(prov_records)} decision snapshots "
+                f"(filter={sym_filter or 'all'}, window={window})."
             ),
             "enforcement_note": (
-                "Inspect-only. The three PR3 tools surface state for agent reasoning. "
-                "All hard enforcement (blocks, scaling, model params) is performed by QualityMatrix "
-                "in the host before any tool or order is executed. See should_allow_tool and get_llm_call_config."
+                "Inspect-only. Host enforces blocks, scaling, and model params via QualityMatrix."
             ),
-            "pr3_design": "Tool-Provenance Heavy (primary) + light Balanced polish. Exactly the three inspect tools specified.",
         }
     except Exception as exc:
         logger.debug("provenance_audit failed: %s", exc)
         return {
             "error": str(exc),
-            "note": "QualityMatrix provenance not available (first run, disabled, or DB schema pending). Tables are created on startup in memory/__init__.py.",
+            "note": "Provenance unavailable (first run, disabled, or schema pending).",
             "recent_tool_usage": [],
             "recent_provenance": [],
-            "pr3_design": "Tool-Provenance Heavy: quality_status + quality_for_symbol + provenance_audit",
         }
 
 
@@ -1319,14 +1276,10 @@ HANDLERS = {
 }
 
 
-# PR3 quality tools registration (executes at import time)
-# Deliver exactly the three read-only inspect tools per the Tool-Provenance Heavy + Balanced hybrid:
-#   quality_status, quality_for_symbol, provenance_audit
-# current_constraints kept only as thin compat layer (point users at the canonical three).
 HANDLERS["quality_status"] = handle_quality_status
 HANDLERS["quality_for_symbol"] = handle_quality_for_symbol
 HANDLERS["provenance_audit"] = handle_provenance_audit
-HANDLERS["current_constraints"] = handle_current_constraints  # legacy/Balanced compat only
+HANDLERS["current_constraints"] = handle_current_constraints
 
 
 

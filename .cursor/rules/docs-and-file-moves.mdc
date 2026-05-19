@@ -1,0 +1,37 @@
+---
+description: Move files and update references; never leave redirect stubs or root shims
+alwaysApply: true
+---
+
+# Documentation and file moves
+
+When consolidating, renaming, or relocating docs, scripts, or entry points:
+
+## Do not leave redirect stubs
+
+- **Never** add a replacement file whose only job is to point elsewhere (e.g. `# Moved`, `See [other.md](other.md)`, a one-line “this moved to …” stub).
+- **Never** keep a duplicate path “for backward compatibility” unless the user explicitly asks for it in that change.
+- If content moves, **move it** (or merge into the target), **delete** the old path, and **update every reference** in the same work.
+
+## Actually move and update
+
+1. **Grep the repo** for the old path, basename, and command strings (see “Removed paths” in `docs/engineering.md`).
+2. **Update** README, ops docs, Docker `CMD`, scripts, `.cursor/rules`, comments, and user-facing strings.
+3. **Delete** obsolete files after references are clean.
+4. Prefer the **canonical location** (e.g. `research/daemon.py` + `python -m research`, not a root launcher shim).
+5. Verify with search: no remaining links to deleted paths.
+
+## Code entry points
+
+- Implementation belongs in the right package/module; launch via `python -m <package>` or documented scripts under `scripts/`.
+- Do not add a second top-level file that only re-exports `main()` from elsewhere unless the user explicitly wants that compatibility layer.
+
+## Docs consolidation
+
+- Merge into fewer real documents (e.g. one `docs/data-sources.md`), not a folder of stubs plus a new index that only links outward.
+- `docs/README.md` may index live files; indexed paths must exist and contain the content.
+- Process start commands live in `docs/entry-points.md` only; other docs link there instead of duplicating tables.
+
+## When the user asks to “clean up” files
+
+Treat that as: fewer files, single source of truth, references fixed—not more indirection.

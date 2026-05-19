@@ -3,9 +3,8 @@ Naive intuition layer — ranks symbols by an "attention score" so the
 agent sees the most-interesting names *now*, instead of round-robining
 the whole universe.
 
-This is the **global-IC version** described in
-docs/PLAN_COGNITIVE_ARCHITECTURE.md §5.  A future PR may swap the
-global IC for the per-symbol IC produced by ``signals.per_symbol_ic``.
+Uses global signal ICs today; ``signals.per_symbol_ic`` can refine
+per-symbol modifiers when wired in.
 
 Score formula (per symbol)::
 

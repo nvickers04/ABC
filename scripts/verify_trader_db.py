@@ -3,7 +3,7 @@
 
 Run on the trader machine with DATABASE_URL or PG* set for `trader_user`.
 Set DATABASE_APP_ROLE=abc_app when using the shared DDL owner (see
-docs/POSTGRES_HOST_SETUP.md §7).
+docs/operations/postgres.md §7).
 
 Exit code 0 and prints OK when memory.init_db() succeeds.
 

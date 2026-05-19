@@ -69,7 +69,6 @@ async def run_daily_review(agent) -> None:
         if TRADING_MODE == "live":
             evaluate_risk_ramp(db, today)
 
-        # PR1: QualityMatrix population hook (hybrid reuse of daily review data)
         try:
             from core.quality.quality_matrix import get_quality_matrix_service
             svc = get_quality_matrix_service()

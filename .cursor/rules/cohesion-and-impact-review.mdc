@@ -1,5 +1,5 @@
 ---
-description: Force cross-module impact review and plain-English explanations
+description: Cohesion and impact review for non-trivial ABC changes
 alwaysApply: true
 ---
 
@@ -7,10 +7,7 @@ alwaysApply: true
 
 For any non-trivial request (planning, coding, refactor, review):
 
-1. Read and follow:
-   - `docs/stabilization-pr-checklist.md`
-   - `docs/change-impact-map.md`
-   - `docs/plain-english-glossary.md`
+1. Read and follow `docs/engineering.md` (checklist, impact map, glossary) and `.cursor/rules/docs-and-file-moves.mdc` when moving or consolidating files.
 2. Before proposing edits, list:
    - target subsystem
    - likely adjacent subsystems impacted

@@ -118,9 +118,6 @@ class TradingAgent:
                 "Using local memory fallback and reduced risk."
             )
 
-        # PR2: Initial population of canonical QualityMatrix at agent startup.
-        # Ensures first cycle sees up-to-date risk_multiplier, LLM config, blocked categories,
-        # and prompt block derived from trade_feedback + current researcher state.
         try:
             from core.quality.quality_matrix import get_quality_matrix_service
             svc = get_quality_matrix_service()
@@ -559,7 +556,6 @@ If no changes warranted: []"""
             set_research_config("last_analysis_snapshot_id", float(max_id), "execution_analysis_complete")
             logger.info(f"Execution analysis complete: analyzed {len(snapshots)} snapshots")
 
-            # PR1: QualityMatrix hook (conservative reuse after execution analysis)
             try:
                 from core.quality.quality_matrix import get_quality_matrix_service
                 svc = get_quality_matrix_service()
@@ -763,12 +759,6 @@ If no changes warranted: []"""
 
         from zoneinfo import ZoneInfo
         _et_now = datetime.now(ZoneInfo("America/New_York"))
-        # ── Operating Context & Researcher Status (PR2: QualityMatrix driven) ──
-        # The matrix is the source of truth for orchestration. Its prompt block
-        # is richer and explicitly calls out HARD policies (model, risk, blocked tools).
-        # PR2: Refresh canonical matrix before prompt construction so any
-        # inter-cycle tool provenance, daily updates, or state flips are reflected
-        # in the injected block + any downstream policy lookups.
         ctx = self._operating_context
         ctx.sync_researcher_from_heartbeat()
 
@@ -779,11 +769,9 @@ If no changes warranted: []"""
             svc.maybe_populate(max_age_seconds=60.0)
         except Exception as _cycle_pop:
             logger.debug("QualityMatrix cycle refresh skipped: %s", _cycle_pop)
-        # Use the matrix block (enhanced for PR2); legacy .quality kept for tools/compat
         status_block = ctx.quality_matrix.to_prompt_block(ctx.risk_multiplier) + "\n\n"
 
         # ── Working Memory: curate then render ──────────────────
-        # Prefers local store in Independent Mode for resilience.
         wm_block = ""
         try:
             from core.runtime.working_memory_access import get_active_working_memory
@@ -797,12 +785,9 @@ If no changes warranted: []"""
             wm_block = "(Working Memory currently unavailable)\n\n"
             ctx.quality.working_memory_completeness = 0.0
 
-        # (status_block already set from QualityMatrix above; duplicate removed for PR2)
-        # status_block remains the rich matrix version for prompt injection.
-
         # ── Attention: sync new watching_for into triggers, render fires ──
         # Rendered ABOVE working memory so the agent sees "what just
-        # fired" before "what I was thinking earlier".  See plan §4.
+        # fired" before "what I was thinking earlier".
         attn_block = ""
         try:
             from core.runtime import attention as _attention
@@ -817,7 +802,7 @@ If no changes warranted: []"""
 
         # ── Intuition: top-N by attention score ──────────────────
         # Rendered just below ATTENTION so "what just fired" comes
-        # before "where my edge is sitting".  See plan §5.
+        # before "where my edge is sitting".
         intu_block = ""
         try:
             from core.runtime import intuition as _intuition
@@ -857,10 +842,7 @@ Account state above.
             TOOL_PLAYBOOK_MAX_CHARS,
             AGENT_TOOL_FEEDBACK_MAX_CHARS,
         )
-        # ── PR2 Strong: Canonical QualityMatrix LLM config (unconditional host override) ──
-        # The matrix decides sampling params. This is hard control at the orchestration
-        # layer — the model never sees "full creativity" when the matrix says otherwise.
-        # Falls back to legacy only if core service is unreachable (never during normal op).
+        # QualityMatrix controls temperature/max_tokens (host override).
         try:
             from core.quality.quality_matrix import get_quality_matrix_service
             svc = get_quality_matrix_service()
@@ -877,7 +859,7 @@ Account state above.
             q_for_log = getattr(ctx.quality_matrix, "overall_quality", "unknown")
 
         logger.info(
-            "CYCLE %d model-config from QualityMatrix (strong): temp=%.2f max_tokens=%d (quality=%s)",
+            "CYCLE %d model-config from QualityMatrix: temp=%.2f max_tokens=%d (quality=%s)",
             self._cycle_id, eff_temp, eff_max_tokens, q_for_log
         )
         chat = self.grok.client.chat.create(
@@ -1012,7 +994,6 @@ Account state above.
                         )
                         self._append_snapshot(f"C{self._cycle_id}: done")
 
-                        # PR1: Record decision provenance snapshot at cycle end (tool purist)
                         try:
                             from core.quality.quality_matrix import (
                                 get_quality_matrix_service,
@@ -1052,10 +1033,6 @@ Account state above.
                         # ── Execute tool action ────────────────
                         last_result = await self.tools.execute(action, action_data)
                         sym = action_data.get('symbol', '')
-
-                        # PR1: Recording now centralized in ToolExecutor._record_tool_for_quality_matrix
-                        # (primary hook per PR1 spec). Kept here only as no-op comment for traceability.
-                        # The executor records on every dispatch (including gate/universe rejects).
 
                         # Cache research results for cross-cycle memory
                         if action == 'research' and last_result.success:

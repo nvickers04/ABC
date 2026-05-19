@@ -19,10 +19,8 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Literal, Optional
 
-# PR1: Canonical QualityMatrix lives in core/quality (hybrid design).
-# OperatingContext now delegates .matrix / .quality_matrix to the live
-# canonical instance (QualityMatrixService) for single source of truth.
-# Strong backward compat: legacy ContextQuality + old call sites remain functional.
+# Canonical QualityMatrix lives in core/quality; this module holds mode flags
+# and legacy ContextQuality for backward compatibility.
 try:
     from core.quality.quality_matrix import (
         QualityMatrix as _CoreQM,
@@ -137,41 +135,15 @@ class ContextQuality:
         return "\n".join(lines)
 
 
-# ── PR1 Complete: Canonical QualityMatrix Delegation ─────────────────────────
-# The authoritative QualityMatrix implementation (with ToolUsageRecord,
-# DecisionProvenanceSnapshot, populate(), recording, to_prompt_block(),
-# recommended_policies(), and strong enforcement APIs) now lives in
-# core/quality/quality_matrix.py and is exposed via QualityMatrixService.
-#
-# This module retains ONLY the legacy ContextQuality (for strong backward
-# compat during transition) + OperatingContext which now delegates .matrix
-# to the live canonical instance (via __post_init__ rebinding).
-# Old local ToolUsageSnapshot + prototype QualityMatrix removed (duplication
-# eliminated; single source of truth for PR1+).
-#
-# Population remains orchestration-driven (review.py + agent execution_analysis).
-# Recording hooks centralized primarily in tools_executor.py (PR1 requirement).
-# All existing call sites (ctx.quality, ctx.risk_multiplier, ctx.quality_matrix,
-# get_model_overrides, get_blocked..., set_researcher_*) continue to work.
-
-
-# ── OperatingContext (PR2 hybrid integration, PR1 core wired) ────────────────
 @dataclass
 class OperatingContext:
-    """
-    The trader's current operating context.
-    Single source of truth. Now carries both legacy ContextQuality (compat)
-    and the new QualityMatrix (orchestration driver for PR2+).
-    """
+    """Trader operating mode: researcher availability, memory source, quality summary."""
+
     quality: ContextQuality = field(default_factory=ContextQuality)
     matrix: QualityMatrix = field(default_factory=QualityMatrix)
-    _local_memory_conn: Optional[object] = None   # placeholder for local fallback DB
 
     def __post_init__(self) -> None:
-        """PR1: Rebind .matrix to the *live singleton* from QualityMatrixService.
-        This ensures OperatingContext always surfaces the canonical populated matrix
-        (with to_prompt_block, enforcement, provenance, etc.) rather than a disconnected copy.
-        """
+        """Rebind .matrix to the live QualityMatrixService singleton when available."""
         try:
             if get_quality_matrix_service is not None:
                 svc = get_quality_matrix_service()
@@ -192,14 +164,10 @@ class OperatingContext:
         if self.quality.memory_source == "postgres":
             self.quality.memory_source = "local_fallback"
         self._recalculate_overall_quality()
-        # Sync hint to canonical matrix (PR1 core; update_researcher is a lightweight compat shim)
         try:
             self.matrix.update_researcher(False)
         except Exception:
             pass
-        # PR2: Trigger canonical QualityMatrix re-population so that
-        # overall_quality, risk_multiplier, blocked categories, and LLM config
-        # immediately reflect the degraded researcher state.
         self._refresh_canonical_matrix()
 
     def set_researcher_available(self):
@@ -211,9 +179,8 @@ class OperatingContext:
             self.matrix.update_researcher(True)
         except Exception:
             pass
-        # PR2: Refresh canonical so full-quality policies are restored.
         self._refresh_canonical_matrix()
-        # Option A recovery observability (no merge). See docs/policy-independent-mode-memory.md
+        # Recovery log only (no merge). See docs/operations/independent-mode.md
         try:
             from core.runtime.working_memory_access import log_wm_recovery_on_reconnect
 
@@ -244,7 +211,7 @@ class OperatingContext:
         return 0.85
 
     def sync_researcher_from_heartbeat(self) -> bool:
-        """Reconcile researcher availability with the live daemon heartbeat.
+        """Reconcile researcher availability with the live research host heartbeat.
 
         Returns True when the researcher is considered available.
         """
@@ -274,9 +241,7 @@ class OperatingContext:
         )
 
     def _refresh_canonical_matrix(self) -> None:
-        """PR2 helper: ask the canonical service to re-populate using current ctx state.
-        Safe, non-fatal; used on researcher flips and startup.
-        """
+        """Re-populate QualityMatrix from current context (non-fatal)."""
         try:
             if get_quality_matrix_service is not None:
                 svc = get_quality_matrix_service()
@@ -288,10 +253,7 @@ class OperatingContext:
 
     @property
     def risk_multiplier(self) -> float:
-        """PR2: Strongly prefer the *canonical* QualityMatrix risk_multiplier.
-        The core matrix (populated from exec feedback + researcher state) is authoritative.
-        We take the more conservative of (core, legacy) to never accidentally increase risk.
-        """
+        """Conservative blend of QualityMatrix and legacy context risk."""
         core_rm = 1.0
         try:
             if get_quality_matrix_service is not None:
@@ -306,12 +268,9 @@ class OperatingContext:
         # Conservative: never take the larger value
         return min(core_rm, legacy)
 
-    # ── Convenience accessors for PR2 wiring ────────────────────────────────
     @property
     def quality_matrix(self) -> "Any":
-        """Primary object for orchestration consumers (PR2).
-
-        Returns the *canonical* QualityMatrix from core/quality when available.
+        """Canonical QualityMatrix from core/quality when available.
         This is the source of truth for to_prompt_block(), get_llm_call_config(),
         recommended_policies(), blocked_tool_categories, should_allow_tool(), etc.
         Falls back to the local shim only on import/bootstrap failure.
@@ -326,7 +285,7 @@ class OperatingContext:
         return self.matrix
 
     def record_tool_usage(self, *a, **k):
-        """PR2: Proxy to *both* local (compat) and canonical service (authoritative)."""
+        """Proxy to matrix; canonical recording is in ToolExecutor."""
         self.matrix.record_tool_usage(*a, **k)
         try:
             if get_quality_matrix_service is not None:
@@ -344,7 +303,7 @@ class OperatingContext:
         # Canonical provenance is recorded via DecisionProvenanceSnapshot in agent loop directly to service.
 
     def get_model_overrides(self) -> Dict[str, Any]:
-        """PR2: Prefer canonical matrix.get_llm_call_config() (richer)."""
+        """LLM sampling overrides from canonical matrix when available."""
         try:
             if get_quality_matrix_service is not None:
                 svc = get_quality_matrix_service()
@@ -362,7 +321,7 @@ class OperatingContext:
         return self.matrix.get_model_overrides()
 
     def get_blocked_tool_categories(self) -> List[str]:
-        """PR2: Return canonical blocked list."""
+        """Blocked tool categories from canonical matrix when available."""
         try:
             if get_quality_matrix_service is not None:
                 svc = get_quality_matrix_service()

@@ -550,9 +550,8 @@ def init_db():
         CREATE INDEX IF NOT EXISTS idx_grad_params_key ON graduated_params(param_key);
         CREATE INDEX IF NOT EXISTS idx_calib_slip_lookup ON calibrated_slippage(order_type, time_bucket, atr_bucket);
 
-        -- PR1 QualityMatrix provenance (tool-usage purist + decision snapshots)
-        -- Additive, decision-scoped (no per-trade attribution). Populated by
-        -- QualityMatrixService hooks in review + agent cycle.
+        -- QualityMatrix provenance (tool usage + decision snapshots)
+        -- Additive, decision-scoped. Populated by QualityMatrixService hooks.
         CREATE TABLE IF NOT EXISTS tool_usage_log (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             ts TEXT NOT NULL,
@@ -720,8 +719,7 @@ def init_db():
         -- trigger fires we record fired_ts/fire_value and the cycle
         -- prompt renders an ATTENTION block.  Cap: 10 active rows
         -- (oldest active evicted on insert).
-        -- See docs/PLAN_COGNITIVE_ARCHITECTURE.md §4 and
-        -- core/runtime/attention.py.
+        -- See core/runtime/attention.py.
         CREATE TABLE IF NOT EXISTS attention_triggers (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             symbol TEXT NOT NULL,
@@ -814,10 +812,7 @@ def _migration_v2_reset_forward_return_pipeline(conn) -> None:
 
 
 def _migration_v3_add_quality_provenance_tables(conn) -> None:
-    """PR1: Additive tables for QualityMatrix provenance (tool usage + decision
-    snapshots).  Tables use IF NOT EXISTS inside the main schema script as well,
-    so this migration is primarily for version stamping + future non-additive work.
-    """
+    """Schema v3: QualityMatrix provenance tables (version stamp; tables also in init DDL)."""
     # Tables are created idempotently in the main init script; migration just records
     # that v3 was applied. No data transform needed.
     pass
@@ -826,7 +821,7 @@ def _migration_v3_add_quality_provenance_tables(conn) -> None:
 _MIGRATIONS: list[tuple[int, str, callable]] = [
     (2, "reset forward-return pipeline for per-signal entry_bar_ts keying",
      _migration_v2_reset_forward_return_pipeline),
-    (3, "add tool_usage_log + decision_provenance tables for QualityMatrix (PR1)",
+    (3, "add tool_usage_log + decision_provenance tables for QualityMatrix",
      _migration_v3_add_quality_provenance_tables),
 ]
 
@@ -1597,7 +1592,7 @@ def get_calibrated_slippage() -> dict[tuple[str, str, str], float]:
     return _impl()
 
 
-# ── QualityMatrix provenance helpers (PR1) ────────────────────────
+# ── QualityMatrix provenance helpers ──────────────────────────────
 # Thin wrappers used by core.quality.quality_matrix; keep logic in the
 # service but expose simple insert / query for tests and direct use.
 

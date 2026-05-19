@@ -36,7 +36,7 @@ async def run_preflight_open_orders(executor: ToolExecutor, *, symbol: str) -> d
         "total_open_orders": len(orders),
         "open_orders_for_symbol": len(same),
         "hint": (
-            "Cancel working orders for this symbol in TWS before smoke_all_tools if IB returns "
+            "Cancel working orders for this symbol in TWS before smoke_tools --all if IB returns "
             "max working orders per side."
         ),
     }

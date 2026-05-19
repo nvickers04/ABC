@@ -7,7 +7,7 @@ Local JSON fallback is used in Independent Mode or when Postgres WM is unreachab
 All agent and tool write/read paths should use get_active_working_memory() so
 routing stays consistent.
 
-Recovery policy (researcher reconnect): see docs/policy-independent-mode-memory.md
+Recovery policy (researcher reconnect): see docs/operations/independent-mode.md
 """
 
 from __future__ import annotations
@@ -109,7 +109,7 @@ def log_wm_recovery_on_reconnect(*, had_local_fallback: bool) -> dict[str, Any]:
 
     Called from OperatingContext.set_researcher_available(). Local entries written
     during Independent Mode remain in data/local_working_memory.json; Postgres is
-    authoritative for new writes. See docs/policy-independent-mode-memory.md.
+    authoritative for new writes. See docs/operations/independent-mode.md.
     """
     summary = summarize_wm_stores()
     local_n = int(summary["local"].get("total", 0))

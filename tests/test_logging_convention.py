@@ -3,7 +3,7 @@
 Locks the project-wide convention that every module declaring a
 module-level ``logger`` uses ``logging.getLogger(__name__)`` (so log
 records carry the dotted package path, which the rotating file handler
-in ``__main__.setup_logging`` relies on).
+in ``core.log_setup.configure_root_logging`` (via ``__main__.setup_logging``) relies on).
 
 Also enforces that no business-logic module contains stray top-level
 ``print(...)`` calls. Acceptable exceptions: ``__main__.py`` (CLI),

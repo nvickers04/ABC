@@ -1,14 +1,14 @@
 """
-QualityMatrix Core (PR1).
+QualityMatrix — host-side context and execution quality policy.
 
-Dataclasses + Service implementing the hybrid design:
+Dataclasses + service implementing the hybrid design:
 - Reuses existing evaluation engines (trade_feedback, execution_snapshots,
   calibrated_slippage, graduated_params, daily review outputs).
 - First-class ToolUsageRecord and DecisionProvenanceSnapshot for provenance
   (decision-scoped; explicitly avoids noisy per-trade / per-tool outcome
   attribution as diagnosed in session analysis).
-- Orchestration-heavy: provides to_prompt_block() + recommended_policies()
-  for later wiring (PR2). Population primarily from internal hooks.
+- Orchestration-heavy: provides to_prompt_block() + recommended_policies().
+  Population from daily review, execution analysis, and cycle hooks.
 - research_config knobs for enablement, retention, scoring weights.
 - Singleton service pattern consistent with get_operating_context().
 
@@ -108,13 +108,11 @@ class QualityMatrix:
     recent_tool_usage: list[ToolUsageRecord] = field(default_factory=list)
     recent_provenance: list[DecisionProvenanceSnapshot] = field(default_factory=list)
 
-    # Orchestration guidance (consumed by PR2 wiring)
     suggested_temperature: float = 0.3
     suggested_max_tokens: int = 2048
     force_conservative_reasoning: bool = False
     blocked_tool_categories: list[str] = field(default_factory=list)  # e.g. ["research", "complex_options"]
 
-    # Added for strong PR2 orchestration (global aggregate for quick policy)
     global_execution_quality: float = 0.5
 
     last_populated: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
@@ -183,8 +181,8 @@ class QualityMatrix:
             "notes": (sq.notes if sq else "") or f"overall={self.overall_quality}",
         }
 
-    # ── Strong Orchestration Enforcement APIs (PR2 Strong Control Variant) ────
-    # These give the QualityMatrix real teeth: host code (not the LLM) makes
+    # ── Host enforcement (hard gates; LLM cannot bypass) ─────────────────────
+    # Host code (not the LLM) makes
     # irreversible decisions. The LLM sees the state via to_prompt_block() +
     # quality_* tools (soft), but cannot bypass the gates below (hard).
 
@@ -245,7 +243,7 @@ class QualityMatrix:
         surfaced to the LLM as a ToolResult so it can adapt, but the action
         is never executed.
 
-        This is the key "real teeth" mechanism for PR2 Strong variant.
+        Host is authoritative; the LLM only sees the rejection reason.
         """
         params = params or {}
         cat = self._categorize_tool(action)
@@ -300,11 +298,7 @@ class QualityMatrix:
         rm = pol["risk_multiplier"]
         return rm > 0.40 and self.overall_quality not in ("minimal", "degraded")
 
-    # ── Transition compatibility shims (PR1 strong compat with pre-existing OperatingContext / ContextQuality) ──
-    # These allow legacy call sites (ctx.matrix.xxx, scheduler, agent fallbacks) to keep working
-    # without modification while the canonical implementation lives in core/quality.
-    # Real population / recording / policy still flows through QualityMatrixService + populate().
-    # Once PR2/3 stabilize, these can be removed after callers migrate to direct service or recommended_policies().
+    # ── Lightweight hooks on OperatingContext (population stays on QualityMatrixService) ──
 
     def update_researcher(self, available: bool, ts: Optional[datetime] = None) -> None:
         """Light hint from OperatingContext.set_researcher_*.
@@ -317,15 +311,12 @@ class QualityMatrix:
 
     def record_tool_usage(self, tool_name: str, symbol: Optional[str] = None,
                           freshness: float = 1.0, source: str = "live", **meta: Any) -> None:
-        """Legacy shim (pre-PR1 OperatingContext style).
-        The primary path is QualityMatrixService.record_tool_usage(ToolUsageRecord).
-        This is a no-op to avoid double-recording; direct service calls are authoritative."""
+        """No-op — ToolUsageRecord is recorded via QualityMatrixService in the executor."""
         # Intentionally minimal — real provenance captured in executor/agent via service.
         pass
 
     def snapshot_decision(self, action: str, symbols: Optional[list[str]] = None, tools_used: Optional[list[str]] = None) -> None:
-        """Legacy shim for decision provenance.
-        Primary mechanism is record_decision_snapshot(DecisionProvenanceSnapshot) on the service."""
+        """No-op — provenance is recorded via QualityMatrixService.record_decision_snapshot."""
         pass
 
     def get_model_overrides(self) -> dict[str, Any]:
@@ -681,37 +672,3 @@ def get_quality_matrix_service() -> QualityMatrixService:
 def reset_quality_matrix_service_for_tests() -> None:
     """Drop the process singleton so tests start from a clean matrix."""
     QualityMatrixService._instance = None
-
-
-# ── Open design decisions (PR1) ─────────────────────────────────────────────
-"""
-1. Table placement: tool_usage_log / decision_provenance live in main DB
-   alongside trade_feedback (simple). Future PR4 could move to dedicated
-   quality/ repo + separate connection if volume grows.
-
-2. SymbolQuality derivation: currently simple linear mapping from avg_gap.
-   Could incorporate calibrated_slippage buckets or graduated_param success
-   per-symbol in future iterations.
-
-3. Cycle_id in records: currently 0 when recorded from tool path; agent
-   can pass real cycle_id. Acceptable for v1.
-
-4. No automatic back-fill of outcomes into old records (by design, per
-   attribution diagnosis). Offline analysis jobs can correlate later.
-
-5. Integration with OperatingContext: PR1 keeps separate singleton.
-   PR2 will likely add `quality_matrix: QualityMatrix` field or a
-   quality_adapter that merges risk_multiplier + to_prompt_block.
-
-6. Persistence of full matrix state: only logs + provenance are durable.
-   Matrix is rebuilt on populate() from source data + logs. Keeps it
-   consistent and avoids sync bugs.
-
-7. research_config keys used:
-   - quality_matrix_enabled (float 0/1)
-   - quality_matrix_max_tools
-   - quality_matrix_max_provenance
-   - quality_matrix_last_populated (written by service)
-
-All decisions favor safe incremental integration over clean-slate invention.
-"""

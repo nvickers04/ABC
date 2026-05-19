@@ -15,8 +15,7 @@ It is purely derived state — every value here can be regenerated from
 
 This module DOES NOT modify combiner weights.  It just measures and
 persists.  The cognitive / intuition layer will read these rows via
-:func:`per_symbol_modifier` once it's wired in (see
-docs/PLAN_COGNITIVE_ARCHITECTURE.md).  Until then the modifier returns
+:func:`per_symbol_modifier` when fully wired in.  Until then the modifier returns
 the conservative default of ``1.0`` whenever ``n_obs`` is below the
 cadence-aware minimum, so callers can opt in early without changing
 behavior.

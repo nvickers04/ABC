@@ -292,7 +292,7 @@ class StateContextBuilder:
         except Exception as e:
             logger.debug(f"Portfolio risk summary failed: {e}")
 
-        # ── Research engine status (in-process scorer; evolution is research_daemon-only) ──
+        # ── Research engine status (in-process scorer; evolution is research-host-only) ──
         try:
             from signals import scorer as _sc
             from signals import template_evolution as _te
@@ -328,7 +328,7 @@ class StateContextBuilder:
             lines.append(
                 f"═══ RESEARCH ENGINE ═══ scorer={sc_state}  "
                 f"evolution_in_this_process={te_local}  "
-                f"(template evolution runs in research_daemon.py)  "
+                f"(template evolution runs in python -m research)  "
                 f"edge_snapshot={age_str}"
             )
             lines.append("(scorer control via research_engine; evolution is not on the trader)")

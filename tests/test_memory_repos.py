@@ -9,7 +9,7 @@ existing imports.
 from __future__ import annotations
 
 import memory
-from memory.repos import config_repo, execution_repo, feedback_repo, schema
+from memory.repos import config_repo, execution_repo, feedback_repo, provenance_repo, schema
 
 
 class TestSchemaRepo:
@@ -67,6 +67,19 @@ class TestExecutionRepo:
         ]
         for name in names:
             assert callable(getattr(execution_repo, name)), name
+            assert callable(getattr(memory, name)), name
+
+
+class TestProvenanceRepo:
+    def test_legacy_imports_still_work(self):
+        names = (
+            "insert_tool_usage_log",
+            "insert_decision_provenance",
+            "get_recent_tool_usage",
+            "get_recent_decision_provenance",
+        )
+        for name in names:
+            assert callable(getattr(provenance_repo, name)), name
             assert callable(getattr(memory, name)), name
 
 

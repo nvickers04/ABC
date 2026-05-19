@@ -1,6 +1,6 @@
 # Trader stack — Grok ReAct agent + IBKR execution (paper or live).
 # Do NOT run alongside research on same container (LLM spend + IBKR client_id conflict).
-# Research daemon (scorer + evolution) runs on research host or separate compose.
+# Research host (scorer + evolution) runs on research machine or separate compose.
 #
 # Requires:
 # - .env with GROK_API_KEY, IBKR_*, DATABASE_URL (or PG*) pointing at shared Postgres.

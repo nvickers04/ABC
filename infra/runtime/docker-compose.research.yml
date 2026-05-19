@@ -51,7 +51,7 @@ services:
       context: ../..
       dockerfile: infra/runtime/Dockerfile.research
     image: abc-research:latest
-    container_name: abc-research-daemon
+    container_name: abc-research-host
     restart: unless-stopped
     env_file:
       - ../../.env

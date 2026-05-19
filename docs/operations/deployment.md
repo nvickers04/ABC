@@ -8,7 +8,7 @@ database.
 
 ## Architecture (principles)
 
-1. **Two-process decoupling** — `python -m research` on research host only; `__main__.py` on trader with `TRADER_IN_PROCESS_SCORER=never` and `--require-daemon` in production.
+1. **Two-process decoupling** — `python -m research` on research host only; `__main__.py` on trader with `TRADER_IN_PROCESS_SCORER=never` and `--require-research-host` in production.
 2. **Thin tools, thick brain** — `core/agent.py` decides; `tools/` execute.
 3. **Cash-only, deterministic LLM** — `TotalCashValue` sizing; `temperature=0`, `seed=42` (QualityMatrix may tighten further).
 4. **Key modules:** `core/quality/quality_matrix.py`, `core/runtime/operating_context.py`, `memory/`, `signals/scorer.py`.
@@ -18,7 +18,7 @@ Researcher writes → Postgres → trader reads each cycle. No direct IPC. When 
 ```
 Research host                          Trader host
 ─────────────────                      ─────────────────
-python -m research                     python __main__.py --require-daemon
+python -m research                     python __main__.py --require-research-host
   scorer, templates, heartbeat           Grok + ToolExecutor + IBKR
   MDA / signal pipeline                  reads signals, WM, hypotheses from DB
          │                                        │
@@ -45,13 +45,13 @@ is **PostgreSQL only** — no SQLite fallback in current builds.
 - Runs scorer + template evolution; **does not** call Grok.
 - Primary market data: MarketData.app (token cap enforced).
 - `IBKR_QUOTES_ENABLED=0` internally — no IBKR market-data lines on this box.
-- MDA health check at startup; daemon exits if unhealthy.
+- MDA health check at startup; research host exits if unhealthy.
 - Daily cap: `RESEARCHER_DAILY_TOKEN_CAP` (default 100000) in `research_config`.
 
 ### Trader host
 
 - Grok ReAct loop + IBKR execution only.
-- **Production:** `TRADER_IN_PROCESS_SCORER=never` and `--require-daemon` so the
+- **Production:** `TRADER_IN_PROCESS_SCORER=never` and `--require-research-host` so the
   trader never starts a second in-process scorer when the research host heartbeat is stale.
 - `--force-in-process` is **dev/single-machine only**.
 - IBKR streaming (stocks + options) lives here only.
@@ -63,7 +63,7 @@ is **PostgreSQL only** — no SQLite fallback in current builds.
 | Host | Command |
 |------|---------|
 | Research | `python -m research` or `scripts/run_research.ps1` |
-| Trader (production) | `TRADER_IN_PROCESS_SCORER=never` then `python __main__.py --require-daemon --verbose` |
+| Trader (production) | `TRADER_IN_PROCESS_SCORER=never` then `python __main__.py --require-research-host --verbose` |
 
 ### Research host
 
@@ -95,7 +95,7 @@ Direct (production):
 
 ```powershell
 $env:TRADER_IN_PROCESS_SCORER = "never"
-python __main__.py --require-daemon --verbose
+python __main__.py --require-research-host --verbose
 ```
 
 Paper soak before live: see [launch-checklist.md](launch-checklist.md).
@@ -132,7 +132,7 @@ SELECT key, value FROM research_config WHERE key LIKE 'researcher_daily_usage_%'
 | Mistake | Why it hurts |
 |---------|----------------|
 | `__main__.py` on research host | Grok spend every cycle |
-| Bare `python __main__.py` on trader (split-host) | In-process scorer duplicates daemon |
+| Bare `python __main__.py` on trader (split-host) | In-process scorer duplicates research host |
 | Different DB or stale commit on one host | Stale signals, schema drift |
 | Dual-write WM to Postgres + local JSON | Drift — see [independent-mode.md](independent-mode.md) |
 

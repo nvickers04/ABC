@@ -44,7 +44,7 @@ else {
 }
 
 Write-Host ""
-Write-Host "== Latest heartbeat (daemon_heartbeat_ts) =="
+Write-Host "== Latest heartbeat (research_host_heartbeat_ts) =="
 $py = Get-PythonExe
 if (-not $py) {
     throw "Could not find Python on PATH. Install Python or use 'py' launcher, then retry."
@@ -52,7 +52,9 @@ if (-not $py) {
 $heartbeatCode = @'
 import memory
 db = memory.get_db()
-r = db.execute("SELECT value FROM research_config WHERE key = ?", ("daemon_heartbeat_ts",)).fetchone()
+r = db.execute("SELECT value FROM research_config WHERE key = ?", ("research_host_heartbeat_ts",)).fetchone()
+if not r:
+    r = db.execute("SELECT value FROM research_config WHERE key = ?", ("daemon_heartbeat_ts",)).fetchone()
 print(r["value"] if r else "no heartbeat")
 '@
 if ($py.PrefixArgs.Count -gt 0) {

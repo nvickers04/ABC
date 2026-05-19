@@ -18,7 +18,7 @@ When consolidating, renaming, or relocating docs, scripts, or entry points:
 1. **Grep the repo** for the old path, basename, and command strings (see “Removed paths” in `docs/engineering.md`).
 2. **Update** README, ops docs, Docker `CMD`, scripts, `.cursor/rules`, comments, and user-facing strings.
 3. **Delete** obsolete files after references are clean.
-4. Prefer the **canonical location** (e.g. `research/daemon.py` + `python -m research`, not a root launcher shim).
+4. Prefer the **canonical location** (e.g. `research/host.py` + `python -m research`, not a root launcher shim).
 5. Verify with search: no remaining links to deleted paths.
 
 ## Code entry points

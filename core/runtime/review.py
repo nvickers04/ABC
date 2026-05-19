@@ -1,12 +1,8 @@
-"""End-of-day review extracted from ``core.agent.TradingAgent``.
+"""End-of-day review and risk-ramp logic extracted from ``TradingAgent``.
 
-Daily review and risk-ramp logic extracted from ``TradingAgent``.
-async function that takes the agent as its first argument. ``TradingAgent``
-keeps a thin method that delegates here so the rest of the codebase is
-unaffected.
-
-Byte-identical behavior is preserved: same imports, same SQL, same logging
-strings, same error swallowing.
+Each entry point is an async function (or plain function for risk ramp) that
+takes the agent or DB handle as its first argument. ``TradingAgent`` keeps thin
+methods that delegate here so tools and tests stay stable.
 """
 
 from __future__ import annotations
@@ -63,7 +59,8 @@ async def run_daily_review(agent) -> None:
         # 2. Execution analysis: triggered by data threshold
         new_snaps = get_new_snapshot_count()
         if new_snaps >= 10:
-            await agent._run_execution_analysis()
+            from core.runtime.execution_analysis import run_execution_analysis
+            await run_execution_analysis(agent)
 
         # 3. Risk ramp-up evaluation (live mode only: 0.5% → 1.0%)
         if TRADING_MODE == "live":

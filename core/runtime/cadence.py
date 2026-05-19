@@ -1,7 +1,7 @@
 """
-Session-aware cadence for the research daemon.
+Session-aware cadence for the research host (``python -m research``).
 
-Returns the seconds-between-rounds the daemon should sleep based on
+Returns the seconds-between-rounds the research host should sleep based on
 the current ET wall-clock.  Pure-function helpers — no IBKR, no DB —
 so it's trivially testable and can run in any process.
 

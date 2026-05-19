@@ -24,7 +24,7 @@ or shared state. Local WM alone is not enough to trade safely — it only preser
 short-term theses and notes.
 
 On split-host production, a **stale heartbeat** means no fresh research, not “no
-database.” Fix the daemon or network before assuming Postgres is down.
+database.” Fix the research host or network before assuming Postgres is down.
 
 ---
 
@@ -77,7 +77,7 @@ remain on Postgres; QualityMatrix reduces trust in research tools when degraded.
 
 | Situation | Action |
 |-----------|--------|
-| Heartbeat stale | `python scripts/health.py researcher`; fix daemon |
+| Heartbeat stale | `python scripts/health.py researcher`; fix research host (`python -m research`) |
 | After long independent run | Grep logs for `WM recovery:` |
 | Local file growth | Normal; gitignored |
 

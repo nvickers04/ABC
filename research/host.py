@@ -8,7 +8,7 @@ Run on the research machine:
     python -m research --no-evolution
 
 Heartbeat is written each scoring round into ``research_config`` so the trader
-can skip its in-process scorer when the daemon is healthy.
+can skip its in-process scorer when the research host is healthy.
 """
 
 from __future__ import annotations
@@ -42,12 +42,12 @@ async def _run(*, verbose: bool, run_evolution: bool) -> None:
 
     from signals.scorer import run_research
 
-    logger.info("Research daemon online — cadence mode enabled")
+    logger.info("Research host online — cadence mode enabled")
     await run_research(verbose=verbose, use_cadence=True)
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="ABC research daemon (no LLM)")
+    parser = argparse.ArgumentParser(description="ABC research host (no LLM)")
     parser.add_argument("--verbose", action="store_true", help="DEBUG logging")
     parser.add_argument(
         "--no-evolution",
@@ -108,7 +108,7 @@ def main() -> None:
             except Exception as mda_err:
                 logger.critical("MDA HEALTH CHECK FAILED: %s", mda_err)
                 logger.critical(
-                    "Research daemon refusing to start — fix MDA on this host."
+                    "Research host refusing to start — fix MDA on this host."
                 )
                 sys.exit(3)
 
@@ -140,7 +140,7 @@ def main() -> None:
             "Researcher boundary check non-fatal: %s (proceeding)", bound_err
         )
 
-    print("=== Research daemon ===")
+    print("=== Research host ===")
     print("Scorer + template evolution. No Grok, no IBKR orders. Ctrl+C to stop.\n")
 
     loop = asyncio.new_event_loop()

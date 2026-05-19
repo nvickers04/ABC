@@ -8,29 +8,7 @@ import numpy as np
 import pytest
 
 
-# ── Fixtures (mirror tests/test_signals.py) ──────────────────────
-
-@pytest.fixture(autouse=True)
-def _isolated_db(tmp_path, monkeypatch):
-    """Fresh temp DB per test."""
-    import memory
-    db_path = tmp_path / "test.db"
-    monkeypatch.setattr(memory, "_DB_PATH", db_path)
-    # _connection no longer exists (Postgres migration) — using robust conftest _isolated_db instead
-    # monkeypatch.setattr(memory, "_connection", None)  # removed to prevent AttributeError
-    monkeypatch.setattr(memory, "_calibration_version", 0)
-    memory._pending_graduated_params.clear()
-    memory._pending_order_context.clear()
-    try:
-        memory.init_db()
-    except Exception as e:
-        import pytest
-        if "PostgreSQL" in str(e) or "connection" in str(e).lower() or "permission" in str(e).lower():
-            pytest.skip(f"Postgres unavailable in this env: {e}")
-        raise
-    yield
-    # teardown handled by conftest reset_state (or best-effort)
-    pass
+# DB isolation: uses ``tests/conftest.py`` autouse ``_isolated_db``.
 
 
 @pytest.fixture

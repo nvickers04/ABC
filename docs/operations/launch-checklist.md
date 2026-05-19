@@ -2,7 +2,7 @@
 
 **Use before every live deployment and after any code change.**
 
-**Entry points:** [../entry-points.md](../entry-points.md) — research host `python -m research`, trader `python __main__.py --require-daemon`.
+**Entry points:** [../entry-points.md](../entry-points.md) — research host `python -m research`, trader `python __main__.py --require-research-host`.
 
 ## 1. Pre-flight environment
 - [ ] `cp .env.template .env` — `GROK_API_KEY`, `IBKR_ACCOUNT_ID`, `DATABASE_URL`, `TRADING_MODE`
@@ -33,7 +33,7 @@
 
 ## 6. Live gate
 - [ ] `TRADING_MODE=live`, `RISK_PER_TRADE` ≤0.5% (or ramp-approved)
-- [ ] `python __main__.py --require-daemon --verbose`
+- [ ] `python __main__.py --require-research-host --verbose`
 - [ ] First cycles: cheap tools; hypotheses and execution_status reviewed
 
 ## 7. Post-launch (48h)
@@ -43,6 +43,6 @@
 ## 8. Rollback
 - `docker compose ... down`, revert image/tag, `git checkout <last-good>`
 
-When green: `TRADING_MODE=live python __main__.py --require-daemon`
+When green: `TRADING_MODE=live python __main__.py --require-research-host`
 
 See [entry-points.md](../entry-points.md), [deployment.md](deployment.md), [postgres.md](postgres.md), [../data-sources.md](../data-sources.md), [../engineering.md](../engineering.md).

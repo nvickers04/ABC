@@ -9,7 +9,7 @@ Usage:
 
 Research (scoring + template evolution) lives in ``python -m research``. This process
 only starts an in-process scorer when the research host heartbeat is absent/stale (unless
-``TRADER_IN_PROCESS_SCORER=never`` / ``--require-daemon``, which forbid that fallback).
+``TRADER_IN_PROCESS_SCORER=never`` / ``--require-research-host``, which forbid that fallback).
 
 Built for Grok (xAI) — dynamic liquidity, overnight holds OK, configurable risk.
 """
@@ -93,14 +93,18 @@ def main():
     parser.add_argument("--no-research", action="store_true",
                         help="Don't pre-start the background scorer "
                              "(agent can still start it via research_engine tool)")
-    daemon_group = parser.add_mutually_exclusive_group()
-    daemon_group.add_argument(
-        "--require-daemon", action="store_true",
+    research_host_group = parser.add_mutually_exclusive_group()
+    research_host_group.add_argument(
+        "--require-daemon",
+        "--require-research-host",
+        action="store_true",
+        dest="require_research_host",
         help="Refuse to start unless the research host is alive (fresh heartbeat). "
-             "Same effect as TRADER_IN_PROCESS_SCORER=never for this flag alone. "
-             "Use in production to guarantee the agent never silently runs the scorer in-process.",
+             "Alias: --require-daemon (legacy). Same effect as TRADER_IN_PROCESS_SCORER=never "
+             "for this flag alone. Use in production so the trader never silently runs "
+             "the scorer in-process.",
     )
-    daemon_group.add_argument(
+    research_host_group.add_argument(
         "--force-in-process", action="store_true",
         help="Always run the scorer in-process, even if the research host heartbeat is fresh. "
              "Useful for dev/debug when you want one process to own everything.",
@@ -154,18 +158,20 @@ def main():
     from core.agent import run_agent
 
     if not args.no_research:
-        # --require-daemon / TRADER_IN_PROCESS_SCORER=never → hard-fail if no fresh heartbeat
+        # --require-research-host / TRADER_IN_PROCESS_SCORER=never → hard-fail if no fresh heartbeat
         # --force-in-process → always run scorer in-process (dev/debug; wins over env gate)
         # default (auto) → fresh research host heartbeat → skip in-process scorer
         from core.runtime.heartbeat import heartbeat_age_s, is_research_host_alive
         from core.config import TRADER_IN_PROCESS_SCORER_NEVER
 
-        daemon_alive = is_research_host_alive()
-        require_daemon = bool(args.require_daemon or TRADER_IN_PROCESS_SCORER_NEVER)
+        research_host_alive = is_research_host_alive()
+        require_research_host = bool(
+            args.require_research_host or TRADER_IN_PROCESS_SCORER_NEVER
+        )
 
         if args.force_in_process:
             from signals.scorer import run_research_threaded
-            if daemon_alive:
+            if research_host_alive:
                 print(
                     "Scoring: in-process (--force-in-process; double-writes vs research host — "
                     "dev/debug only).\n"
@@ -176,26 +182,26 @@ def main():
                     "Scoring: in-process (--force-in-process; no research host heartbeat).\n"
                 )
             run_research_threaded(verbose=args.verbose)
-        elif require_daemon and not daemon_alive:
+        elif require_research_host and not research_host_alive:
             age = heartbeat_age_s()
             age_str = "never" if age == float("inf") else f"{age:.1f}s"
             hint = ""
-            if TRADER_IN_PROCESS_SCORER_NEVER and not args.require_daemon:
+            if TRADER_IN_PROCESS_SCORER_NEVER and not args.require_research_host:
                 hint = " (TRADER_IN_PROCESS_SCORER=never in .env)"
             msg = (
                 f"Research scorer unavailable: no fresh research host heartbeat "
                 f"(age={age_str}){hint}. Start ``python -m research`` on the research host, "
                 f"or pass --force-in-process for dev only."
             )
-            if args.require_daemon and not TRADER_IN_PROCESS_SCORER_NEVER:
+            if args.require_research_host and not TRADER_IN_PROCESS_SCORER_NEVER:
                 msg = (
-                    f"--require-daemon set but research host heartbeat is stale "
+                    f"--require-research-host set but heartbeat is stale "
                     f"(age={age_str}). Start python -m research first, or drop the flag."
                 )
             print(msg)
             logger.error(msg)
             sys.exit(2)
-        elif daemon_alive:
+        elif research_host_alive:
             age = heartbeat_age_s()
             print(
                 f"Scoring: remote (research host heartbeat {age:.0f}s ago) — "

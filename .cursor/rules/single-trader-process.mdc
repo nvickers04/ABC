@@ -1,5 +1,5 @@
 ---
-description: Integrated Terminal + transcript visibility; single trader; split-host use --require-daemon; no silent in-process scorer
+description: Integrated Terminal + transcript visibility; single trader; split-host use --require-research-host; no silent in-process scorer
 alwaysApply: true
 ---
 
@@ -16,7 +16,7 @@ Cursor agent **background** shell jobs often **do not** show up as a normal Term
 3. **Interactive, long-lived, or spendy** jobs (traders, daemons, dev servers, watch mode, anything using LLM/IBKR keys, anything expected to run until stopped): do **not** rely on agent-only or hidden execution. Give the user the **exact command** to run in **Cursor’s integrated Terminal** (**Terminal → New Terminal** / the bottom panel). That is the **default** place they should run and watch the process (live output, **Ctrl+C**). Do **not** spawn a separate OS window via `Start-Process powershell`, `Start-Process cmd`, etc. **unless** the user explicitly asks for an external window.
 4. **Never** start a process the user cannot observe or correlate with a command they recognize.
 
-## Single trader / daemon (duplicate prevention)
+## Single trader / research host (duplicate prevention)
 
 Running **multiple** `python __main__.py` (Grok trader) or parallel **research** long-runners multiplies **xAI spend**, **IBKR client IDs**, and confusing logs.
 
@@ -31,11 +31,11 @@ When the user (or you) asks to **run**, **start**, **try again**, or start the G
 
 ## Research host + trader machine (shared Postgres)
 
-This repo supports **one research machine** (Postgres + `python -m research`) and a **separate trader machine** (`__main__.py`). Both use the **same** Postgres (`DATABASE_URL` / `PG*`) so the daemon’s heartbeat row is visible to the trader.
+This repo supports **one research machine** (Postgres + `python -m research`) and a **separate trader machine** (`__main__.py`). Both use the **same** Postgres (`DATABASE_URL` / `PG*`) so the research host heartbeat row is visible to the trader.
 
-- **Bug to avoid:** `python __main__.py` **without** `--require-daemon` will start an **in-process scorer** whenever the research host heartbeat is **missing or stale**. That is a **second scorer** next to `python -m research` — duplicate cadence and **double-writes** into shared tables. That **breaks** the split-host model.
+- **Bug to avoid:** `python __main__.py` **without** `--require-research-host` will start an **in-process scorer** whenever the research host heartbeat is **missing or stale**. That is a **second scorer** next to `python -m research` — duplicate cadence and **double-writes** into shared tables. That **breaks** the split-host model.
 - **Do not** suggest or run bare `python __main__.py` / `python __main__.py --verbose` for **production** on the trader box when scoring is owned by a remote research host. Prefer:
-  - **`python __main__.py --verbose --require-daemon`** — refuse to start unless the research host heartbeat is fresh (fix `python -m research` or DB if it exits).
+  - **`python __main__.py --verbose --require-research-host`** — refuse to start unless the research host heartbeat is fresh (fix `python -m research` or DB if it exits). Legacy alias: `--require-daemon`.
   - **`--no-research`** only when the operator explicitly wants no auto-scorer on the trader (still understand tool/agent paths).
   - **`--force-in-process`** only when the user **explicitly** wants dev single-process mode (never default).
 - If the user’s setup is split-host, **call this out** whenever starting the trader so they never silently fall back to in-process scoring.

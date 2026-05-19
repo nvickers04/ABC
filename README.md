@@ -32,7 +32,7 @@ Grok (ReAct Brain)  →  Tools (thin wrappers)  →  IBKR Execution
 ├── memory/            # Postgres persistence, working memory, migrations
 ├── data/              # Market data, broker gateway, cost tracker
 ├── execution/         # IBKR orders and queries
-├── research/          # Universe config, simulator; daemon in research/daemon.py
+├── research/          # Universe config, simulator; research host in research/host.py
 ├── signals/           # Scorers, combiner, templates (used by research host)
 ├── docs/              # Ops and engineering (see docs/README.md)
 ├── scripts/           # run_research.ps1, health.py, smoke_tools.py, verify_trader_db.py
@@ -46,8 +46,8 @@ Grok (ReAct Brain)  →  Tools (thin wrappers)  →  IBKR Execution
 
 | Role | Production command | Code |
 |------|------------------|------|
-| **Research host** | `python -m research` | `research/daemon.py` |
-| **Trader** | `python __main__.py --require-daemon` | `__main__.py` → `core/agent.py` |
+| **Research host** | `python -m research` | `research/host.py` |
+| **Trader** | `python __main__.py --require-research-host` | `__main__.py` → `core/agent.py` |
 | **Health** | `python scripts/health.py` | `scripts/health.py` |
 
 Details, dev single-machine modes, Docker, and scripts: **[docs/entry-points.md](docs/entry-points.md)**.
@@ -80,7 +80,7 @@ Health: `python scripts/health.py`
 
 ### Production (two machines)
 
-See **[docs/entry-points.md](docs/entry-points.md)** — research: `python -m research`; trader: `python __main__.py --require-daemon` with `TRADER_IN_PROCESS_SCORER=never`.
+See **[docs/entry-points.md](docs/entry-points.md)** — research: `python -m research`; trader: `python __main__.py --require-research-host` with `TRADER_IN_PROCESS_SCORER=never`.
 
 ### Trader-only shortcuts
 
@@ -161,7 +161,7 @@ Tool interfaces are normalized for Grok tool-calling usage:
 ## Two-machine production
 
 Research host runs `python -m research` only (never `__main__.py`).
-Trader host runs `python __main__.py --require-daemon` with `TRADER_IN_PROCESS_SCORER=never`.
+Trader host runs `python __main__.py --require-research-host` with `TRADER_IN_PROCESS_SCORER=never`.
 Both share one **PostgreSQL** database.
 
 Full runbooks: **[docs/operations/deployment.md](docs/operations/deployment.md)** · [postgres](docs/operations/postgres.md) · [independent mode](docs/operations/independent-mode.md)

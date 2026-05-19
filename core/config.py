@@ -164,7 +164,7 @@ MULTI_AGENT_RESEARCH_ENABLED: bool = os.getenv(
 # The research host (python -m research: scorer + template evolution) on the researcher machine
 # host must NEVER run unbounded. MDA streaming must be healthy, and total daily
 # research activity (MDA credits / equivalent "tokens") is capped at 100k.
-# Enforced early in research.daemon and per-round in signals/scorer.py.
+# Enforced early in research.host and per-round in signals/scorer.py.
 RESEARCHER_DAILY_TOKEN_CAP: int = int(
     os.getenv("RESEARCHER_DAILY_TOKEN_CAP", "100000")
 )
@@ -197,7 +197,7 @@ IBKR_QUOTE_LINE_BUDGET: int = int(os.getenv("IBKR_QUOTE_LINE_BUDGET", "90"))
 # When TRADER_IN_PROCESS_SCORER=never (aliases: 0, false, off, remote_only, no),
 # the trader never starts ``signals.scorer`` in this process and **refuses to
 # start** unless ``python -m research`` has a fresh DB heartbeat (same hard
-# gate as ``--require-daemon``). The ``research_engine`` tool cannot start or
+# gate as ``--require-research-host``). The ``research_engine`` tool cannot start or
 # resume the scorer. ``--force-in-process`` still overrides for dev/debug.
 _TRADER_IPS_RAW = os.getenv("TRADER_IN_PROCESS_SCORER", "auto").strip().lower()
 TRADER_IN_PROCESS_SCORER_NEVER: bool = _TRADER_IPS_RAW in (

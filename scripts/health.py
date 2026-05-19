@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Health checks for research daemon and trader operating mode.
+"""Health checks for research host and trader operating mode.
 
   python scripts/health.py researcher
   python scripts/health.py trader
@@ -28,7 +28,7 @@ def _check_researcher() -> int:
     print("=== ABC Researcher Health ===\n")
     alive = is_research_host_alive()
     age = heartbeat_age_s()
-    print(f"Daemon heartbeat alive:     {alive}")
+    print(f"Research host heartbeat:    {alive}")
     print(f"Heartbeat age:              {round(age, 1)} seconds")
 
     today = datetime.now(timezone.utc).strftime("%Y-%m-%d")

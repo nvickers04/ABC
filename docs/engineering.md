@@ -10,13 +10,13 @@ When moving or consolidating docs, scripts, or entry points:
 
 - **Move and update** — merge or relocate content, delete the old path, grep and fix all references (README, ops docs, Docker, scripts, rules) in the same change.
 - **No redirect stubs** — do not leave files that only say “moved to …” or link to the new location.
-- **No extra root shims** — prefer `python -m <package>` or `scripts/` launchers; implementation lives in the package (e.g. `research/daemon.py`).
+- **No extra root shims** — prefer `python -m <package>` or `scripts/` launchers; implementation lives in the package (e.g. `research/host.py`).
 
 Cursor enforces this in `.cursor/rules/docs-and-file-moves.mdc`.  
 Canonical process commands: [entry-points.md](entry-points.md).  
 Module map and migration status: [codebase-layout.md](codebase-layout.md).
 
-**Removed paths (do not recreate):** `research_daemon.py`, `docs/data-sources/*`,
+**Removed paths (do not recreate):** `research_daemon.py`, `research/daemon.py` (use `research/host.py`), `docs/data-sources/*`,
 `docs/PLAN_*.md`, `docs/*_HOST_SETUP.md`, split engineering checklists,
 `scripts/check_researcher.py`, `scripts/check_trader.py`, `scripts/smoke_*_tools.py`
 (plural legacy names — use `health.py` and `smoke_tools.py`).

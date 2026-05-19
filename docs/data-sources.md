@@ -25,13 +25,13 @@ Which external providers we use, what each cannot do, and which process owns eac
 | Research without trader? | OK for IC backfill / signal testing |
 | Trader without research host? | **Dev only** — stale composites in production |
 
-IC needs live forward-return pairs; **run the daemon whenever the trader runs** in production.
+IC needs live forward-return pairs; **run the research host whenever the trader runs** in production.
 
 ---
 
 ## MarketData.app (MDA)
 
-**Code:** `data/marketdata_client.py`, `data/data_provider.py` · **Process:** research daemon (primary)  
+**Code:** `data/marketdata_client.py`, `data/data_provider.py` · **Process:** research host (primary)  
 **Auth:** `MARKETDATA_TOKEN` · **Plan:** ~100k credits/day
 
 **Used for:** bulk quotes, historical candles (1m–D), option chains with Greeks, EOD quotes.
@@ -61,7 +61,7 @@ IC needs live forward-return pairs; **run the daemon whenever the trader runs** 
 
 ## Yahoo Finance (yfinance)
 
-**Code:** `data/data_provider.py` · **Process:** research daemon · **Auth:** none (public scrape)
+**Code:** `data/data_provider.py` · **Process:** research host · **Auth:** none (public scrape)
 
 **Used for:** fundamentals, insider flow, institutional ownership, earnings calendar, news, short interest.
 
@@ -76,7 +76,7 @@ IC needs live forward-return pairs; **run the daemon whenever the trader runs** 
 **Code:** `core/grok_llm.py`, `core/agent.py` · **Process:** trader only  
 **Auth:** `XAI_API_KEY` / `GROK_API_KEY` · **Models:** `REASONING_MODEL`, `MULTI_AGENT_MODEL` in `grok_llm.py`
 
-The LLM is the trader brain each cycle: state → tools → decisions. **Zero LLM calls in the research daemon.**
+The LLM is the trader brain each cycle: state → tools → decisions. **Zero LLM calls on the research host.**
 
 Prompt order is intentional: ATTENTION → INTUITION → WORKING MEMORY → state → cost → briefing.
 
@@ -89,7 +89,7 @@ Prompt order is intentional: ATTENTION → INTUITION → WORKING MEMORY → stat
 | MDA client | `data/marketdata_client.py` |
 | IBKR core | `execution/ibkr_core.py` |
 | IBKR quotes | `data/ibkr_quote_source.py` |
-| Daemon | `python -m research` (`research/daemon.py`) |
+| Research host | `python -m research` (`research/host.py`) |
 | Trader | `__main__.py` |
 | Combiner / IC | `signals/combiner.py`, `signals/scorer.py` |
 | Heartbeat | `core/runtime/heartbeat.py` |

@@ -49,3 +49,18 @@ def test_heartbeat_age_s_returns_seconds_since_write():
     write_heartbeat(now=now - 30.0)
     age = heartbeat_age_s(now=now)
     assert 29.5 <= age <= 30.5
+
+
+def test_read_legacy_heartbeat_key():
+    from core.runtime.heartbeat import (
+        HEARTBEAT_KEY,
+        LEGACY_HEARTBEAT_KEY,
+        read_heartbeat,
+    )
+    from memory import get_research_config, set_research_config
+
+    ts = 1_700_000_123.0
+    set_research_config(HEARTBEAT_KEY, 0.0, reason="test reset")
+    set_research_config(LEGACY_HEARTBEAT_KEY, ts, reason="legacy heartbeat")
+    assert get_research_config(HEARTBEAT_KEY, 0.0) == 0.0
+    assert read_heartbeat() == pytest.approx(ts)

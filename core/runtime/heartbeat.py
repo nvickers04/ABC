@@ -2,11 +2,14 @@
 Research host heartbeat helpers.
 
 Stores the research host's last scoring-round timestamp in ``research_config``
-under ``HEARTBEAT_KEY`` (``daemon_heartbeat_ts`` — key name is historical).
+under :data:`HEARTBEAT_KEY` (``research_host_heartbeat_ts``). Deployments that
+still have the legacy key ``daemon_heartbeat_ts`` are read transparently; new
+writes use only the canonical key.
 
-The trader reads ``is_research_host_alive(stale_after_s)`` on startup and each cycle.
+The trader reads :func:`is_research_host_alive` on startup and each cycle.
 When fresh, the trader skips its in-process scorer. When stale, it may fall back
-to single-process scoring (unless ``--require-daemon`` / ``TRADER_IN_PROCESS_SCORER=never``).
+to single-process scoring (unless ``--require-research-host`` /
+``TRADER_IN_PROCESS_SCORER=never``).
 """
 
 from __future__ import annotations
@@ -17,8 +20,8 @@ from typing import Optional
 
 logger = logging.getLogger(__name__)
 
-
-HEARTBEAT_KEY: str = "daemon_heartbeat_ts"
+HEARTBEAT_KEY: str = "research_host_heartbeat_ts"
+LEGACY_HEARTBEAT_KEY: str = "daemon_heartbeat_ts"
 
 # Hard floor when no cadence is supplied — regular-hours rounds stay fresh;
 # a dead research host is detected within ~3 minutes.
@@ -39,17 +42,28 @@ def write_heartbeat(now: Optional[float] = None) -> float:
 
 
 def read_heartbeat() -> float:
-    """Return the last heartbeat timestamp (0.0 if none / on error)."""
+    """Return the last heartbeat timestamp (0.0 if none / on error).
+
+    Prefers :data:`HEARTBEAT_KEY`; falls back to :data:`LEGACY_HEARTBEAT_KEY`
+    so existing databases keep working without a manual migration.
+    """
     try:
         from memory import get_research_config
-        return float(get_research_config(HEARTBEAT_KEY, 0.0))
+
+        ts = float(get_research_config(HEARTBEAT_KEY, 0.0))
+        if ts > 0.0:
+            return ts
+        return float(get_research_config(LEGACY_HEARTBEAT_KEY, 0.0))
     except Exception as e:
         logger.debug("heartbeat read failed: %s", e)
         return 0.0
 
 
-def is_research_host_alive(stale_after_s: Optional[float] = None,
-                         *, now: Optional[float] = None) -> bool:
+def is_research_host_alive(
+    stale_after_s: Optional[float] = None,
+    *,
+    now: Optional[float] = None,
+) -> bool:
     """True iff the research host heartbeat exists and is fresh for the cadence tier.
 
     When ``stale_after_s`` is None (the common case) the threshold is
@@ -65,6 +79,7 @@ def is_research_host_alive(stale_after_s: Optional[float] = None,
     if stale_after_s is None:
         try:
             from core.runtime.cadence import cadence_seconds
+
             cadence_s = float(cadence_seconds())
         except Exception:
             cadence_s = 30.0
@@ -80,7 +95,3 @@ def heartbeat_age_s(now: Optional[float] = None) -> float:
         return float("inf")
     cur = float(now) if now is not None else time.time()
     return max(0.0, cur - last)
-
-
-# Back-compat alias — prefer is_research_host_alive in new code.
-is_daemon_alive = is_research_host_alive

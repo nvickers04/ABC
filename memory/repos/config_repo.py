@@ -5,11 +5,8 @@ tables. The legacy ``memory.__init__`` re-exports these names via thin
 shims so existing callers (``from memory import get_research_config``)
 keep working byte-for-byte.
 
-The monotonic ``calibration_version`` counter is intentionally kept in
-``memory.__init__`` — it is mutated by ``upsert_calibrated_slippage``
-(execution domain) and read here, so collocating it with one side
-would have been arbitrary. ``get_calibration_version`` is a thin
-re-read of that module-level int.
+The monotonic ``calibration_version`` counter lives in
+``memory.session_state`` (mutated by ``upsert_calibrated_slippage``).
 """
 
 from __future__ import annotations
@@ -144,18 +141,13 @@ def insert_graduated_param(
         return None
 
 
-# ── calibration version (state owned by memory/__init__) ───────
+# ── calibration version (process-local; see memory.session_state) ─
 
 
 def get_calibration_version() -> int:
-    """Return current calibration version (monotonic counter).
-
-    The counter itself is a module-level int in ``memory.__init__``,
-    mutated by ``upsert_calibrated_slippage``. Read it through the module
-    so we always see the latest value rather than capturing a stale ref.
-    """
-    import memory as _memory
-    return _memory._calibration_version
+    """Return current calibration version (monotonic counter)."""
+    from memory.session_state import calibration_version
+    return calibration_version
 
 
 __all__ = [

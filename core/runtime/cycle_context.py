@@ -6,11 +6,8 @@ from datetime import datetime
 from typing import TYPE_CHECKING, Any
 
 from core.log_context import get_logger
+from core.memory_config import get_memory_config
 from core.runtime.prompt_budget import (
-    CYCLE_ATTENTION_MAX_CHARS,
-    CYCLE_GUIDANCE_MAX_CHARS,
-    CYCLE_INTUITION_TOP_N,
-    CYCLE_WM_MAX_CHARS,
     CyclePromptMetrics,
     build_continuity_block,
     truncate_text,
@@ -34,14 +31,15 @@ def compact_quality_block(matrix: Any, risk_multiplier: float) -> str:
 
 def compact_wm_block(wm: Any) -> str:
     """Render working memory with per-section caps."""
+    cfg = get_memory_config()
     render = getattr(wm, "render", None)
     if not callable(render):
         return ""
     try:
-        text = render(max_entries_per_section=3)
+        text = render(max_entries_per_section=cfg.wm_render_cycle_max_entries)
     except TypeError:
         text = render()
-    text = truncate_text(text, CYCLE_WM_MAX_CHARS)
+    text = truncate_text(text, cfg.cycle_wm_max_chars)
     return text + "\n\n" if text.strip() else ""
 
 
@@ -49,20 +47,23 @@ async def load_attention_block(conn: Any) -> str:
     from core.runtime import attention as _attention
 
     _attention.sync_from_working_memory(conn)
+    cfg = get_memory_config()
     rendered = _attention.render_attention_block(
         conn,
-        max_rows=6,
-        max_source_chars=48,
+        max_rows=cfg.cycle_attention_max_rows,
+        max_source_chars=cfg.cycle_attention_max_source_chars,
     )
     if not rendered:
         return ""
-    return truncate_text(rendered, CYCLE_ATTENTION_MAX_CHARS) + "\n\n"
+    return truncate_text(rendered, cfg.cycle_attention_max_chars) + "\n\n"
 
 
 async def load_intuition_block(conn: Any) -> str:
     from core.runtime import intuition as _intuition
 
-    rendered = _intuition.render_intuition_block(conn, top_n=CYCLE_INTUITION_TOP_N)
+    rendered = _intuition.render_intuition_block(
+        conn, top_n=get_memory_config().cycle_intuition_top_n
+    )
     return rendered + "\n\n" if rendered else ""
 
 
@@ -85,7 +86,7 @@ async def build_cycle_user_context(
         from core.quality.quality_matrix import get_quality_matrix_service
 
         svc = get_quality_matrix_service()
-        svc.maybe_populate(max_age_seconds=60.0)
+        svc.maybe_populate(max_age_seconds=get_memory_config().quality_populate_max_age_seconds)
     except Exception as exc:
         logger.debug("quality_matrix_refresh_skipped", error=str(exc))
 
@@ -106,7 +107,12 @@ async def build_cycle_user_context(
         wm = get_active_working_memory()
         wm.curate()
         wm_block = compact_wm_block(wm)
-        ctx.quality.working_memory_completeness = 0.85 if ctx.is_independent_mode else 0.95
+        mem = get_memory_config()
+        ctx.quality.working_memory_completeness = (
+            mem.wm_completeness_independent
+            if ctx.is_independent_mode
+            else mem.wm_completeness_connected
+        )
     except Exception as exc:
         logger.warning("Working Memory load failed: %s", exc)
         wm_block = "(Working Memory unavailable)\n\n"
@@ -136,7 +142,10 @@ async def build_cycle_user_context(
     inject = f"{cost_line}{pre_scan_prompt}{gap_guard_prompt}"
     metrics.inject_chars = len(inject)
 
-    guidance = truncate_text(ctx.cycle_guidance_footer(), CYCLE_GUIDANCE_MAX_CHARS)
+    guidance = truncate_text(
+        ctx.cycle_guidance_footer(),
+        get_memory_config().cycle_guidance_max_chars,
+    )
     metrics.guidance_chars = len(guidance)
 
     context = (

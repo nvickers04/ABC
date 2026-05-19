@@ -21,6 +21,8 @@ from datetime import datetime, timezone
 from typing import Any, Literal, Optional
 
 from core.log_context import get_logger
+from core.memory_config import get_memory_config
+from core.prompt_config import get_prompt_config
 
 logger = get_logger(__name__)
 
@@ -53,8 +55,12 @@ else:
 
         overall_quality: Literal["full", "limited", "minimal", "degraded"] = "minimal"
         risk_multiplier: float = 0.4
-        suggested_temperature: float = 0.3
-        suggested_max_tokens: int = 2048
+        suggested_temperature: float = field(
+            default_factory=lambda: get_prompt_config().fallback_matrix_temperature
+        )
+        suggested_max_tokens: int = field(
+            default_factory=lambda: get_prompt_config().fallback_matrix_max_tokens
+        )
         force_conservative_reasoning: bool = True
         blocked_tool_categories: list[str] = field(default_factory=list)
         recent_tool_usage: list[Any] = field(default_factory=list)
@@ -76,7 +82,13 @@ else:
             }
 
         def get_llm_call_config(self) -> dict[str, Any]:
-            return {"temperature": 0.15, "max_tokens": 3072, "reasoning_bias": "conservative", "source": "fallback"}
+            pc = get_prompt_config()
+            return {
+                "temperature": pc.fallback_conservative_temperature,
+                "max_tokens": pc.fallback_conservative_max_tokens,
+                "reasoning_bias": "conservative",
+                "source": "fallback",
+            }
 
         def should_allow_tool(
             self,
@@ -262,7 +274,8 @@ class OperatingContext:
             self.quality.overall_quality = "full"
         elif (
             self.quality.memory_source == "local_fallback"
-            and self.quality.working_memory_completeness > 0.3
+            and self.quality.working_memory_completeness
+            > get_memory_config().wm_completeness_limited_threshold
         ):
             self.quality.overall_quality = "limited"
         else:
@@ -274,13 +287,10 @@ class OperatingContext:
 
         Used when populating QualityMatrix to avoid feedback loops.
         """
-        if self.quality.researcher_available:
-            return 1.0
-        if self.quality.overall_quality == "minimal":
-            return 0.4
-        if self.quality.overall_quality == "limited":
-            return 0.65
-        return 0.85
+        return get_memory_config().legacy_risk_multiplier_for_quality(
+            researcher_available=bool(self.quality.researcher_available),
+            overall_quality=str(self.quality.overall_quality),
+        )
 
     def sync_researcher_from_heartbeat(self) -> bool:
         """Reconcile researcher flags with :func:`~core.runtime.heartbeat.is_research_host_alive`.
@@ -310,11 +320,8 @@ class OperatingContext:
         Returns:
             Independent-mode guidance or standard connected-mode guidance.
         """
-        if self.is_independent_mode:
-            return _INDEPENDENT_MODE_GUIDANCE
-        return (
-            "Start by calling briefing() to assess research status. "
-            "Use quality_status() when you need the current host risk posture."
+        return get_prompt_config().cycle_guidance_footer(
+            independent_mode=self.is_independent_mode
         )
 
     def _refresh_canonical_matrix(self) -> None:
@@ -375,9 +382,10 @@ class OperatingContext:
                 svc = get_quality_matrix_service()
                 if svc is not None:
                     cfg = svc.get_matrix().get_llm_call_config()
+                    pc = get_prompt_config()
                     return {
-                        "temperature": cfg.get("temperature", 0.3),
-                        "max_tokens": cfg.get("max_tokens", 8192),
+                        "temperature": cfg.get("temperature", pc.fallback_matrix_temperature),
+                        "max_tokens": cfg.get("max_tokens", pc.fallback_matrix_max_tokens),
                         "reasoning_bias": cfg.get("reasoning_bias", "balanced"),
                         "source": "QualityMatrix-canonical",
                     }
@@ -414,16 +422,3 @@ def reset_operating_context_for_tests() -> None:
     _current_context = None
 
 
-_INDEPENDENT_MODE_GUIDANCE = """=== INDEPENDENT MODE (researcher unavailable) ===
-You are running with limited / local context only (no live researcher feed).
-
-**First actions — read-only quality inspect tools:**
-1. quality_status() — canonical QualityMatrix: overall_quality, risk_multiplier, blocked_tool_categories, llm_call_config, can_initiate_new_risk(), provenance summary.
-2. quality_for_symbol(symbol) — per-symbol execution quality from local trade_feedback.
-3. provenance_audit(window=12, symbol?) — recent tool usage + decision provenance snapshots.
-
-**Decision rules:**
-- New risk only on high conviction: strong quality_for_symbol score, local WM thesis, provenance_audit showing recent tool diversity.
-- Prefer managing or reducing existing positions over new entries.
-- Treat briefing, signals, and WM as potentially stale; cross-check with the quality tools.
-- Host enforces risk_multiplier, tool blocks, and quantity scaling — do not attempt to override."""

@@ -9,7 +9,8 @@ from pydantic import ValidationError
 
 import core.config as cfg
 from core.config import ConfigError, assert_config_valid, validate_config
-from core.settings import AppSettings, RuntimeConfigSnapshot
+from core.risk_execution_config import RiskExecutionConfig
+from core.settings import RuntimeConfigSnapshot
 
 
 @pytest.fixture(autouse=True)
@@ -165,13 +166,16 @@ class TestDatabaseUrl:
             )
 
 
-class TestAppSettings:
+class TestRiskExecutionConfig:
     def test_mode_defaults_apply_risk(self, monkeypatch):
+        from core.risk_execution_config import RiskExecutionConfig, get_risk_execution_config
+
         monkeypatch.delenv("RISK_PER_TRADE", raising=False)
         monkeypatch.delenv("MIN_RR", raising=False)
         monkeypatch.setenv("TRADING_MODE", "live")
         monkeypatch.setenv("IBKR_ACCOUNT_TYPE", "live")
-        s = AppSettings(_env_file=None)
+        get_risk_execution_config.cache_clear()
+        s = RiskExecutionConfig(_env_file=None)
         assert s.risk_per_trade_pct == 0.5
         assert s.min_rr_ratio == 2.5
 

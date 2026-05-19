@@ -155,3 +155,8 @@ HANDLERS = {
     "get_position": handle_get_position,
     "refresh_state": handle_refresh_state,
 }
+
+
+def register_handlers(registry) -> None:
+    """Register this module's handlers on the central :class:`core.tool_registry.ToolRegistry`."""
+    registry.bind_handlers(HANDLERS)

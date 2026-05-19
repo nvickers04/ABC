@@ -32,15 +32,14 @@ from __future__ import annotations
 from typing import Any, Optional
 
 from core.log_context import get_logger
+from core.loop_config import get_loop_config
 
 logger = get_logger(__name__)
 
-
-# ── Configuration ────────────────────────────────────────────────
-
-TOP_N: int = 5            # rows shown in the INTUITION block
-TOP_DRIVERS: int = 3      # signals listed per row (top by |contribution|)
-NOVELTY_LOOKBACK_S: float = 12 * 3600.0  # only count "prev" within 12h
+_lc = get_loop_config()
+TOP_N: int = _lc.intuition_top_n
+TOP_DRIVERS: int = _lc.intuition_top_drivers
+NOVELTY_LOOKBACK_S: float = _lc.intuition_novelty_lookback_seconds
 
 
 # ── Latest-data helpers ─────────────────────────────────────────

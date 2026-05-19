@@ -39,48 +39,19 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Any, Optional
 
+from core.memory_config import get_memory_config
+
 logger = logging.getLogger(__name__)
 
 
-# ── Section configuration ───────────────────────────────────────
+# ── Section configuration (from core.memory_config) ─────────────
 
-SECTIONS: tuple[str, ...] = (
-    "open_theses",
-    "recent_verdicts",
-    "watching_for",
-    "regime_notes",
-    "lessons_today",
-)
-
-# Cap per section.  When exceeded, oldest-expires-first is evicted.
-SECTION_CAPS: dict[str, int] = {
-    "open_theses":     8,
-    "recent_verdicts": 12,
-    "watching_for":    10,
-    "regime_notes":    5,
-    "lessons_today":   8,
-}
-
-# Default expiry per section, in minutes.  Sentinel ``"EOD"`` means
-# "end of local calendar day" (resolved at write time).  The agent can
-# always override via ``expires_in_minutes``.
-SECTION_DEFAULT_EXPIRY: dict[str, str | int] = {
-    "open_theses":     "EOD",
-    "recent_verdicts": 30,    # PASS verdicts; agent overrides for BUYs (2h)
-    "watching_for":    60,
-    "regime_notes":    "EOD",
-    "lessons_today":   "EOD",
-}
-
-
-# ── Quality metadata defaults (for per-entry tracking + section trust) ──
-
+_mem_cfg = get_memory_config()
+SECTIONS: tuple[str, ...] = _mem_cfg.wm_sections
+SECTION_CAPS: dict[str, int] = dict(_mem_cfg.section_caps)
+SECTION_DEFAULT_EXPIRY: dict[str, str | int] = dict(_mem_cfg.section_default_expiry)
 DEFAULT_SECTION_SCORES: dict[str, dict[str, Any]] = {
-    "lessons_today": {"score": 0.92, "last_updated": None, "sample_size": 0},
-    "open_theses":   {"score": 0.70, "last_updated": None, "sample_size": 0},
-    "watching_for":  {"score": 0.78, "last_updated": None, "sample_size": 0},
-    "regime_notes":  {"score": 0.75, "last_updated": None, "sample_size": 0},
-    "recent_verdicts": {"score": 0.85, "last_updated": None, "sample_size": 0},
+    k: dict(v) for k, v in _mem_cfg.default_section_scores.items()
 }
 
 
@@ -340,7 +311,7 @@ class WorkingMemory:
                 omitted = len(live) - len(show)
                 for e in show:
                     age_min = max(0, int((ts - e.created_ts) // 60))
-                    text = (e.entry_text or "")[:400]
+                    text = (e.entry_text or "")[: get_memory_config().wm_entry_text_max_chars]
                     lines.append(f"    - ({age_min}m ago) {text}")
                 if omitted > 0:
                     lines.append(f"    … +{omitted} older in this section")

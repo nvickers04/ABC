@@ -28,17 +28,18 @@ def _categorize_query(query: str) -> tuple[str, int]:
       sector - industry, sector rotation         -> TTL=4h
       ticker - specific symbol mentions          -> TTL=30min
     """
+    from core.memory_config import get_memory_config
+
+    mem = get_memory_config()
     q = query.upper()
     tickers = _get_ticker_symbols()
-    # Check if query mentions a known ticker
     for sym in tickers:
         if sym in q.split():
-            return "ticker", 1800  # 30 min
-    # Sector keywords
+            return "ticker", mem.research_ttl_ticker_seconds
     sector_kw = {"SECTOR", "INDUSTRY", "ROTATION", "CYCLICAL", "DEFENSIVE", "GROWTH", "VALUE"}
     if any(kw in q for kw in sector_kw):
-        return "sector", 14400  # 4 hours
-    return "macro", 0  # 0 means "until session change"
+        return "sector", mem.research_ttl_sector_seconds
+    return "macro", mem.research_ttl_macro_seconds
 
 
 __all__ = [

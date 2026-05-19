@@ -496,3 +496,8 @@ HANDLERS = {
     "iceberg_order": handle_iceberg_order,
     "snap_mid_order": handle_snap_mid_order,
 }
+
+
+def register_handlers(registry) -> None:
+    """Register this module's handlers on the central :class:`core.tool_registry.ToolRegistry`."""
+    registry.bind_handlers(HANDLERS)

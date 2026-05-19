@@ -87,6 +87,60 @@ def build_trader_parser() -> argparse.ArgumentParser:
         metavar="MODE",
         help="IBKR account mode (default: %(default)s). Live sets TRADING_MODE=live.",
     )
+    general.add_argument(
+        "--trading-mode",
+        choices=["aggressive_paper", "paper", "live"],
+        default=None,
+        metavar="MODE",
+        help="Override TRADING_MODE (aggressive_paper | paper | live).",
+    )
+    general.add_argument(
+        "--risk-per-trade",
+        type=float,
+        default=None,
+        metavar="PCT",
+        help="Override RISK_PER_TRADE (percent of cash, e.g. 1.0 = 1%%).",
+    )
+    general.add_argument(
+        "--max-daily-loss-pct",
+        type=float,
+        default=None,
+        metavar="PCT",
+        help="Override MAX_DAILY_LOSS_PCT session loss flatten threshold.",
+    )
+    general.add_argument(
+        "--max-llm-cost",
+        type=float,
+        default=None,
+        metavar="USD",
+        help="Override MAX_DAILY_LLM_COST (USD/day).",
+    )
+    general.add_argument(
+        "--cash-only",
+        action="store_true",
+        default=None,
+        help="Force CASH_ONLY=true (no margin / short stock).",
+    )
+    general.add_argument(
+        "--allow-margin",
+        action="store_true",
+        help="Set CASH_ONLY=false (use only when you understand margin risk).",
+    )
+    general.add_argument(
+        "--config-summary",
+        action="store_true",
+        help="Print ProfitConfig summary (all levers + P&L notes) and exit.",
+    )
+    general.add_argument(
+        "--profit-profile",
+        choices=["conservative", "balanced", "aggressive"],
+        default=None,
+        metavar="PROFILE",
+        help=(
+            "Apply profitability preset across risk, loop, memory, prompt, and tools "
+            "(conservative | balanced | aggressive). Sets PROFIT_PROFILE."
+        ),
+    )
 
     scoring = parser.add_argument_group(
         "scoring",
@@ -126,6 +180,44 @@ def build_trader_parser() -> argparse.ArgumentParser:
     return parser
 
 
+def apply_profit_profile_cli_to_environ(args: argparse.Namespace) -> None:
+    """Set ``PROFIT_PROFILE`` when ``--profit-profile`` is passed."""
+    import os
+
+    from core.profit_profiles import PROFIT_PROFILE_ENV, normalize_profit_profile
+
+    profile = getattr(args, "profit_profile", None)
+    if profile is not None:
+        os.environ[PROFIT_PROFILE_ENV] = normalize_profit_profile(profile)
+
+
+def apply_trader_cli_to_environ(args: argparse.Namespace) -> None:
+    """Push recognized CLI overrides into ``os.environ`` before config reload."""
+    import os
+
+    apply_profit_profile_cli_to_environ(args)
+    if getattr(args, "trading_mode", None):
+        os.environ["TRADING_MODE"] = str(args.trading_mode)
+    if getattr(args, "account", None) == "live":
+        os.environ["IBKR_ACCOUNT_TYPE"] = "live"
+        if not os.environ.get("TRADING_MODE"):
+            os.environ["TRADING_MODE"] = "live"
+    elif getattr(args, "account", None) == "paper":
+        os.environ["IBKR_ACCOUNT_TYPE"] = "paper"
+    if getattr(args, "risk_per_trade", None) is not None:
+        os.environ["RISK_PER_TRADE"] = str(args.risk_per_trade)
+    if getattr(args, "max_daily_loss_pct", None) is not None:
+        os.environ["MAX_DAILY_LOSS_PCT"] = str(args.max_daily_loss_pct)
+    if getattr(args, "max_llm_cost", None) is not None:
+        os.environ["MAX_DAILY_LLM_COST"] = str(args.max_llm_cost)
+    if getattr(args, "cash_only", None) is True:
+        os.environ["CASH_ONLY"] = "true"
+    if getattr(args, "allow_margin", False):
+        os.environ["CASH_ONLY"] = "false"
+    if getattr(args, "require_research_host", False):
+        os.environ["TRADER_IN_PROCESS_SCORER"] = "never"
+
+
 def parse_trader_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     """Parse trader CLI arguments (``argv`` defaults to ``sys.argv[1:]``)."""
     return build_trader_parser().parse_args(argv)
@@ -154,8 +246,30 @@ def build_research_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Do not start the template-evolution background thread.",
     )
+    parser.add_argument(
+        "--config-summary",
+        action="store_true",
+        help="Print ProfitConfig summary (all levers + P&L notes) and exit.",
+    )
+    parser.add_argument(
+        "--profit-profile",
+        choices=["conservative", "balanced", "aggressive"],
+        default=None,
+        metavar="PROFILE",
+        help=(
+            "Apply profitability preset (conservative | balanced | aggressive). "
+            "Sets PROFIT_PROFILE before config load."
+        ),
+    )
 
     return parser
+
+
+def load_profit_config(*, dotenv: bool = True):
+    """Apply env, reload all sub-configs, sync ``core.config`` — single startup entry."""
+    from core.central_profit_config import load_profit_config as _load
+
+    return _load(dotenv=dotenv)
 
 
 def parse_research_args(argv: Sequence[str] | None = None) -> argparse.Namespace:

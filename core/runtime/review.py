@@ -11,6 +11,7 @@ from datetime import datetime, timezone
 
 from core.config import TRADING_MODE
 from core.log_context import get_logger
+from core.loop_config import get_loop_config
 
 logger = get_logger(__name__)
 
@@ -39,9 +40,10 @@ async def run_daily_review(agent) -> None:
             (today,),
         ).fetchall()
 
+        lc = get_loop_config()
         for r in rows:
             gap = r["avg_gap"] if r["avg_gap"] else 0
-            if abs(gap) > 0.005:  # >0.5% gap is noteworthy
+            if abs(gap) > lc.review_execution_gap_threshold:
                 agent._emit_hypothesis(
                     hypothesis_type="execution_gap",
                     description=f"Slot {r['slot']} avg execution gap {gap:+.3f} on {r['n']} trades",
@@ -58,7 +60,7 @@ async def run_daily_review(agent) -> None:
 
         # 2. Execution analysis: triggered by data threshold
         new_snaps = get_new_snapshot_count()
-        if new_snaps >= 10:
+        if new_snaps >= lc.review_execution_analysis_min_snapshots:
             from core.runtime.execution_analysis import run_execution_analysis
             await run_execution_analysis(agent)
 
@@ -85,17 +87,18 @@ def evaluate_risk_ramp(db, today: str) -> None:
     """
     try:
         from memory import get_research_config, set_research_config
+
+        lc = get_loop_config()
         if get_research_config("risk_ramp_approved", 0.0) >= 1.0:
             return  # Already ramped
 
-        # Count trading days with at least 1 trade in last 30 days
         stats = db.execute(
-            """SELECT COUNT(DISTINCT date(ts)) as trading_days,
+            f"""SELECT COUNT(DISTINCT date(ts)) as trading_days,
                       COUNT(*) as total_trades,
                       SUM(pnl) as total_pnl,
                       SUM(CASE WHEN pnl > 0 THEN 1 ELSE 0 END) as wins
                FROM trades
-               WHERE ts >= date(?, '-30 days') || 'T00:00:00'""",
+               WHERE ts >= date(?, '-{lc.review_risk_ramp_lookback_days} days') || 'T00:00:00'""",
             (today,),
         ).fetchone()
 
@@ -108,7 +111,11 @@ def evaluate_risk_ramp(db, today: str) -> None:
         wins = stats["wins"] or 0
         win_rate = wins / total_trades if total_trades > 0 else 0
 
-        if trading_days >= 10 and total_pnl > 0 and win_rate > 0.45:
+        if (
+            trading_days >= lc.review_risk_ramp_min_trading_days
+            and total_pnl > 0
+            and win_rate > lc.review_risk_ramp_min_win_rate
+        ):
             set_research_config(
                 "risk_ramp_approved", 1.0,
                 f"Auto-approved: {trading_days} days, {total_trades} trades, "
@@ -120,7 +127,7 @@ def evaluate_risk_ramp(db, today: str) -> None:
             )
         else:
             logger.info(
-                f"Risk ramp check: {trading_days}/10 days, "
+                f"Risk ramp check: {trading_days}/{lc.review_risk_ramp_min_trading_days} days, "
                 f"P&L=${total_pnl:.2f}, WR={win_rate:.0%} — not yet"
             )
     except Exception as e:

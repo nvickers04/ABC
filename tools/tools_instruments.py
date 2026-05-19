@@ -369,3 +369,8 @@ async def handle_instrument_selector(executor, params: dict) -> Any:
 HANDLERS = {
     "instrument_selector": handle_instrument_selector,
 }
+
+
+def register_handlers(registry) -> None:
+    """Register this module's handlers on the central :class:`core.tool_registry.ToolRegistry`."""
+    registry.bind_handlers(HANDLERS)

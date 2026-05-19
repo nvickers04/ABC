@@ -1,84 +1,51 @@
 """IBKR endpoint resolution utilities.
 
-SIMPLE: IBKR_PORT env var is the ONLY config. Default 7497 (paper).
-- 7497 = Paper trading (default, safe)
-- 7496 = Live trading (set explicitly when ready)
-
-PAPER_MODE env var provides an additional safety check.
+Ports and host come from :mod:`core.risk_execution_config` (env / CLI / mode).
 """
+
 from __future__ import annotations
 
-from core.log_context import get_logger
-
-import logging
-import os
 from typing import Tuple
+
+from core.log_context import get_logger
+from core.risk_execution_config import get_risk_execution_config
 
 logger = get_logger(__name__)
 
-# Standard IBKR ports
-PAPER_PORT = 7497
-LIVE_PORT = 7496
-DEFAULT_PORT = PAPER_PORT  # Safe default
-
-# PAPER_MODE env var — ultimate safety toggle
-PAPER_MODE = os.getenv("PAPER_MODE", "True").lower() == "true"
-
-# TRADING_MODE takes priority when set (aggressive_paper | paper | live)
-_TRADING_MODE = os.getenv("TRADING_MODE", "").lower().strip()
-
 
 def get_ibkr_port() -> int:
-    """Get IBKR port from env var, default to paper (7497).
-
-    Port resolution order:
-    1. If TRADING_MODE=live → 7496 (live port)
-    2. If TRADING_MODE=paper or aggressive_paper → 7497 (paper port)
-    3. If PAPER_MODE=True (default) → 7497 regardless of IBKR_PORT
-    4. Else fall back to IBKR_PORT env var
-    """
-    if _TRADING_MODE == "live":
-        return LIVE_PORT   # 7496 — live trading
-    if _TRADING_MODE in ("paper", "aggressive_paper"):
-        return PAPER_PORT  # 7497 — paper trading
-    # Legacy: PAPER_MODE toggle
-    if PAPER_MODE:
-        return PAPER_PORT
-    return int(os.getenv("IBKR_PORT", DEFAULT_PORT))
+    """Resolve TWS API port from :class:`RiskExecutionConfig`."""
+    return get_risk_execution_config().resolve_ibkr_port()
 
 
 def get_ibkr_host() -> str:
-    """Get IBKR host, default localhost."""
-    return os.getenv("IBKR_HOST", "127.0.0.1")
+    """Resolve TWS API host."""
+    return get_risk_execution_config().ibkr_host
 
 
 def is_paper_trading() -> bool:
-    """Check if using paper trading port."""
-    return get_ibkr_port() == PAPER_PORT
+    """True when resolved port is the configured paper port."""
+    rc = get_risk_execution_config()
+    return get_ibkr_port() == rc.ibkr_paper_port
 
 
 def is_live_trading() -> bool:
-    """Check if using live trading port."""
-    return get_ibkr_port() == LIVE_PORT
+    """True when resolved port is the configured live port."""
+    rc = get_risk_execution_config()
+    return get_ibkr_port() == rc.ibkr_live_port
 
 
 def resolve_ibkr_endpoint(mode: str | None = None) -> Tuple[str, int, str]:
-    """Resolve IBKR host/port. Mode param is ignored - use IBKR_PORT env var.
-    
-    Returns:
-        Tuple of (host, port, mode_string)
-    """
+    """Return (host, port, mode_string). ``mode`` is ignored (kept for API compat)."""
+    del mode
     host = get_ibkr_host()
     port = get_ibkr_port()
-    mode_str = "paper" if port == PAPER_PORT else "live"
-
+    rc = get_risk_execution_config()
+    mode_str = "paper" if port == rc.ibkr_paper_port else "live"
     return host, port, mode_str
 
 
 def format_ibkr_endpoint(mode: str | None = None) -> str:
-    """Return a human-readable host:port string with mode for logging."""
+    """Human-readable host:port (mode) for logging."""
     host, port, resolved_mode = resolve_ibkr_endpoint(mode)
     return f"{host}:{port} ({resolved_mode})"
-
-
-

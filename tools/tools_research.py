@@ -1284,5 +1284,8 @@ HANDLERS["provenance_audit"] = handle_provenance_audit
 HANDLERS["current_constraints"] = handle_current_constraints
 
 
+def register_handlers(registry) -> None:
+    """Register this module's handlers on the central :class:`core.tool_registry.ToolRegistry`."""
+    registry.bind_handlers(HANDLERS)
 
 

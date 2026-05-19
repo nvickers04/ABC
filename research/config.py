@@ -74,12 +74,27 @@ OPTION_CHAIN_STRIKE_LIMIT = 20      # Max strikes per expiration (server-side fi
 # Thresholds were raised after field runs hit the daily cap: react earlier,
 # skip expensive bundles sooner, and combine with runway + burn heuristics
 # in core/runtime/mda_budget.py.
-MDA_SOFT_CREDIT_FRACTION = 0.48          # Below: 1.35x sleep (early cushion)
-MDA_LOW_CREDIT_FRACTION = 0.32         # Below: 2x sleep between rounds
-MDA_CRITICAL_CREDIT_FRACTION = 0.18    # Below: 4x sleep (overrides low tier)
-MDA_SKIP_SUBDAILY_FRACTION = 0.38       # Below: skip 1m/5m/1h candle bundles (saves ~75 calls/round @ n=25)
+def _mda_exports() -> tuple[float, float, float, float, float]:
+    from core.risk_execution_config import get_risk_execution_config
+
+    r = get_risk_execution_config()
+    return (
+        r.mda_soft_credit_fraction,
+        r.mda_low_credit_fraction,
+        r.mda_critical_credit_fraction,
+        r.mda_skip_subdaily_fraction,
+        r.mda_max_sleep_multiplier,
+    )
+
+
+(
+    MDA_SOFT_CREDIT_FRACTION,
+    MDA_LOW_CREDIT_FRACTION,
+    MDA_CRITICAL_CREDIT_FRACTION,
+    MDA_SKIP_SUBDAILY_FRACTION,
+    MDA_MAX_SLEEP_MULTIPLIER,
+) = _mda_exports()
 MDA_DAILY_CREDIT_LIMIT_TYPICAL = 100_000  # Doc / sanity only; API headers are authoritative
-MDA_MAX_SLEEP_MULTIPLIER = 8.0          # Hard cap on combined cadence stretch
 
 # ── Options structure schemas ──────────────────────────────────
 # These are the REQUIRED fields for each options structure.

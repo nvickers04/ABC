@@ -39,14 +39,14 @@ from datetime import datetime
 from typing import Any, Iterable, Optional
 
 from core.log_context import get_logger
+from core.memory_config import get_memory_config
 
 logger = get_logger(__name__)
 
 
-# ── Configuration ────────────────────────────────────────────────
-
-ACTIVE_CAP: int = 10
-RENDER_WINDOW_S: float = 15 * 60  # show fired triggers for 15 min
+_mem_cfg = get_memory_config()
+ACTIVE_CAP: int = _mem_cfg.attention_active_cap
+RENDER_WINDOW_S: float = _mem_cfg.attention_render_window_s
 
 # Conditions we evaluate.  ``crosses_above`` / ``crosses_below`` need a
 # prior ``last_value`` to detect the crossing edge; ``above`` / ``below``
@@ -497,9 +497,9 @@ def render_attention_block(
     conn,
     *,
     now: Optional[float] = None,
-    window_s: float = RENDER_WINDOW_S,
-    max_rows: int = 10,
-    max_source_chars: int = 80,
+    window_s: float | None = None,
+    max_rows: int | None = None,
+    max_source_chars: int | None = None,
 ) -> str:
     """Render the ATTENTION block for the cycle prompt.
 
@@ -507,6 +507,13 @@ def render_attention_block(
     it's watching) and any triggers fired within the last
     ``window_s`` seconds.  Returns ``""`` if there's nothing to show.
     """
+    cfg = get_memory_config()
+    if window_s is None:
+        window_s = cfg.attention_render_window_s
+    if max_rows is None:
+        max_rows = cfg.attention_render_default_max_rows
+    if max_source_chars is None:
+        max_source_chars = cfg.attention_render_default_max_source_chars
     ts = float(now) if now is not None else time.time()
     try:
         cur = conn.execute(

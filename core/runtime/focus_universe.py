@@ -23,11 +23,12 @@ from __future__ import annotations
 from typing import Iterable, List
 
 from core.log_context import get_logger
+from core.memory_config import get_memory_config
 
 logger = get_logger(__name__)
 
 
-def get_focus_symbols(conn, *, limit: int = 32) -> List[str]:
+def get_focus_symbols(conn, *, limit: int | None = None) -> List[str]:
     """Return up to ``limit`` distinct symbols with active attention triggers.
 
     Ordered by most-recently-created trigger first so newer interests
@@ -35,6 +36,8 @@ def get_focus_symbols(conn, *, limit: int = 32) -> List[str]:
     empty list (never None) on any DB failure — the caller treats an
     empty focus set as "score base universe only."
     """
+    if limit is None:
+        limit = get_memory_config().focus_symbols_scorer_limit
     try:
         cur = conn.execute(
             "SELECT DISTINCT symbol FROM attention_triggers "

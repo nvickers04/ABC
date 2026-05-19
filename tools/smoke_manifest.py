@@ -13,14 +13,19 @@ Run those only deliberately with operator approval.
 
 from __future__ import annotations
 
-from tools.tools_executor import _ORDER_ACTIONS, _REGISTRY
+from core.tool_registry import get_tool_registry
+from tools.tools_executor import _ORDER_ACTIONS
+
+
+def _registry_keys() -> frozenset[str]:
+    return frozenset(get_tool_registry().handlers.keys())
 
 NEVER_AUTOTEST: frozenset[str] = frozenset({"flatten_limits", "cancel_all_orphans"})
 
 
 def broker_mutating_names() -> frozenset[str]:
     """Tools that submit orders or cancel/modify broker working orders."""
-    all_reg = frozenset(_REGISTRY.keys())
+    all_reg = _registry_keys()
     raw = (
         _ORDER_ACTIONS
         - {"plan_order", "enter_option", "flatten_limits"}
@@ -31,7 +36,7 @@ def broker_mutating_names() -> frozenset[str]:
 
 def safe_names() -> frozenset[str]:
     """Tools safe to invoke in default paper smoke (no placements / cancels)."""
-    return frozenset(_REGISTRY.keys()) - broker_mutating_names() - NEVER_AUTOTEST
+    return _registry_keys() - broker_mutating_names() - NEVER_AUTOTEST
 
 
 def registry_partition_ok() -> bool:
@@ -43,4 +48,4 @@ def registry_partition_ok() -> bool:
         return False
     if s & b or s & n:
         return False
-    return s | b | n == frozenset(_REGISTRY.keys())
+    return s | b | n == _registry_keys()

@@ -290,3 +290,8 @@ def _cv_adjusted_risk(base_risk: float) -> float:
 HANDLERS = {
     "calculate_size": handle_calculate_size,
 }
+
+
+def register_handlers(registry) -> None:
+    """Register this module's handlers on the central :class:`core.tool_registry.ToolRegistry`."""
+    registry.bind_handlers(HANDLERS)

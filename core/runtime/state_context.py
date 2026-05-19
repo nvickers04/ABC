@@ -17,45 +17,14 @@ from datetime import datetime as _dt
 from typing import Optional
 
 from core.log_context import get_logger
+from core.memory_config import get_memory_config
 from core.runtime.interfaces import BrokerGatewayProtocol, MarketHoursProtocol
 
 logger = get_logger(__name__)
 
 
-# ── Symbol → sector map for portfolio concentration summary ─────
-# Matches the diversified RESEARCH_UNIVERSE.  Used for cheap in-prompt
-# exposure reporting; no external lookup.  Unknown symbols bucket as
-# "other".
-_SECTOR_MAP: dict[str, str] = {
-    # Mega-cap tech / AI
-    "NVDA": "tech", "META": "tech", "AMD": "tech", "AVGO": "tech",
-    # High-growth software
-    "CRWD": "software", "NET": "software", "PLTR": "software", "APP": "software",
-    # Fintech
-    "SOFI": "fintech", "HOOD": "fintech",
-    # Consumer discretionary
-    "DKNG": "discretionary", "CAVA": "discretionary",
-    # Healthcare
-    "LLY": "healthcare", "UNH": "healthcare", "GILD": "healthcare",
-    # Energy
-    "XOM": "energy", "OXY": "energy",
-    # Traditional financials
-    "JPM": "financials", "GS": "financials",
-    # Industrials
-    "CAT": "industrials", "UPS": "industrials",
-    # Staples
-    "COST": "staples", "WMT": "staples",
-    # Materials
-    "FCX": "materials",
-    # EM / China
-    "BABA": "em",
-    # Common hedges
-    "SPY": "index_hedge", "QQQ": "index_hedge", "IWM": "index_hedge",
-}
-
-
 def _sector_of(symbol: str) -> str:
-    return _SECTOR_MAP.get((symbol or "").upper(), "other")
+    return get_memory_config().sector_of(symbol)
 
 
 class StateContextBuilder:
@@ -232,10 +201,8 @@ class StateContextBuilder:
                         f"Stock long: ${long_stock_notional:,.0f} ({pct_long:.1f}% of NetLiq)  "
                         f"| Cash: ${cash_val:,.0f} ({pct_cash:.1f}%)"
                     )
-                    # Idle-cash flag: if more than 30% of NetLiq is in cash,
-                    # the agent has slack and should actively evaluate top
-                    # candidates instead of defaulting to skip.
-                    if pct_cash > 30:
+                    mem = get_memory_config()
+                    if pct_cash > mem.idle_cash_slack_pct:
                         lines.append(
                             f"  ⚠ IDLE CASH: {pct_cash:.0f}% of NetLiq is uninvested. "
                             "Required this cycle: evaluate the top composite from briefing() "
@@ -254,18 +221,18 @@ class StateContextBuilder:
                     )
                 lines.append(f"Open unrealized P&L: ${total_unreal:+,.2f}")
 
-                # Concentration: top 3 symbols by notional
                 if per_symbol:
+                    top_n = get_memory_config().portfolio_concentration_top_n
                     top_syms = sorted(
                         per_symbol.items(), key=lambda kv: kv[1]["notional"], reverse=True
-                    )[:3]
+                    )[:top_n]
                     if net_liq_val > 0:
                         conc_str = ", ".join(
                             f"{s}={v['notional'] / net_liq_val * 100:.1f}%" for s, v in top_syms
                         )
                     else:
                         conc_str = ", ".join(f"{s}=${v['notional']:,.0f}" for s, v in top_syms)
-                    lines.append(f"Concentration (top 3 of NetLiq): {conc_str}")
+                    lines.append(f"Concentration (top {top_n} of NetLiq): {conc_str}")
 
                 # Sector exposure — group per-symbol notional by sector
                 if per_symbol:

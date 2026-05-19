@@ -20,7 +20,6 @@ logger = get_logger(__name__)
 
 # ── Research cache: exact-query TTL to avoid repeated expensive calls ──
 _research_cache: dict[str, tuple[dict, float]] = {}   # query -> (result_dict, timestamp)
-_RESEARCH_TTL = 600  # 10 minutes
 
 _MA_SPEND_DAY_KEY = "multi_agent_llm_day"
 _MA_SPEND_USD_KEY = "multi_agent_llm_usd"
@@ -68,13 +67,16 @@ async def handle_research(executor, params: dict) -> Any:
         return {"error": "query is required — describe what you want to research"}
 
     deep = params.get("deep", False)
+    from core.memory_config import get_memory_config
 
-    # ── Check TTL cache (exact match, 10-min window) ──
+    mem = get_memory_config()
+
+    # ── Check TTL cache (exact match) ──
     _cache_key = query.lower().strip()
     if _cache_key in _research_cache:
         cached_result, cached_ts = _research_cache[_cache_key]
         age = time.time() - cached_ts
-        if age < _RESEARCH_TTL:
+        if age < mem.multi_agent_research_ttl_seconds:
             logger.info(f"Research cache hit ({age:.0f}s old): {query[:60]}")
             cached_result = dict(cached_result)  # copy
             cached_result["cached"] = True
@@ -114,14 +116,15 @@ async def handle_research(executor, params: dict) -> Any:
         from xai_sdk.chat import user as sdk_user
         from xai_sdk.tools import web_search, x_search
 
-        from core.grok_llm import MULTI_AGENT_MODEL
+        from core.prompt_config import get_prompt_config
 
         api_key = os.environ.get("XAI_API_KEY") or os.environ.get("GROK_API_KEY")
         client = AsyncClient(api_key=api_key)
 
         # Build multi-agent chat with built-in tools
+        ma_model = get_prompt_config().multi_agent_model
         create_kwargs: dict[str, Any] = {
-            "model": MULTI_AGENT_MODEL,
+            "model": ma_model,
             "messages": [sdk_user(query)],
             "tools": [web_search(), x_search()],
         }
@@ -136,7 +139,7 @@ async def handle_research(executor, params: dict) -> Any:
         cost_usd = 0.0
         if hasattr(executor, "cost_tracker") and executor.cost_tracker:
             cost_usd = executor.cost_tracker.log_llm_usage(
-                MULTI_AGENT_MODEL,
+                ma_model,
                 usage=usage,
                 purpose="multi_agent_research",
             )
@@ -177,7 +180,7 @@ async def handle_research(executor, params: dict) -> Any:
         # ── Store in cache ──
         _research_cache[_cache_key] = (result, time.time())
         # Evict oldest if > 20 cached queries
-        if len(_research_cache) > 20:
+        if len(_research_cache) > mem.multi_agent_research_cache_max_entries:
             oldest = min(_research_cache, key=lambda k: _research_cache[k][1])
             del _research_cache[oldest]
 
@@ -191,3 +194,8 @@ async def handle_research(executor, params: dict) -> Any:
 HANDLERS = {
     "research": handle_research,
 }
+
+
+def register_handlers(registry) -> None:
+    """Register this module's handlers on the central :class:`core.tool_registry.ToolRegistry`."""
+    registry.bind_handlers(HANDLERS)

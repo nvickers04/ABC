@@ -152,3 +152,8 @@ HANDLERS = {
     "update_working_memory": handle_update_working_memory,
     "clear_working_memory_entry": handle_clear_working_memory_entry,
 }
+
+
+def register_handlers(registry) -> None:
+    """Register this module's handlers on the central :class:`core.tool_registry.ToolRegistry`."""
+    registry.bind_handlers(HANDLERS)

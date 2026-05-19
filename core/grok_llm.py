@@ -5,14 +5,13 @@ Uses the official xai-sdk (>= 1.8.0) for all model communication.
 The agent loop in agent.py uses self.grok.client.chat.create() to build
 conversations and chat.sample() to get responses.
 
-**API model slugs live only here** (`REASONING_MODEL`, `MULTI_AGENT_MODEL`).
-Elsewhere (docs, prompts, logs) refer generically to “Grok” so a version
-change is a single edit plus `data/cost_tracker.py` pricing if xAI changes
-rates. Slug validity: https://docs.x.ai/docs/models
+**API model slugs live in** :mod:`core.prompt_config` (``PromptConfig.reasoning_model``
+and ``PromptConfig.multi_agent_model``). Elsewhere refer generically to “Grok”.
+Slug validity: https://docs.x.ai/docs/models
 
 Models:
-    REASONING_MODEL   — single-agent ReAct trading loop (client-side tools)
-    MULTI_AGENT_MODEL — multi-agent research (built-in web_search / x_search)
+    reasoning_model   — single-agent ReAct trading loop (client-side tools)
+    multi_agent_model — multi-agent research (built-in web_search / x_search)
 """
 
 import logging
@@ -21,11 +20,9 @@ from typing import Optional
 
 from xai_sdk import AsyncClient
 
-logger = logging.getLogger(__name__)
+from core.prompt_config import get_prompt_config
 
-# ── xAI API model slugs (edit here when xAI renames or you switch tiers) ──
-REASONING_MODEL = "grok-4.3"
-MULTI_AGENT_MODEL = "grok-4.20-multi-agent"
+logger = logging.getLogger(__name__)
 
 
 class GrokLLM:
@@ -33,13 +30,14 @@ class GrokLLM:
 
     def __init__(
         self,
-        model: str = REASONING_MODEL,
-        temperature: float = 0.0,
-        max_tokens: int = 8192,
+        model: str | None = None,
+        temperature: float | None = None,
+        max_tokens: int | None = None,
     ):
-        self.model = model
-        self.temperature = temperature
-        self.max_tokens = max_tokens
+        pc = get_prompt_config()
+        self.model = model or pc.reasoning_model
+        self.temperature = pc.llm_temperature if temperature is None else temperature
+        self.max_tokens = pc.llm_max_tokens if max_tokens is None else max_tokens
 
         api_key = os.environ.get("XAI_API_KEY") or os.environ.get("GROK_API_KEY")
         if not api_key:
@@ -47,7 +45,7 @@ class GrokLLM:
 
         self.client = AsyncClient(api_key=api_key)
 
-        logger.info(f"GrokLLM initialized (model={model}, temp={temperature})")
+        logger.info(f"GrokLLM initialized (model={self.model}, temp={self.temperature})")
 
 
 # Singleton
@@ -62,9 +60,19 @@ def get_grok_llm() -> GrokLLM:
     return _grok_llm
 
 
+def get_reasoning_model() -> str:
+    """Return the configured reasoning model slug."""
+    return get_prompt_config().reasoning_model
+
+
+def get_multi_agent_model() -> str:
+    """Return the configured multi-agent research model slug."""
+    return get_prompt_config().multi_agent_model
+
+
 __all__ = [
     "GrokLLM",
     "get_grok_llm",
-    "REASONING_MODEL",
-    "MULTI_AGENT_MODEL",
+    "get_reasoning_model",
+    "get_multi_agent_model",
 ]

@@ -1057,7 +1057,9 @@ async def handle_multi_leg(executor, params: dict) -> Any:
             return await handle_vertical_spread(executor, dispatch_params)
 
     # Otherwise pass params directly to the target handler
-    handler = HANDLERS.get(handler_name)
+    from core.tool_registry import get_tool_registry
+
+    handler = get_tool_registry().get_handler(handler_name)
     if handler is None:
         return {"error": f"Handler '{handler_name}' not found"}
 
@@ -1094,3 +1096,8 @@ HANDLERS = {
     # Multi-leg convenience
     "multi_leg": handle_multi_leg,
 }
+
+
+def register_handlers(registry) -> None:
+    """Register this module's handlers on the central :class:`core.tool_registry.ToolRegistry`."""
+    registry.bind_handlers(HANDLERS)

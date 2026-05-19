@@ -166,3 +166,8 @@ async def handle_signal_breakdown(executor, params: dict) -> Any:
 
 
 HANDLERS["signal_breakdown"] = handle_signal_breakdown
+
+
+def register_handlers(registry) -> None:
+    """Register this module's handlers on the central :class:`core.tool_registry.ToolRegistry`."""
+    registry.bind_handlers(HANDLERS)

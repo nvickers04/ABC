@@ -40,9 +40,14 @@ class ResearchHostStatus:
     CAP_STOPPED = 5.0
     STOPPED = 6.0
 
-# Hard floor when no cadence is supplied — regular-hours rounds stay fresh;
-# a dead research host is detected within ~3 minutes.
-DEFAULT_STALE_AFTER_S: float = 180.0
+def _heartbeat_cfg():
+    from core.risk_execution_config import get_risk_execution_config
+
+    return get_risk_execution_config()
+
+
+# Hard floor when no cadence is supplied — regular-hours rounds stay fresh.
+DEFAULT_STALE_AFTER_S: float = _heartbeat_cfg().heartbeat_default_stale_after_s
 
 
 def write_heartbeat(now: Optional[float] = None) -> float:
@@ -175,7 +180,8 @@ def is_research_host_alive(
             cadence_s = float(cadence_seconds())
         except Exception:
             cadence_s = 30.0
-        stale_after_s = max(DEFAULT_STALE_AFTER_S, 3.0 * cadence_s + 60.0)
+        cfg = _heartbeat_cfg()
+        stale_after_s = cfg.heartbeat_stale_after_s(cadence_s)
     cur = float(now) if now is not None else time.time()
     return (cur - last) <= float(stale_after_s)
 

@@ -156,9 +156,9 @@ for _t in ("update_working_memory", "clear_working_memory_entry"):
 
 
 def _register_missing_sections() -> None:
-    from tools.tools_executor import get_valid_actions
+    from core.tool_registry import get_tool_registry
 
-    for t in get_valid_actions():
+    for t in get_tool_registry().agent_action_names():
         if t not in SECTION:
             SECTION[t] = "OTHER"
 
@@ -193,9 +193,9 @@ def _line_for(name: str) -> str:
 def _lines() -> dict[str, str]:
     global _CACHE
     if _CACHE is None:
-        from tools.tools_executor import get_valid_actions
+        from core.tool_registry import get_tool_registry
 
-        _CACHE = {n: _line_for(n) for n in get_valid_actions()}
+        _CACHE = {n: _line_for(n) for n in get_tool_registry().agent_action_names()}
     return _CACHE
 
 

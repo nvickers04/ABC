@@ -22,6 +22,8 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Any, ClassVar, Literal, Optional
 
+from core.loop_config import get_loop_config
+from core.memory_config import get_memory_config
 from memory import get_db, get_research_config, set_research_config
 
 logger = logging.getLogger(__name__)
@@ -157,8 +159,12 @@ class QualityMatrix:
     recent_tool_usage: list[ToolUsageRecord] = field(default_factory=list)
     recent_provenance: list[DecisionProvenanceSnapshot] = field(default_factory=list)
 
-    suggested_temperature: float = 0.3
-    suggested_max_tokens: int = 2048
+    suggested_temperature: float = field(
+        default_factory=lambda: get_loop_config().matrix_default_suggested_temperature
+    )
+    suggested_max_tokens: int = field(
+        default_factory=lambda: get_loop_config().matrix_default_suggested_max_tokens
+    )
     force_conservative_reasoning: bool = False
     blocked_tool_categories: list[str] = field(default_factory=list)
 
@@ -247,16 +253,17 @@ class QualityMatrix:
             Dict with keys such as ``risk_multiplier``, ``force_conservative_reasoning``,
             ``suggested_temperature``, ``blocked_tool_categories``, ``symbol_execution_quality``.
         """
+        lc = get_loop_config()
         sq = self.symbol_quality.get(symbol) if symbol else None
 
         base_risk = self.risk_multiplier
-        if sq and sq.execution_quality < 0.35:
-            base_risk = min(base_risk, 0.5)
+        if sq and sq.execution_quality < lc.symbol_exec_poor_threshold:
+            base_risk = min(base_risk, lc.symbol_risk_cap_multiplier)
 
         return {
             "risk_multiplier": round(base_risk, 3),
             "force_conservative_reasoning": self.force_conservative_reasoning
-            or (sq is not None and sq.execution_quality < 0.4),
+            or (sq is not None and sq.execution_quality < lc.symbol_exec_conservative_threshold),
             "suggested_temperature": self.suggested_temperature,
             "suggested_max_tokens": self.suggested_max_tokens,
             "blocked_tool_categories": list(self.blocked_tool_categories),
@@ -287,7 +294,11 @@ class QualityMatrix:
             return "complex_options"
         if a in ("complex_orders", "adaptive_order", "vwap_order", "iceberg_order") or a.endswith("_spread"):
             return "complex_orders"
-        if a in ("plan_order", "market_order", "limit_order", "buy", "sell") and self.risk_multiplier < 0.55:
+        lc = get_loop_config()
+        if (
+            a in ("plan_order", "market_order", "limit_order", "buy", "sell")
+            and self.risk_multiplier < lc.high_risk_entry_rm_threshold
+        ):
             return "high_risk_entry"
         return None
 
@@ -300,23 +311,28 @@ class QualityMatrix:
             Dict with ``temperature``, ``max_tokens``, ``top_p``, ``reasoning_bias``,
             ``source``, and ``quality`` keys.
         """
+        lc = get_loop_config()
         temp = float(self.suggested_temperature)
         mt = int(self.suggested_max_tokens)
 
         if self.overall_quality == "degraded":
-            temp = min(temp, 0.05)
-            mt = min(mt, 3072)
+            temp = min(temp, lc.llm_temp_degraded_cap)
+            mt = min(mt, lc.llm_tokens_degraded_cap)
         elif self.overall_quality in ("minimal", "limited"):
-            temp = min(temp, 0.18)
-            mt = min(mt, 5500)
+            temp = min(temp, lc.llm_temp_minimal_limited_cap)
+            mt = min(mt, lc.llm_tokens_limited_cap)
 
         if self.force_conservative_reasoning:
-            temp = min(temp, 0.12)
+            temp = min(temp, lc.llm_temp_conservative_cap)
 
         return {
             "temperature": round(temp, 3),
             "max_tokens": int(mt),
-            "top_p": 0.78 if self.force_conservative_reasoning else 0.93,
+            "top_p": (
+                lc.llm_top_p_conservative
+                if self.force_conservative_reasoning
+                else lc.llm_top_p_normal
+            ),
             "reasoning_bias": (
                 "conservative"
                 if self.force_conservative_reasoning or self.overall_quality != "full"
@@ -365,7 +381,10 @@ class QualityMatrix:
                         "and information tools are permitted. Call quality_status() + "
                         "quality_for_symbol() to understand posture."
                     )
-                if is_independent_mode and self.risk_multiplier < 0.55:
+                if (
+                    is_independent_mode
+                    and self.risk_multiplier < get_loop_config().independent_mode_entry_rm_threshold
+                ):
                     return False, (
                         "Independent Mode + QualityMatrix risk posture prohibits new entries. "
                         f"(rm={self.risk_multiplier:.2f}). Focus on existing positions only."
@@ -389,14 +408,15 @@ class QualityMatrix:
         Returns:
             Final integer quantity (at least 1).
         """
+        lc = get_loop_config()
         pol = self.recommended_policies(symbol)
         mult = float(pol.get("risk_multiplier", self.risk_multiplier))
 
         if intent == "entry" and self.overall_quality in ("minimal", "degraded"):
-            mult = min(mult, 0.25)
+            mult = min(mult, lc.entry_scale_minimal_degraded)
 
         if self.force_conservative_reasoning and intent == "entry":
-            mult = min(mult, 0.6)
+            mult = min(mult, lc.entry_scale_conservative)
 
         return max(1, int(float(requested) * mult))
 
@@ -409,9 +429,10 @@ class QualityMatrix:
         Returns:
             True when risk multiplier and overall quality allow new entries.
         """
+        lc = get_loop_config()
         pol = self.recommended_policies(symbol)
         rm = pol["risk_multiplier"]
-        return rm > 0.40 and self.overall_quality not in ("minimal", "degraded")
+        return rm > lc.min_rm_for_new_risk and self.overall_quality not in ("minimal", "degraded")
 
     def update_researcher(self, available: bool, ts: Optional[datetime] = None) -> None:
         """Apply a lightweight researcher availability hint.
@@ -427,7 +448,9 @@ class QualityMatrix:
             if self.overall_quality == "full":
                 self.overall_quality = "limited"
                 self.force_conservative_reasoning = True
-            self.risk_multiplier = min(self.risk_multiplier, 0.65)
+            self.risk_multiplier = min(
+                self.risk_multiplier, get_loop_config().researcher_unavailable_rm_cap
+            )
 
     def record_tool_usage(
         self,
@@ -472,10 +495,13 @@ class QualityMatrix:
 
     def reset_for_new_session(self) -> None:
         """Trim in-memory provenance rings at session boundaries."""
-        if len(self.recent_tool_usage) > 5:
-            self.recent_tool_usage = self.recent_tool_usage[-5:]
-        if len(self.recent_provenance) > 3:
-            self.recent_provenance = self.recent_provenance[-3:]
+        mem = get_memory_config()
+        max_tools = mem.quality_session_reset_max_tools
+        max_prov = mem.quality_session_reset_max_provenance
+        if len(self.recent_tool_usage) > max_tools:
+            self.recent_tool_usage = self.recent_tool_usage[-max_tools:]
+        if len(self.recent_provenance) > max_prov:
+            self.recent_provenance = self.recent_provenance[-max_prov:]
 
 
 class QualityMatrixService:
@@ -490,8 +516,9 @@ class QualityMatrixService:
     def __init__(self) -> None:
         self.matrix = QualityMatrix()
         self._enabled = True
-        self._max_recent_tools = 50
-        self._max_recent_provenance = 30
+        mem = get_memory_config()
+        self._max_recent_tools = mem.quality_max_recent_tools
+        self._max_recent_provenance = mem.quality_max_recent_provenance
         self._logger = logging.getLogger(__name__ + ".service")
 
     @classmethod
@@ -503,11 +530,20 @@ class QualityMatrixService:
 
     def _refresh_knobs(self) -> None:
         """Reload enablement and retention limits from ``research_config``."""
+        mem = get_memory_config()
         try:
-            self._enabled = bool(get_research_config("quality_matrix_enabled", 1.0) >= 0.5)
-            self._max_recent_tools = int(get_research_config("quality_matrix_max_tools", 50.0))
+            self._enabled = bool(
+                get_research_config("quality_matrix_enabled", 1.0)
+                >= mem.quality_matrix_enabled_threshold
+            )
+            self._max_recent_tools = int(
+                get_research_config("quality_matrix_max_tools", float(mem.quality_max_recent_tools))
+            )
             self._max_recent_provenance = int(
-                get_research_config("quality_matrix_max_provenance", 30.0)
+                get_research_config(
+                    "quality_matrix_max_provenance",
+                    float(mem.quality_max_recent_provenance),
+                )
             )
         except Exception:
             pass
@@ -551,15 +587,18 @@ class QualityMatrixService:
             researcher_ok = bool(ctx.quality.researcher_available)
             base_rm = float(ctx.legacy_risk_multiplier)
 
+            mem = get_memory_config()
+            lookback = mem.quality_symbol_lookback_days
+            sym_limit = mem.quality_symbol_sql_limit
             rows = db.execute(
-                """SELECT symbol,
+                f"""SELECT symbol,
                           COUNT(*) as n,
                           AVG(execution_gap) as avg_gap,
                           SUM(CASE WHEN actual_pnl > 0 THEN 1 ELSE 0 END) * 1.0 / COUNT(*) as winrate
                    FROM trade_feedback
-                   WHERE ts >= date('now', '-7 days') || 'T00:00:00' AND symbol IS NOT NULL
+                   WHERE ts >= date('now', '-{lookback} days') || 'T00:00:00' AND symbol IS NOT NULL
                    GROUP BY symbol
-                   ORDER BY n DESC LIMIT 50""",
+                   ORDER BY n DESC LIMIT {sym_limit}""",
             ).fetchall()
 
             now = datetime.now(timezone.utc)
@@ -567,11 +606,18 @@ class QualityMatrixService:
             total_gap = 0.0
             total_n = 0
 
+            lc = get_loop_config()
             for r in rows:
                 sym = r["symbol"]
                 n = int(r["n"] or 0)
                 avg_gap = float(r["avg_gap"] or 0.0)
-                exec_q = max(0.05, min(0.95, 0.75 - abs(avg_gap) * 25.0))
+                exec_q = max(
+                    lc.symbol_exec_quality_min,
+                    min(
+                        lc.symbol_exec_quality_max,
+                        lc.symbol_exec_quality_base - abs(avg_gap) * lc.symbol_exec_quality_gap_coeff,
+                    ),
+                )
                 sq = SymbolQuality(
                     symbol=sym,
                     execution_quality=round(exec_q, 3),
@@ -586,33 +632,40 @@ class QualityMatrixService:
 
             self.matrix.symbol_quality = new_symq
 
-            global_exec = 0.5
+            global_exec = lc.global_exec_quality_default
             if total_n > 0:
-                global_exec = max(0.1, min(0.9, 0.7 - (total_gap / total_n) * 20))
+                global_exec = max(
+                    lc.global_exec_min,
+                    min(
+                        lc.global_exec_max,
+                        lc.global_exec_formula_base
+                        - (total_gap / total_n) * lc.global_exec_formula_gap_coeff,
+                    ),
+                )
             self.matrix.global_execution_quality = round(global_exec, 3)
 
             self._load_recent_from_db(db)
 
-            has_bad_exec = global_exec < 0.35 or any(
-                s.execution_quality < 0.3 for s in new_symq.values()
+            has_bad_exec = global_exec < lc.global_exec_degraded_threshold or any(
+                s.execution_quality < lc.symbol_exec_bad_threshold for s in new_symq.values()
             )
 
             if not researcher_ok or base_quality == "minimal":
                 self.matrix.overall_quality = "minimal"
-                self.matrix.risk_multiplier = min(base_rm, 0.4)
+                self.matrix.risk_multiplier = min(base_rm, lc.minimal_posture_rm_cap)
                 self.matrix.force_conservative_reasoning = True
-                self.matrix.suggested_temperature = 0.15
+                self.matrix.suggested_temperature = lc.matrix_temp_minimal
                 self.matrix.blocked_tool_categories = ["research"] if not researcher_ok else []
             elif has_bad_exec or base_quality == "limited":
                 self.matrix.overall_quality = "limited"
-                self.matrix.risk_multiplier = min(base_rm, 0.65)
+                self.matrix.risk_multiplier = min(base_rm, lc.limited_posture_rm_cap)
                 self.matrix.force_conservative_reasoning = True
-                self.matrix.suggested_temperature = 0.22
+                self.matrix.suggested_temperature = lc.matrix_temp_limited
             else:
                 self.matrix.overall_quality = "full"
                 self.matrix.risk_multiplier = base_rm
                 self.matrix.force_conservative_reasoning = False
-                self.matrix.suggested_temperature = 0.3
+                self.matrix.suggested_temperature = lc.matrix_temp_full
                 self.matrix.blocked_tool_categories = []
 
             self.matrix.last_populated = now

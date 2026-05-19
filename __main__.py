@@ -84,7 +84,10 @@ def _configure_scorer(args) -> None:
         )
         return
 
-    from core.config import TRADER_IN_PROCESS_SCORER_NEVER
+    from core.entry_cli import load_profit_config
+
+    profit = load_profit_config(dotenv=False)
+    trader_in_process_scorer_never = profit.risk.trader_in_process_scorer_never
     from core.runtime.heartbeat import (
         heartbeat_age_s,
         is_research_host_alive,
@@ -96,7 +99,7 @@ def _configure_scorer(args) -> None:
     research_host_alive = is_research_host_operational()
     heartbeat_fresh = is_research_host_alive()
     require_research_host = bool(
-        args.require_research_host or TRADER_IN_PROCESS_SCORER_NEVER
+        args.require_research_host or trader_in_process_scorer_never
     )
 
     if args.force_in_process:
@@ -120,7 +123,7 @@ def _configure_scorer(args) -> None:
         age_str = "never" if age == float("inf") else f"{age:.1f}s"
         status = read_research_host_status()
         hint = ""
-        if TRADER_IN_PROCESS_SCORER_NEVER and not args.require_research_host:
+        if trader_in_process_scorer_never and not args.require_research_host:
             hint = " (TRADER_IN_PROCESS_SCORER=never in .env)"
         msg = (
             f"Research scorer unavailable: research host not operational "
@@ -128,7 +131,7 @@ def _configure_scorer(args) -> None:
             f"Start ``python -m research`` on the research host, "
             f"or pass --force-in-process for dev only."
         )
-        if args.require_research_host and not TRADER_IN_PROCESS_SCORER_NEVER:
+        if args.require_research_host and not trader_in_process_scorer_never:
             msg = (
                 f"--require-research-host set but heartbeat is stale "
                 f"(age={age_str}). Start python -m research first, or drop the flag."
@@ -165,42 +168,37 @@ def _configure_scorer(args) -> None:
 
 def main() -> None:
     """Main entry point."""
-    from core.entry_cli import parse_trader_args
+    from core.entry_cli import apply_trader_cli_to_environ, load_profit_config, parse_trader_args
 
     args = parse_trader_args()
+    apply_trader_cli_to_environ(args)
+    profit = load_profit_config(dotenv=not args.test)
+
+    if getattr(args, "config_summary", False):
+        profit.summary()
+        return
+
     setup_logging(verbose=args.verbose)
 
     if args.test:
-        from dotenv import load_dotenv
-
-        load_dotenv(override=True)
         asyncio.run(test_grok())
         return
 
-    os.environ["IBKR_ACCOUNT_TYPE"] = args.account
-    if args.account == "live":
+    if args.account == "live" or profit.trading_mode == "live":
         logger.warning("*** LIVE TRADING MODE — real money ***")
-        if not os.environ.get("TRADING_MODE"):
-            os.environ["TRADING_MODE"] = "live"
-
-    from core.config import refresh_trading_identity_from_environ
-
-    refresh_trading_identity_from_environ()
     validate_startup()
-
-    from core import config as _budget_cfg
 
     print(
         "\nLLM / API spend guardrails (this app’s estimates — xAI console may differ):\n"
-        f"  • MAX_DAILY_LLM_COST ≈ ${_budget_cfg.MAX_DAILY_LLM_COST:.2f} tracked USD/day → agent halts\n"
-        f"  • research() cap ≈ ${_budget_cfg.MAX_DAILY_MULTI_AGENT_RESEARCH_USD:.2f} tracked USD/day\n"
-        "  • Daily token caps per bucket — see core/config.py / .env\n"
+        f"  • MAX_DAILY_LLM_COST ≈ ${profit.risk.max_daily_llm_cost:.2f} tracked USD/day → agent halts\n"
+        f"  • research() cap ≈ ${profit.risk.max_daily_multi_agent_research_usd:.2f} tracked USD/day\n"
+        "  • Daily token caps per bucket — run with --config-summary for full lever list\n"
         "  Match these to your prepaid balance; export MAX_DAILY_LLM_COST=… if needed.\n"
     )
     logger.info(
         "Budget defaults: MAX_DAILY_LLM_COST=%s MAX_DAILY_MULTI_AGENT_RESEARCH_USD=%s",
-        _budget_cfg.MAX_DAILY_LLM_COST,
-        _budget_cfg.MAX_DAILY_MULTI_AGENT_RESEARCH_USD,
+        profit.risk.max_daily_llm_cost,
+        profit.risk.max_daily_multi_agent_research_usd,
     )
 
     print(f"\n=== Grok Trader ({args.account}) ===")

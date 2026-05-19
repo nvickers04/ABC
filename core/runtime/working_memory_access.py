@@ -21,6 +21,7 @@ import time
 from typing import Any, Protocol, TypedDict, cast, runtime_checkable
 
 from core.log_context import get_logger
+from core.memory_config import get_memory_config
 from core.runtime.operating_context import get_operating_context
 
 logger = get_logger(__name__)
@@ -176,8 +177,9 @@ def summarize_wm_stores() -> WmStoreSummary:
         Summary dict with ``policy``, ``local``, and ``postgres`` counts.
         Postgres section may include ``error`` when unreachable.
     """
+    policy = get_memory_config().wm_policy
     summary: WmStoreSummary = {
-        "policy": "postgres_wins_no_merge",
+        "policy": policy,
         "local": {"total": 0, "by_section": {}},
         "postgres": {"total": 0, "by_section": {}},
     }
@@ -215,13 +217,14 @@ def log_wm_recovery_on_reconnect(*, had_local_fallback: bool) -> WmStoreSummary:
         The same structure as :func:`summarize_wm_stores`, plus ``had_local_fallback``.
     """
     summary = summarize_wm_stores()
+    policy = summary.get("policy", get_memory_config().wm_policy)
     local_n = int(summary["local"].get("total", 0))
     pg = summary["postgres"]
     pg_n = int(pg.get("total", 0)) if "error" not in pg else -1
 
     if had_local_fallback and local_n > 0:
         logger.info(
-            "WM recovery: researcher back online | policy=postgres_wins_no_merge | "
+            f"WM recovery: researcher back online | policy={policy} | "
             "local_live=%d postgres_live=%s | local archived at data/local_working_memory.json "
             "(not auto-merged) | local_sections=%s",
             local_n,
@@ -230,7 +233,7 @@ def log_wm_recovery_on_reconnect(*, had_local_fallback: bool) -> WmStoreSummary:
         )
     elif had_local_fallback:
         logger.info(
-            "WM recovery: researcher back online | policy=postgres_wins_no_merge | "
+            f"WM recovery: researcher back online | policy={policy} | "
             "local_live=0 | postgres_live=%s",
             pg_n if pg_n >= 0 else "unavailable",
         )

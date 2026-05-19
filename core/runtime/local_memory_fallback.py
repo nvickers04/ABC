@@ -15,6 +15,7 @@ import time
 from pathlib import Path
 from typing import Any
 
+from core.memory_config import get_memory_config
 from memory.working_memory import (
     DEFAULT_SECTION_SCORES,
     SECTION_CAPS,
@@ -23,7 +24,7 @@ from memory.working_memory import (
     _validate_section,
 )
 
-LOCAL_MEMORY_FILE = Path("data/local_working_memory.json")
+LOCAL_MEMORY_FILE = Path(get_memory_config().wm_local_file)
 LOCAL_MEMORY_FILE.parent.mkdir(parents=True, exist_ok=True)
 
 
@@ -209,7 +210,11 @@ class LocalWorkingMemoryStore:
             Markdown-style block or a placeholder when empty.
         """
         now = float(now_ts if now_ts is not None else time.time())
-        cap = max_entries_per_section if max_entries_per_section is not None else 5
+        cap = (
+            max_entries_per_section
+            if max_entries_per_section is not None
+            else get_memory_config().wm_render_local_default_max_entries
+        )
         lines = ["═══ WORKING MEMORY (local fallback) ═══"]
         any_content = False
         for section in SECTIONS:
@@ -223,7 +228,9 @@ class LocalWorkingMemoryStore:
             lines.append(f"**{section.upper()}**")
             show = entries[-cap:] if cap > 0 else entries
             for e in show:
-                text = str(e.get("entry_text", ""))[:300]
+                text = str(e.get("entry_text", ""))[
+                    : get_memory_config().wm_local_entry_text_max_chars
+                ]
                 lines.append(f"- {text}")
             if len(entries) > len(show):
                 lines.append(f"- … +{len(entries) - len(show)} older")

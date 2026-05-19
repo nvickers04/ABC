@@ -16,7 +16,7 @@ from __future__ import annotations
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
-from core.config import OPEN_GAP_GUARD_PCT, OPEN_GUARD_DELAY_MINUTES
+from core.loop_config import get_loop_config
 from core.log_context import get_logger
 from data.data_provider import get_data_provider
 from data.market_hours import get_market_hours_provider
@@ -51,11 +51,12 @@ async def evaluate_gap_guard(agent: Any) -> str:
             _mh = get_market_hours_provider()
             _info_gap = _mh.get_session_info()
             mins_since_open = _info_gap.get("minutes_to_close")
-            # Only check gap in first 5 minutes of regular session
+            # Only check gap in first N minutes of regular session
             if mins_since_open is not None:
-                total_regular = 390  # minutes in regular session
+                lc = get_loop_config()
+                total_regular = lc.gap_guard_regular_session_minutes
                 mins_elapsed = total_regular - mins_since_open
-                if mins_elapsed <= 5:
+                if mins_elapsed <= lc.gap_guard_check_window_minutes:
                     try:
                         dp = get_data_provider()
                         spy_quote = dp.get_quote("SPY")
@@ -70,14 +71,14 @@ async def evaluate_gap_guard(agent: Any) -> str:
                                 ) or last
                             if last > 0 and prev_close > 0:
                                 gap_pct = abs(last - prev_close) / prev_close * 100
-                                if gap_pct >= OPEN_GAP_GUARD_PCT:
+                                if gap_pct >= lc.gap_guard_spy_move_pct:
                                     agent._gap_guard_until = (
                                         datetime.now(timezone.utc)
-                                        + timedelta(minutes=OPEN_GUARD_DELAY_MINUTES)
+                                        + timedelta(minutes=lc.gap_guard_delay_minutes)
                                     )
                                     gap_guard_prompt = (
                                         f"\n⚠️ GAP GUARD: SPY gapped {gap_pct:.1f}% overnight. "
-                                        f"Waiting {OPEN_GUARD_DELAY_MINUTES} min before new entries. "
+                                        f"Waiting {lc.gap_guard_delay_minutes} min before new entries. "
                                         f"Manage existing positions only.\n"
                                     )
                                     logger.warning(f"Gap guard triggered: SPY gap {gap_pct:.1f}%")

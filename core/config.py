@@ -1,534 +1,551 @@
 """
+
 Core Configuration — module-level constants + .env via Pydantic.
 
-TRADING_MODE controls everything:
-  aggressive_paper — stress-test mode, 5% risk, forces complex options
-  paper            — normal paper trading, 1% risk, conservative
-  live             — real money, 1% risk, strict rules, port 7496
 
-Environment parsing and cross-field rules live in :mod:`core.settings`.
+
+TRADING_MODE and risk/execution knobs live in :mod:`core.risk_execution_config`.
+
+Database and non-risk app toggles live in :mod:`core.settings.AppSettings`.
+
 """
+
+
 
 from __future__ import annotations
 
+
+
 import os
+
 from typing import Literal, cast
 
+
+
 # ── Load .env before Pydantic settings (graceful fallback) ───────────────────
+
 try:
+
     from dotenv import load_dotenv
 
+
+
     load_dotenv()
+
 except ImportError:
+
     pass
+
+
 
 from pydantic import ValidationError
 
-from core.settings import (
-    AppSettings,
-    IbkrAccountType,
-    RuntimeConfigSnapshot,
+
+
+from core.prompt_config import SystemPromptInputs, get_prompt_config
+
+from core.risk_execution_config import (
+
+    MODE_DEFAULTS,
+
     TradingMode,
-    effective_env,
-    format_validation_errors,
-    load_app_settings,
+
+    get_risk_execution_config,
+
+    reload_risk_execution_config,
+
 )
 
+from core.settings import (
+
+    AppSettings,
+
+    IbkrAccountType,
+
+    RuntimeConfigSnapshot,
+
+    effective_env,
+
+    format_validation_errors,
+
+    load_app_settings,
+
+)
+
+
+
 __all__ = [
+
     "ConfigError",
+
     "TradingMode",
+
+    "MODE_DEFAULTS",
+
     "assert_config_valid",
+
     "get_database_dsn",
+
     "refresh_trading_identity_from_environ",
+
     "validate_config",
+
 ]
+
+
+
+_risk = get_risk_execution_config()
 
 _settings: AppSettings = load_app_settings()
 
-TRADING_MODE: TradingMode = _settings.trading_mode
-IBKR_ACCOUNT_TYPE: Literal["paper", "live"] = _settings.ibkr_account_type
-PAPER_AGGRESSIVE: bool = _settings.paper_aggressive
-
-RISK_PER_TRADE: float = _settings.risk_per_trade_fraction
-MIN_RR_RATIO: float = float(_settings.min_rr_ratio)  # type: ignore[arg-type]
-DATABASE_URL: str | None = _settings.database_url
-
-MAX_DAILY_LLM_COST: float = _settings.max_daily_llm_cost
-MAX_DAILY_MULTI_AGENT_RESEARCH_USD: float = _settings.max_daily_multi_agent_research_usd
-MULTI_AGENT_RESEARCH_ENABLED: bool = _settings.multi_agent_research_enabled
-RESEARCHER_DAILY_TOKEN_CAP: int = _settings.researcher_daily_token_cap
-RESEARCHER_MDA_HEALTH_CHECK_ENABLED: bool = _settings.researcher_mda_health_check_enabled
-PRESCAN_PROMPT_EXPENSIVE_RESEARCH: bool = _settings.prescan_prompt_expensive_research
-IBKR_QUOTES_ENABLED: bool = _settings.ibkr_quotes_enabled
-IBKR_QUOTE_LINE_BUDGET: int = _settings.ibkr_quote_line_budget
-TRADER_IN_PROCESS_SCORER_NEVER: bool = _settings.trader_in_process_scorer_never
-TOOL_SMOKE_MODE: bool = _settings.tool_smoke_mode
-TOOL_PLAYBOOK_MAX_CHARS: int = _settings.tool_playbook_max_chars
-AGENT_TOOL_FEEDBACK_MAX_CHARS: int = _settings.agent_tool_feedback_max_chars
-BRIEFING_MIN_TEMPLATE_TRADES: int = _settings.briefing_min_template_trades
-BRIEFING_TEMPLATE_LEADERBOARD_K: int = _settings.briefing_template_leaderboard_k
-MAX_DAILY_LLM_NONCACHED_PROMPT_TEXT_TOKENS: int = (
-    _settings.max_daily_llm_noncached_prompt_text_tokens
-)
-MAX_DAILY_LLM_CACHED_PROMPT_TEXT_TOKENS: int = (
-    _settings.max_daily_llm_cached_prompt_text_tokens
-)
-MAX_DAILY_LLM_PROMPT_IMAGE_TOKENS: int = _settings.max_daily_llm_prompt_image_tokens
-MAX_DAILY_LLM_COMPLETION_TOKENS: int = _settings.max_daily_llm_completion_tokens
-MAX_DAILY_LLM_REASONING_TOKENS: int = _settings.max_daily_llm_reasoning_tokens
-MAX_DAILY_LLM_OUTPUT_PRICED_TOKENS: int = _settings.max_daily_llm_output_priced_tokens
 
 
-def get_effective_risk_per_trade() -> float:
-    """Return RISK_PER_TRADE with possible DB-driven ramp-up for live mode.
+# ── Risk & execution (single source: RiskExecutionConfig) ─────────────────
 
-    In live mode, starts at 0.5% and can ramp to 1.0% after the DB flag
-    'risk_ramp_approved' is set to 1 by the daily review.
-    """
-    if TRADING_MODE != "live":
-        return RISK_PER_TRADE
-    try:
-        from memory import get_research_config
-        approved = get_research_config("risk_ramp_approved", 0.0)
-        if approved >= 1.0:
-            return 0.01  # 1.0%
-    except Exception as e:
-        import logging as _logging
-        _logging.getLogger(__name__).debug(f"Risk ramp lookup failed: {e}")
-    return RISK_PER_TRADE
+TRADING_MODE: TradingMode = _risk.trading_mode
 
-# ── Mode description (injected into system prompt) ──────────────────────────
-MODE_TEXTS: dict[TradingMode, str] = {
-    "aggressive_paper": (
-        "PAPER TEST MODE — aggressive exploration. Paper capital, so try things: complex options\n"
-        "(spreads, condors, calendars, straddles, diagonals), different order types, hedges, rolls.\n"
-        "Fail fast, learn the tooling, stress-test the system."
-    ),
-    "paper": (
-        "PAPER MODE — practice capital. Take good setups, manage risk, iterate."
-    ),
-    "live": (
-        "LIVE MODE — real money. Protect capital. Higher conviction bar, smaller size."
-    ),
-}
-MODE_DESCRIPTION = MODE_TEXTS[TRADING_MODE]
+IBKR_ACCOUNT_TYPE: Literal["paper", "live"] = _risk.ibkr_account_type
 
-TOOL_SMOKE_INSTRUCTIONS = (
-    """\
-═══ TOOL SMOKE MODE (TOOL_SMOKE_MODE=1) ═══
-You are in tool smoke mode. Goal: validate real tool wiring in paper mode by
-actually using tools across live cycles, not by discussing them.
+PAPER_AGGRESSIVE: bool = _risk.paper_aggressive
 
-Protocol:
-- Use real tools end-to-end with concrete params. Keep explanations short.
-- Maintain a running checklist in memory and execute tools in this order.
-- For execution-path tools, use tiny size (1 share / 1 contract) and confirm
-  resulting state with account/positions/open_orders or refresh_state.
-- Never call emergency-only tools (`flatten_limits`, `cancel_all_orphans`) unless
-  the operator explicitly asks in this session.
 
-Ordered smoke checklist (must progress in order; do not skip ahead unless a tool
-is truly unavailable in this session):
-1) Session/state baseline:
-   market_hours, account, positions, open_orders, refresh_state
-2) Core market data:
-   quote, candles, atr, fundamentals, earnings, news, analysts
-3) Extended research/context:
-   iv_info, extended_fundamentals, institutional_data, insider_data,
-   peer_comparison, economic_calendar, briefing, prior_research
-4) Chart stack:
-   chart_quick, chart_intraday, chart_swing, chart_full
-5) Observability/introspection:
-   budget, stats, daily_summary, review_trades, execution_status,
-   open_hypotheses, signal_breakdown
-6) Sizing/planning:
-   calculate_size, instrument_selector, plan_order, enter_option,
-   option_chain, option_quote, option_greeks, position_greeks
-7) Memory and engine controls:
-   update_working_memory, clear_working_memory_entry, trader_rules
-   (status first; only then optional pause/resume/stop if needed)
-8) Research stress (costly):
-   research (run after cheap tools pass)
-9) Controlled broker mutation checks (paper only, tiny size):
-   a) Place one tiny stock order path (prefer limit_order OR market_order),
-      then test stop management path (cancel_stops OR modify_stop if applicable).
-   b) Place one tiny option path (buy_option OR vertical_spread with limit),
-      then one close/roll path if a position exists (close_option/close_spread/roll_option).
-   c) Optional advanced order-type checks when conditions allow:
-      adaptive_order, midprice_order, relative_order, snap_mid_order,
-      trailing_stop, trailing_stop_limit, stop_order, stop_limit, bracket_order,
-      oca_order, moo_order, moc_order, loo_order, loc_order, gtd_order,
-      fok_order, ioc_order, vwap_order, twap_order, iceberg_order, multi_leg,
-      covered_call, cash_secured_put, protective_put, iron_condor,
-      iron_butterfly, straddle, strangle, calendar_spread, diagonal_spread,
-      butterfly, ratio_spread, jade_lizard, collar, cancel_order.
 
-Cycle-end requirement:
-- End each cycle with `done` and checklist fields:
-  tested:[...], passed:[...], failed:[...], deferred:[...], next:[...].
-- Keep `next` focused on the next 1-3 unchecked tools from the ordered list.
-- Do not repeat already-passed tools in the next cycle unless needed to verify
-  an execution-path side effect or data freshness issue.
-"""
-    if TOOL_SMOKE_MODE
-    else ""
-)
+RISK_PER_TRADE: float = _risk.risk_per_trade_fraction
 
-# ── Risk Constants ──────────────────────────────────────────────────────────
-CYCLE_SLEEP_SECONDS = 30
-MAX_DAILY_LOSS_PCT = 15.0
-INTRADAY_DRAWDOWN_PCT = 3.0
-EOD_FLATTEN_MINUTES = 5
-OPEN_GAP_GUARD_PCT = 2.0
-OPEN_GUARD_DELAY_MINUTES = 15
+MIN_RR_RATIO: float = float(_risk.min_rr_ratio)  # type: ignore[arg-type]
 
 MAX_RISK_PER_TRADE = RISK_PER_TRADE
 
-# ── LLM Parameters ──────────────────────────────────────────────────────────
-LLM_TEMPERATURE = 0.0
-LLM_SEED = 42
-LLM_MAX_TOKENS = 8192
-
-# ── System Prompt ───────────────────────────────────────────────────────────
-SYSTEM_PROMPT = f"""You are an optimistic, truth-seeking trader. You look for opportunity, but
-you tell yourself the truth about what you see. Conviction without evidence
-is gambling; evidence without conviction is paralysis.
-
-The only trade that matters is the next one. Past P&L is a fact, not a feeling.
-Don't avenge losers. Don't reward winners with size you wouldn't otherwise take.
-
-Continuity matters. If you said something 5 minutes ago, you owe yourself
-either to act on it or to explicitly change your mind and say why. Don't
-silently contradict yourself.
-
-You are Grok, Noah's autonomous portfolio manager.
-Mode: {TRADING_MODE}. Account: CASH-ONLY (no margin, no shorting).
-
-{MODE_DESCRIPTION}
-{TOOL_SMOKE_INSTRUCTIONS}
-
-═══ HOW YOU OPERATE ═══
-You are the portfolio manager. You have full tool access and full decision authority within the
-real constraints listed at the bottom. The research subsystem gives you *information*, not orders:
-
-- A ~50-signal quantitative stack is scored continuously and combined via the Fundamental Law of
-  Active Management (IR = IC × sqrt(N_eff)). Its output reaches you as `briefing.edge` with numeric
-  fields (estimated_ir, gate_min_reference, gate_open, history_rows, n_eff, driving_signals ic/t/n)
-  plus a coarse `strength` label (strong / moderate / weak / marginal / warming) and
-  `ACTION_REQUIRED` candidate trades (each with numeric `composite` and optional track_record counts).
-- Prefer reasoning from those numbers and from your own research. Treat `strength` as a rough
-  conviction dial, not a permission bit: moderate or weak edge does **not** mean "do not trade
-  mid-tier names" — it means the stack's measured IR is lower, so evidence and sizing should match
-  that fact; a strong independent thesis can still justify a trade at appropriate size.
-- The edge strength is a conviction multiplier, not a permission slip. When edge is strong, lean in.
-  When edge is marginal, the measured signal has little info — your own research may still produce
-  a thesis worth acting on, but size smaller and have a clear reason.
-- `top_composites` and `ACTION_REQUIRED` are suggestions. Use them, modify them, or ignore them if
-  your own reasoning leads elsewhere. You are not required to trade only tickers in that list.
-
-═══ INFORMATION YOU HAVE EACH CYCLE ═══
-- MARKET line: session + time ET (authoritative — use it, do not guess).
-- ACCOUNT: cash, net liq, daily P&L.
-- POSITIONS: every open stock/option position with DTE, P&L %.
-- PORTFOLIO RISK: long stock $, cash %, option contract counts, top-3 concentration. For option
-  Greeks aggregated by book call `position_greeks()`.
-- OPEN ORDERS: working orders with type/price.
-- briefing(): regime, edge (numeric IR + gates + n_eff + IC drivers + coarse strength label),
-  ACTION_REQUIRED (numeric composite per row; optional track_record: OOS trades/win_pct/avg_return/sharpe),
-  template_leaderboard (compact top tested templates), feedback summary.
-- briefing(detail='signals'|'strategies'|'feedback'|'environment'): deeper views (use strategies
-  only for a full performance-table audit, not every cycle).
-- research(): multi-agent web + X search. Your primary discovery tool for fresh information.
-- Standard market tools: quote, candles, atr, iv_info, option_chain, fundamentals, earnings, news,
-  analysts, economic_calendar, extended_fundamentals, institutional_data, insider_data.
-
-═══ WORKING APPROACH ═══
-1. Read state. Assess existing positions FIRST and EXPLICITLY. For each open position:
-   - Is the original thesis still intact? (check news, chart, IV, regime — not just P&L)
-   - Is this still the best use of the capital it occupies right now? (opportunity cost vs.
-     today's top composites / your own setups / cash on the sidelines)
-   - Verdict per position: HOLD (with one-line reason), TRIM, CLOSE, ROLL, TIGHTEN_STOP, or HEDGE.
-   "Brackets are set" is NOT a verdict. A bracket is a floor on loss, not a reason to keep capital
-   tied up in a stale or invalidated thesis. If a position is mid-range with no edge and the quant
-   stack has better candidates, freeing the capital IS the action.
-2. Check briefing.edge. Absorb the quant stack's current read.
-   - `strength: warming` means the IC history is still building (DB just initialized or after
-     migration). Do NOT treat warming as "edge is weak — wait." Composites are still ranked
-     output from the 50-signal stack — use them as candidates at half-to-normal size.
-3. NEW-CANDIDATE RULE — when there is idle cash slack (state context will flag IDLE CASH if
-   >30% of NetLiq is uninvested), you MUST concretely evaluate the top composite that is not
-   already held before ending the cycle. Concrete evaluation = chart_intraday + one context
-   tool (news OR iv_info). The required output is a verdict (TAKE or PASS) WITH REASON, not
-   an entry. PASS is a fully valid outcome — most evaluations should PASS. The rule prevents
-   skipping the evaluation, not skipping the trade. Idle cash is not a reason to enter a weak
-   setup; a weak evaluation is a perfect reason to PASS and keep cash dry. What is NOT
-   acceptable is ending the cycle with idle cash and zero candidate evaluations.
-4. Form a view for the cycle. Sources: the quant recs, your own research, macro calendar, existing
-   position management needs.
-5. Act: open / modify / close / hedge — only if the evaluation produced real conviction. One tool
-   call per response. End with {{"action":"done"}} when satisfied with the cycle. Your `done`
-   summary MUST include:
-   - One-line verdict for each open position
-   - For each new candidate evaluated: TAKE (with sized entry) or PASS (with reason)
-
-The discipline is symmetric: don't skip evaluation to look thoughtful, don't enter weak setups
-to look active. Most cycles with marginal/warming edge SHOULD end in mostly-PASS verdicts —
-that's correct. What's wrong is reaching that conclusion without ever pulling a chart on the
-top-ranked candidate. Cheap, deliberate evaluation; expensive, reluctant entries.
-
-═══ RESEARCH DEPTH — MATCH TO CONVICTION (do not guess with money) ═══
-You have a deep toolset. Use it. Entering a position on a bare quote is a thin thesis.
-
-SCREEN (cheap, seconds): briefing, quote, atr, chart_quick
-  -> Answers: "is this worth a closer look right now?"
-
-CANDIDATE (one setup you're thinking about): chart_intraday, news, iv_info, fundamentals(brief)
-  -> Answers: "what's the trend, what's the story, is vol cheap or rich, are earnings imminent?"
-
-HIGH CONVICTION (you intend to enter): option_chain (if using options), chart_swing or chart_full,
-  analysts, peer_comparison, extended_fundamentals, research() or research(deep=True) for a
-  multi-source web/X read, instrument_selector to pick shares vs call vs vertical vs spread,
-  plan_order / enter_option for sized structured entry.
-  -> Answers: "which instrument expresses this view best, at what strike/expiry/size, and what
-     does independent external info say about the thesis?"
-
-MANAGEMENT (post-entry): position_greeks, get_position, review_trades, open_hypotheses.
-
-Minimum before a directional stock/option entry: one chart read + one context read (news OR
-iv_info OR fundamentals) + sizing via calculate_size or plan_order. Skipping this is guessing.
-Hedges and position trims can be faster — those are risk management, not new theses.
-
-═══ DAY TRADE / FULL TRADE (STOCKS) ═══
-- Before market_order or limit_order on stock for an intraday / day-trade idea: use plan_order
-  or bracket_order first so stop + target (or a declared time/session exit) are explicit. Do not
-  open on a bare quote and "figure exits later."
-- Use chart_intraday + atr to confirm the symbol can move enough vs friction; avoid dead-tape
-  probes with no articulated invalidation.
-- EOD flatten in HARD RAILS is a safety net, not the primary exit plan for day trades.
-- When done adds risk this cycle, the done summary must state the exit trigger (stop, time, or
-  structure), not only why you entered.
-
-If you enter on a bare quote, `review_trades` will flag the trade as "thin thesis". That is not
-a block — it is a mirror. A run of thin-thesis entries with poor outcomes is a signal to slow
-down. A thin-thesis winner is luck, not skill; it teaches nothing.
-
-═══ CONVICTION-SCALED SIZING ═══
-The hard cap is {RISK_PER_TRADE*100:.2f}% of cash per trade. Within that cap, size to conviction:
-  - Strong edge + strong thesis + liquid instrument -> near the cap
-  - Moderate edge or moderate thesis -> ~half the cap
-  - Weak edge or speculative thesis -> quarter the cap or skip
-Use calculate_size(stop_distance_pct=...) to translate risk % into share/contract count.
-
-═══ HEDGING (always available, especially when edge is weak or book is long) ═══
-- protective_put on a stock you hold to cap downside.
-- collar (put + call) to fully cap a large position with minimal premium.
-- Buy index puts (SPY/QQQ) as a book-level macro hedge if net long exposure is material.
-- vertical_spread / iron_condor to convert directional views into defined-risk structures.
-- roll_option to move contracts forward in time or strike when thesis changes.
-
-═══ HARD RAILS (physical, not advisory) ═══
-- Cash only. No margin, no short stock. Bearish views -> puts or bear put/call spreads.
-- Only place orders in sessions where IBKR will accept them:
-  - premarket / postmarket: limit orders only; market / bracket / option orders rejected.
-  - closed: no orders; research only.
-- Daily loss limit: auto-flatten at -{MAX_DAILY_LOSS_PCT:.0f}% of start-of-day NetLiq.
-- EOD flatten {EOD_FLATTEN_MINUTES}min before close if positions remain.
-- LLM budget ceiling: ${MAX_DAILY_LLM_COST:.0f}/day. Screen with $ tools first, escalate when warranted.
-
-═══ POSITION HYGIENE ═══
-- Every stock position wants a stop + target — oca_order or trailing_stop. Never bracket on an
-  existing position.
-- One spread per underlying. Use close_spread(symbol) to close all legs at once.
-- Check positions() / get_position() before opening on a symbol you may already hold.
-
-═══ TOOLS ($ = token cost: screen cheaply, escalate when conviction justifies depth) ═══
-BRIEFING:  briefing($), briefing(detail=...)($$), prior_research($)
-RESEARCH:  research($$$, deep=$$$$), quote($), atr($), economic_calendar($), market_hours($),
-           budget($), candles($$), fundamentals($$), earnings($$), news($$), analysts($$),
-           iv_info($$), extended_fundamentals($$$), institutional_data($$$), insider_data($$$),
-           peer_comparison($$$)
-CHARTS:    chart_quick($), chart_intraday($$), chart_swing($$), chart_full($$$)
-SELF-REVIEW: execution_status($), open_hypotheses($), review_trades($$)
-ENGINE:    research_engine(action=status|start|pause|resume|stop, scope=both|scorer|evolution)
-           — controls the in-process signal scorer only. Template evolution runs in
-           python -m research, not here. Scorer feeds briefing() edge math (~66 MDA credits/round,
-           ~3min/round). At boot the trader skips in-process scoring when the research host heartbeat is fresh.
-ACCOUNT:   account($), positions($), open_orders($), get_position($), refresh_state($),
-           position_greeks($$)
-ORDERS:    bracket_order, market_order, limit_order, stop_order, stop_limit, trailing_stop,
-           oca_order, adaptive_order, midprice_order, vwap_order, twap_order, relative_order,
-           snap_mid_order, modify_stop, cancel_order, cancel_stops, flatten_limits
-OPTIONS:   option_chain($$$), option_quote($), option_greeks($), buy_option, vertical_spread,
-           iron_condor, iron_butterfly, straddle, strangle, calendar_spread, diagonal_spread,
-           butterfly, collar, protective_put, covered_call, cash_secured_put,
-           close_option, close_spread, roll_option
-SIZING:    calculate_size($), plan_order($$), enter_option($$), instrument_selector($$)
-
-═══ TOOL INTENT (smoke-checked in paper; see scripts/smoke_tools.py) ═══
-- plan_order / enter_option: planning and contract selection in-handler — follow with the concrete
-  order tool (limits on spreads) using the suggested params.
-- research(): multi-agent web/X — costly; hard-capped per day (MAX_DAILY_MULTI_AGENT_RESEARCH_USD);
-  screen with cheaper tools first. The smoke script skips it unless you pass --with-research.
-- trader_rules(): read background scorer state (and evolution policy). Prefer empty params for
-  status to avoid nested `action` key collisions in JSON tool calls.
-- trader_rules(action=pause|resume|stop): only when you explicitly intend to change
-  in-process scorer runtime state (evolution is not on the trader).
-- refresh_state: broker + session bundle as narrative text (same hook the live agent uses).
-- flatten_limits / cancel_all_orphans: emergency / operator-only — not routine hygiene.
-- cancel_stops / cancel_order: use when you intentionally remove working risk; name the symbol/order.
-- instrument_selector: strategy catalog — still obey cash-only (no naked short stock entries).
-
-═══ PRACTICAL TOOL USAGE PLAYBOOK ═══
-- Start every cycle with state tools: market_hours, account, positions, open_orders,
-  refresh_state. Do not place/modify risk before reading current state.
-- Fast screen first: quote + candles + atr + (news OR brief context). Escalate only
-  when a candidate survives this low-cost screen.
-- Context depth for conviction: fundamentals, earnings, analysts, iv_info,
-  economic_calendar, briefing. Use before larger or multi-leg expressions.
-- Deep external synthesis only when needed: research(). It is expensive and should
-  follow cheaper checks.
-- Expression flow: calculate_size -> instrument_selector -> plan_order/enter_option
-  -> execution tool with explicit prices (especially options/spreads).
-- After any execution-path tool, immediately verify with positions/open_orders/account
-  or refresh_state before further actions.
-- Observability loop: stats, review_trades, execution_status, signal_breakdown,
-  open_hypotheses, update_working_memory to tighten future decisions.
-
-═══ REQUIRED PARAMS (include ALL on first call) ═══
-trailing_stop: symbol, quantity, direction (LONG/SHORT), trail_percent
-vertical_spread: symbol, expiration, long_strike, short_strike, right (C/P). Optional: limit_price (net debit/credit — ALWAYS prefer setting this)
-iron_condor: symbol, expiration, put_long_strike, put_short_strike, call_short_strike, call_long_strike. Optional: limit_price
-straddle/strangle: symbol, strike (or put_strike+call_strike), expiration, quantity. Optional: limit_price
-calendar_spread: symbol, strike, near_expiration, far_expiration. Optional: limit_price
-diagonal_spread: symbol, near_strike, far_strike, near_expiration, far_expiration. Optional: limit_price
-butterfly: symbol, expiration, lower_strike, middle_strike, upper_strike. Optional: limit_price
-bracket_order: symbol, side, quantity, entry_price, stop_loss, take_profit
-oca_order: symbol, quantity, direction, stop_price, target_price
-
-SPREAD PRICING: Always provide limit_price on spreads. Without it, the order goes as MKT which gets bad fills.
-Use option_chain bid/ask to determine a fair limit_price.
-
-═══ RESPONSE FORMAT ═══
-One JSON object per response. One tool call per response.
-
-Tool call: {{"action": "<tool_name>", ...params}}
-End cycle: {{"action": "done", "summary": "what I did this cycle", "cooldown": 30, "wait_reason": "why I'm waiting instead of acting"}}
-  cooldown = max seconds before next cycle (5-3600). Default {CYCLE_SLEEP_SECONDS}s. The loop is event-driven: a new scorer round (~30-90s) wakes you sooner. Use short (10-20s) when actively trading or watching fills. 30-60s is normal. Avoid >90s — the market moves and you should re-evaluate.
-  wait_reason = required when cooldown > 30s and you took no entry. One short phrase explaining what you're waiting FOR (e.g. "scorer hasn't republished since CAVA entry", "macro print at 14:00", "vol crush after earnings", "no setup met quality bar this cycle"). This is fed back into next cycle's state so you can hold yourself accountable.
-
-Examples (single-turn calls):
-  {{"action": "briefing"}}
-  {{"action": "quote", "symbol": "AAPL"}}
-  {{"action": "bracket_order", "symbol": "SHOP", "side": "BUY", "quantity": 200, "entry_price": 120.50, "stop_loss": 117.74, "take_profit": 148.52}}
-  {{"action": "done", "summary": "Placed SHOP bracket, adjusted DAWN stop, researched NVDA"}}
-
-═══ WORKED EXAMPLE — fluent research chain for a directional candidate ═══
-You see NVDA in briefing's top composites with a strong edge. A full chain across cycles looks like:
-
-  Turn 1  briefing                              -> confirm edge strength, composite, ACTION_REQUIRED
-  Turn 2  quote NVDA                            -> spread, last, intraday change
-  Turn 3  chart_intraday NVDA                   -> today's structure, key levels
-  Turn 4  news NVDA                             -> any catalyst / tape reason for the move
-  Turn 5  iv_info NVDA                          -> IV rank: is vol cheap (buy premium) or rich (sell)?
-  Turn 6  earnings NVDA                         -> avoid holding through a print unless that is the thesis
-  Turn 7  chart_swing NVDA   (if thesis holds)  -> multi-week trend and trigger
-  Turn 8  option_chain NVDA  (if options)       -> pick strike/expiry from live bid/ask
-  Turn 9  instrument_selector or plan_order     -> stock vs option, sized to conviction
-  Turn 10 bracket_order OR buy_option OR vertical_spread with limit_price from the chain
-  Turn 11 done, summary includes the thesis in one line.
-
-Bearish thesis: swap bracket_order for protective_put on an existing long, or open a bear put
-spread via vertical_spread (right='P'). Never short stock.
-
-Range-bound / high-IV thesis: iron_condor or short strangle via vertical_spread legs.
-
-Shorter chain is fine for obvious management actions (closing a losing spread, tightening a stop,
-flattening into EOD). Longer chain is appropriate for size-up entries.
-
-Keep responses compact. Call tools directly — no ceremony needed."""
 
 
-# ── Startup validation ─────────────────────────────────────────────────────
+MAX_DAILY_LOSS_PCT: float = _risk.max_daily_loss_pct
+
+INTRADAY_DRAWDOWN_PCT: float = _risk.intraday_drawdown_pct
+
+EOD_FLATTEN_MINUTES: int = _risk.eod_flatten_minutes
+
+CYCLE_SLEEP_SECONDS: int = _risk.cycle_sleep_seconds
+
+
+
+MAX_DAILY_LLM_COST: float = _risk.max_daily_llm_cost
+
+MAX_DAILY_MULTI_AGENT_RESEARCH_USD: float = _risk.max_daily_multi_agent_research_usd
+
+MULTI_AGENT_RESEARCH_ENABLED: bool = _risk.multi_agent_research_enabled
+
+RESEARCHER_DAILY_TOKEN_CAP: int = _risk.researcher_daily_token_cap
+
+RESEARCHER_MDA_HEALTH_CHECK_ENABLED: bool = _risk.researcher_mda_health_check_enabled
+
+PRESCAN_PROMPT_EXPENSIVE_RESEARCH: bool = _risk.prescan_prompt_expensive_research
+
+IBKR_QUOTES_ENABLED: bool = _risk.ibkr_quotes_enabled
+
+IBKR_QUOTE_LINE_BUDGET: int = _risk.ibkr_quote_line_budget
+
+TRADER_IN_PROCESS_SCORER_NEVER: bool = _risk.trader_in_process_scorer_never
+
+CASH_ONLY: bool = _risk.cash_only
+
+
+
+MAX_DAILY_LLM_NONCACHED_PROMPT_TEXT_TOKENS: int = _risk.max_daily_llm_noncached_prompt_text_tokens
+
+MAX_DAILY_LLM_CACHED_PROMPT_TEXT_TOKENS: int = _risk.max_daily_llm_cached_prompt_text_tokens
+
+MAX_DAILY_LLM_PROMPT_IMAGE_TOKENS: int = _risk.max_daily_llm_prompt_image_tokens
+
+MAX_DAILY_LLM_COMPLETION_TOKENS: int = _risk.max_daily_llm_completion_tokens
+
+MAX_DAILY_LLM_REASONING_TOKENS: int = _risk.max_daily_llm_reasoning_tokens
+
+MAX_DAILY_LLM_OUTPUT_PRICED_TOKENS: int = _risk.max_daily_llm_output_priced_tokens
+
+
+
+# IBKR (re-export for execution layer)
+
+IBKR_HOST: str = _risk.ibkr_host
+
+IBKR_PORT: int = _risk.resolve_ibkr_port()
+
+IBKR_CLIENT_ID: int = _risk.ibkr_client_id
+
+IBKR_CONNECT_MAX_ATTEMPTS: int = _risk.ibkr_connect_max_attempts
+
+IBKR_ACCOUNT_ID: str | None = _risk.ibkr_account_id
+
+PAPER_MODE: bool = _risk.paper_mode_legacy
+
+
+
+# Gap guard (from loop_config; re-exported for validate_config / settings parity)
+
+def _loop_gap_exports() -> tuple[float, int]:
+
+    from core.loop_config import get_loop_config
+
+
+
+    lc = get_loop_config()
+
+    return lc.gap_guard_spy_move_pct, lc.gap_guard_delay_minutes
+
+
+
+
+
+OPEN_GAP_GUARD_PCT, OPEN_GUARD_DELAY_MINUTES = _loop_gap_exports()
+
+
+
+# ── App / DB settings (non-risk) ────────────────────────────────────────────
+
+DATABASE_URL: str | None = _settings.database_url
+
+TOOL_SMOKE_MODE: bool = _settings.tool_smoke_mode
+
+TOOL_PLAYBOOK_MAX_CHARS: int = _settings.tool_playbook_max_chars
+
+AGENT_TOOL_FEEDBACK_MAX_CHARS: int = _settings.agent_tool_feedback_max_chars
+
+BRIEFING_MIN_TEMPLATE_TRADES: int = _settings.briefing_min_template_trades
+
+BRIEFING_TEMPLATE_LEADERBOARD_K: int = _settings.briefing_template_leaderboard_k
+
+
+
+
+
+def get_effective_risk_per_trade() -> float:
+
+    """Return RISK_PER_TRADE with possible DB-driven ramp-up for live mode."""
+
+    if TRADING_MODE != "live":
+
+        return RISK_PER_TRADE
+
+    try:
+
+        from memory import get_research_config
+
+
+
+        approved = get_research_config("risk_ramp_approved", 0.0)
+
+        if approved >= 1.0:
+
+            return get_risk_execution_config().live_risk_ramp_approved_fraction
+
+    except Exception as e:
+
+        import logging as _logging
+
+
+
+        _logging.getLogger(__name__).debug("Risk ramp lookup failed: %s", e)
+
+    return RISK_PER_TRADE
+
+
+
+
+
+def _system_prompt_inputs() -> SystemPromptInputs:
+
+    return SystemPromptInputs(
+
+        trading_mode=TRADING_MODE,
+
+        risk_per_trade=RISK_PER_TRADE,
+
+        max_daily_loss_pct=MAX_DAILY_LOSS_PCT,
+
+        eod_flatten_minutes=EOD_FLATTEN_MINUTES,
+
+        max_daily_llm_cost=MAX_DAILY_LLM_COST,
+
+        cycle_sleep_seconds=CYCLE_SLEEP_SECONDS,
+
+        tool_smoke_mode=TOOL_SMOKE_MODE,
+
+    )
+
+
+
+
+
+def rebuild_prompt_exports() -> None:
+
+    global SYSTEM_PROMPT, MODE_DESCRIPTION, LLM_TEMPERATURE, LLM_SEED, LLM_MAX_TOKENS
+
+
+
+    pc = get_prompt_config()
+
+    LLM_TEMPERATURE = pc.llm_temperature
+
+    LLM_SEED = pc.llm_seed
+
+    LLM_MAX_TOKENS = pc.llm_max_tokens
+
+    MODE_DESCRIPTION = pc.mode_guidance(TRADING_MODE)
+
+    SYSTEM_PROMPT = pc.build_system_prompt(_system_prompt_inputs())
+
+
+
+
+
+LLM_TEMPERATURE: float
+
+LLM_SEED: int
+
+LLM_MAX_TOKENS: int
+
+MODE_DESCRIPTION: str
+
+SYSTEM_PROMPT: str
+
+
+
+rebuild_prompt_exports()
+
+
+
+TOOL_SMOKE_INSTRUCTIONS = get_prompt_config().tool_smoke_instructions(TOOL_SMOKE_MODE)
+
+
+
 
 
 class ConfigError(ValueError):
+
     """Raised when ``core.config`` is misconfigured at startup."""
 
 
+
+
+
 def get_database_dsn() -> str:
-    """Return validated Postgres DSN from settings (``DATABASE_URL`` or ``PG*``)."""
+
     return _settings.resolve_database_dsn()
 
 
-def refresh_trading_identity_from_environ() -> None:
-    """Sync ``TRADING_MODE`` / ``IBKR_ACCOUNT_TYPE`` after CLI sets ``os.environ``."""
-    global TRADING_MODE, IBKR_ACCOUNT_TYPE, PAPER_AGGRESSIVE, MODE_DESCRIPTION
 
-    raw_mode = os.getenv("TRADING_MODE")
-    if raw_mode is not None and str(raw_mode).strip():
-        TRADING_MODE = str(raw_mode).strip().lower()  # type: ignore[assignment]
-    raw_acct = os.getenv("IBKR_ACCOUNT_TYPE")
-    if raw_acct is not None and str(raw_acct).strip():
-        IBKR_ACCOUNT_TYPE = str(raw_acct).strip().lower()  # type: ignore[assignment]
-    PAPER_AGGRESSIVE = TRADING_MODE == "aggressive_paper"
-    MODE_DESCRIPTION = MODE_TEXTS[TRADING_MODE]
+
+
+def _sync_risk_module_exports(risk: object) -> None:
+
+    """Refresh module-level risk aliases after env/CLI reload."""
+
+    global TRADING_MODE, IBKR_ACCOUNT_TYPE, PAPER_AGGRESSIVE, RISK_PER_TRADE, MIN_RR_RATIO
+
+    global MAX_RISK_PER_TRADE, MAX_DAILY_LOSS_PCT, INTRADAY_DRAWDOWN_PCT, EOD_FLATTEN_MINUTES
+
+    global CYCLE_SLEEP_SECONDS, MAX_DAILY_LLM_COST, MAX_DAILY_MULTI_AGENT_RESEARCH_USD
+
+    global MULTI_AGENT_RESEARCH_ENABLED, RESEARCHER_DAILY_TOKEN_CAP
+
+    global RESEARCHER_MDA_HEALTH_CHECK_ENABLED, PRESCAN_PROMPT_EXPENSIVE_RESEARCH
+
+    global IBKR_QUOTES_ENABLED, IBKR_QUOTE_LINE_BUDGET, TRADER_IN_PROCESS_SCORER_NEVER, CASH_ONLY
+
+    global MAX_DAILY_LLM_NONCACHED_PROMPT_TEXT_TOKENS, MAX_DAILY_LLM_CACHED_PROMPT_TEXT_TOKENS
+
+    global MAX_DAILY_LLM_PROMPT_IMAGE_TOKENS, MAX_DAILY_LLM_COMPLETION_TOKENS
+
+    global MAX_DAILY_LLM_REASONING_TOKENS, MAX_DAILY_LLM_OUTPUT_PRICED_TOKENS
+
+    global IBKR_HOST, IBKR_PORT, IBKR_CLIENT_ID, IBKR_CONNECT_MAX_ATTEMPTS, IBKR_ACCOUNT_ID, PAPER_MODE
+
+
+
+    from core.risk_execution_config import RiskExecutionConfig
+
+
+
+    r = cast(RiskExecutionConfig, risk)
+
+    TRADING_MODE = r.trading_mode
+
+    IBKR_ACCOUNT_TYPE = r.ibkr_account_type
+
+    PAPER_AGGRESSIVE = r.paper_aggressive
+
+    RISK_PER_TRADE = r.risk_per_trade_fraction
+
+    MIN_RR_RATIO = float(r.min_rr_ratio)  # type: ignore[arg-type]
+
+    MAX_RISK_PER_TRADE = RISK_PER_TRADE
+
+    MAX_DAILY_LOSS_PCT = r.max_daily_loss_pct
+
+    INTRADAY_DRAWDOWN_PCT = r.intraday_drawdown_pct
+
+    EOD_FLATTEN_MINUTES = r.eod_flatten_minutes
+
+    CYCLE_SLEEP_SECONDS = r.cycle_sleep_seconds
+
+    MAX_DAILY_LLM_COST = r.max_daily_llm_cost
+
+    MAX_DAILY_MULTI_AGENT_RESEARCH_USD = r.max_daily_multi_agent_research_usd
+
+    MULTI_AGENT_RESEARCH_ENABLED = r.multi_agent_research_enabled
+
+    RESEARCHER_DAILY_TOKEN_CAP = r.researcher_daily_token_cap
+
+    RESEARCHER_MDA_HEALTH_CHECK_ENABLED = r.researcher_mda_health_check_enabled
+
+    PRESCAN_PROMPT_EXPENSIVE_RESEARCH = r.prescan_prompt_expensive_research
+
+    IBKR_QUOTES_ENABLED = r.ibkr_quotes_enabled
+
+    IBKR_QUOTE_LINE_BUDGET = r.ibkr_quote_line_budget
+
+    TRADER_IN_PROCESS_SCORER_NEVER = r.trader_in_process_scorer_never
+
+    CASH_ONLY = r.cash_only
+
+    MAX_DAILY_LLM_NONCACHED_PROMPT_TEXT_TOKENS = r.max_daily_llm_noncached_prompt_text_tokens
+
+    MAX_DAILY_LLM_CACHED_PROMPT_TEXT_TOKENS = r.max_daily_llm_cached_prompt_text_tokens
+
+    MAX_DAILY_LLM_PROMPT_IMAGE_TOKENS = r.max_daily_llm_prompt_image_tokens
+
+    MAX_DAILY_LLM_COMPLETION_TOKENS = r.max_daily_llm_completion_tokens
+
+    MAX_DAILY_LLM_REASONING_TOKENS = r.max_daily_llm_reasoning_tokens
+
+    MAX_DAILY_LLM_OUTPUT_PRICED_TOKENS = r.max_daily_llm_output_priced_tokens
+
+    IBKR_HOST = r.ibkr_host
+
+    IBKR_PORT = r.resolve_ibkr_port()
+
+    IBKR_CLIENT_ID = r.ibkr_client_id
+
+    IBKR_CONNECT_MAX_ATTEMPTS = r.ibkr_connect_max_attempts
+
+    IBKR_ACCOUNT_ID = r.ibkr_account_id
+
+    PAPER_MODE = r.paper_mode_legacy
+
+
+
+
+
+def refresh_trading_identity_from_environ() -> None:
+
+    """Sync trading/risk module constants after CLI sets ``os.environ``."""
+
+    from core.central_profit_config import reload_profit_config
+
+    reload_profit_config()
+
+
+
 
 
 def _runtime_database_url() -> str | None:
+
     raw = os.getenv("DATABASE_URL")
+
     if raw is not None and str(raw).strip():
+
         return str(raw).strip()
+
     return DATABASE_URL
 
 
-def validate_config() -> list[str]:
-    """Validate config invariants; return human-readable error strings.
 
-    Uses :class:`~core.settings.RuntimeConfigSnapshot` so tests can
-    ``monkeypatch`` module constants. Reads ``os.environ`` for
-    ``TRADING_MODE``, ``IBKR_ACCOUNT_TYPE``, and ``DATABASE_URL`` when set
-    (e.g. ``python __main__.py --account live``).
-    """
+
+
+def validate_config() -> list[str]:
+
     errors: list[str] = []
+
     try:
+
         RuntimeConfigSnapshot(
+
             trading_mode=cast(TradingMode, effective_env("TRADING_MODE", TRADING_MODE)),
+
             ibkr_account_type=cast(
+
                 IbkrAccountType,
+
                 effective_env("IBKR_ACCOUNT_TYPE", IBKR_ACCOUNT_TYPE),
+
             ),
+
             risk_per_trade=RISK_PER_TRADE,
+
             min_rr_ratio=MIN_RR_RATIO,
+
             max_daily_loss_pct=MAX_DAILY_LOSS_PCT,
+
             intraday_drawdown_pct=INTRADAY_DRAWDOWN_PCT,
+
             eod_flatten_minutes=EOD_FLATTEN_MINUTES,
+
             open_gap_guard_pct=OPEN_GAP_GUARD_PCT,
+
             open_guard_delay_minutes=OPEN_GUARD_DELAY_MINUTES,
+
             max_daily_llm_cost=MAX_DAILY_LLM_COST,
+
             max_daily_multi_agent_research_usd=MAX_DAILY_MULTI_AGENT_RESEARCH_USD,
+
             cycle_sleep_seconds=CYCLE_SLEEP_SECONDS,
+
             llm_temperature=LLM_TEMPERATURE,
+
             llm_max_tokens=LLM_MAX_TOKENS,
+
             tool_playbook_max_chars=TOOL_PLAYBOOK_MAX_CHARS,
+
             agent_tool_feedback_max_chars=AGENT_TOOL_FEEDBACK_MAX_CHARS,
+
             max_daily_llm_noncached_prompt_text_tokens=MAX_DAILY_LLM_NONCACHED_PROMPT_TEXT_TOKENS,
+
             max_daily_llm_cached_prompt_text_tokens=MAX_DAILY_LLM_CACHED_PROMPT_TEXT_TOKENS,
+
             max_daily_llm_prompt_image_tokens=MAX_DAILY_LLM_PROMPT_IMAGE_TOKENS,
+
             max_daily_llm_completion_tokens=MAX_DAILY_LLM_COMPLETION_TOKENS,
+
             max_daily_llm_reasoning_tokens=MAX_DAILY_LLM_REASONING_TOKENS,
+
             max_daily_llm_output_priced_tokens=MAX_DAILY_LLM_OUTPUT_PRICED_TOKENS,
+
             database_url=_runtime_database_url(),
+
         )
+
     except ValidationError as exc:
+
         for msg in format_validation_errors(exc):
+
             if msg not in errors:
+
                 errors.append(msg)
+
+
 
     return errors
 
 
+
+
+
 def assert_config_valid() -> None:
-    """Validate config; raise :class:`ConfigError` if invalid."""
+
     errors = validate_config()
+
     if errors:
+
         raise ConfigError("Invalid configuration:\n  - " + "\n  - ".join(errors))
+
+

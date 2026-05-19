@@ -2,55 +2,42 @@
 
 Uses a simple chars÷4 heuristic (no tiktoken dependency). QualityMatrix
 posture lines are always preserved; narrative blocks are trimmed first.
+
+All numeric caps come from :mod:`core.memory_config`.
 """
 
 from __future__ import annotations
 
 import logging
-import os
 from dataclasses import dataclass
 from typing import Any
 
 from core.log_context import get_logger
+from core.memory_config import get_memory_config
 
 logger = get_logger(__name__)
 
-_CHARS_PER_TOKEN = 4.0
 
-
-def _env_int(name: str, default: int) -> int:
-    raw = os.getenv(name, "").strip()
-    if not raw:
-        return default
-    try:
-        return max(0, int(raw))
-    except ValueError:
-        return default
-
-
-# Soft caps (override via env)
-CYCLE_WM_MAX_CHARS = _env_int("CYCLE_WM_MAX_CHARS", 2400)
-CYCLE_ATTENTION_MAX_CHARS = _env_int("CYCLE_ATTENTION_MAX_CHARS", 1200)
-CYCLE_INTUITION_TOP_N = _env_int("CYCLE_INTUITION_TOP_N", 3)
-CYCLE_SNAPSHOT_MAX = _env_int("CYCLE_SNAPSHOT_MAX", 3)
-CYCLE_SNAPSHOT_CHARS = _env_int("CYCLE_SNAPSHOT_CHARS", 100)
-CYCLE_LAST_SUMMARY_CHARS = _env_int("CYCLE_LAST_SUMMARY_CHARS", 160)
-CYCLE_GUIDANCE_MAX_CHARS = _env_int("CYCLE_GUIDANCE_MAX_CHARS", 400)
+def _mem():
+    return get_memory_config()
 
 
 def estimate_tokens(text: str) -> int:
     """Rough token count from character length (~4 chars/token)."""
     if not text:
         return 0
-    return max(1, int((len(text) + _CHARS_PER_TOKEN - 1) / _CHARS_PER_TOKEN))
+    cpt = _mem().chars_per_token
+    return max(1, int((len(text) + cpt - 1) / cpt))
 
 
-def truncate_text(text: str, max_chars: int, *, marker: str = "\n…[trimmed]\n") -> str:
+def truncate_text(text: str, max_chars: int, *, marker: str | None = None) -> str:
     """Truncate with a visible marker; no-op when ``max_chars <= 0``."""
     if max_chars <= 0 or len(text) <= max_chars:
         return text
-    room = max(80, max_chars - len(marker))
-    return text[:room] + marker
+    cfg = _mem()
+    m = marker if marker is not None else cfg.truncate_marker
+    room = max(cfg.truncate_min_room, max_chars - len(m))
+    return text[:room] + m
 
 
 @dataclass
@@ -112,18 +99,25 @@ def build_continuity_block(
     last_wait_reason: str = "",
     last_wake_reason: str = "",
     market_snapshots: list[str] | None = None,
-    max_snapshots: int = CYCLE_SNAPSHOT_MAX,
-    max_snapshot_chars: int = CYCLE_SNAPSHOT_CHARS,
-    max_summary_chars: int = CYCLE_LAST_SUMMARY_CHARS,
+    max_snapshots: int | None = None,
+    max_snapshot_chars: int | None = None,
+    max_summary_chars: int | None = None,
 ) -> str:
     """Compact rolling continuity (last cycle + wake + recent snapshots)."""
+    cfg = _mem()
+    max_snapshots = cfg.cycle_snapshot_max if max_snapshots is None else max_snapshots
+    max_snapshot_chars = cfg.cycle_snapshot_chars if max_snapshot_chars is None else max_snapshot_chars
+    max_summary_chars = cfg.cycle_last_summary_chars if max_summary_chars is None else max_summary_chars
     parts: list[str] = []
     if last_cycle_summary:
         parts.append(f"LAST: {truncate_text(last_cycle_summary, max_summary_chars, marker='…')}")
     if last_wait_reason or last_wake_reason:
         wr = last_wait_reason or "—"
         wk = last_wake_reason or "timer"
-        parts.append(f"WAIT:{truncate_text(wr, 80, marker='…')} | WAKE:{truncate_text(wk, 60, marker='…')}")
+        parts.append(
+            f"WAIT:{truncate_text(wr, cfg.continuity_wait_reason_max_chars, marker='…')} "
+            f"| WAKE:{truncate_text(wk, cfg.continuity_wake_reason_max_chars, marker='…')}"
+        )
     snaps = market_snapshots or []
     if snaps:
         tail = snaps[-max_snapshots:]

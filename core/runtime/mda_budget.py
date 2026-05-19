@@ -22,13 +22,7 @@ import time
 from typing import Any, Optional
 
 from core.log_context import get_logger
-from research.config import (
-    MDA_CRITICAL_CREDIT_FRACTION,
-    MDA_LOW_CREDIT_FRACTION,
-    MDA_MAX_SLEEP_MULTIPLIER,
-    MDA_SKIP_SUBDAILY_FRACTION,
-    MDA_SOFT_CREDIT_FRACTION,
-)
+from core.risk_execution_config import get_risk_execution_config
 
 logger = get_logger(__name__)
 
@@ -69,33 +63,35 @@ def seconds_until_mda_reset(usage: dict[str, Any]) -> Optional[float]:
 
 def mda_cadence_multiplier(usage: dict[str, Any]) -> float:
     """Scale sleep from **balance only** (remaining / limit): 1.0 / 1.35 / 2 / 4."""
+    rc = get_risk_execution_config()
     frac = credit_fraction(usage)
     if frac is None:
         return 1.0
-    if frac < MDA_CRITICAL_CREDIT_FRACTION:
-        return 4.0
-    if frac < MDA_LOW_CREDIT_FRACTION:
-        return 2.0
-    if frac < MDA_SOFT_CREDIT_FRACTION:
-        return 1.35
+    if frac < rc.mda_critical_credit_fraction:
+        return rc.mda_cadence_mult_critical
+    if frac < rc.mda_low_credit_fraction:
+        return rc.mda_cadence_mult_low
+    if frac < rc.mda_soft_credit_fraction:
+        return rc.mda_cadence_mult_soft
     return 1.0
 
 
 def mda_runway_multiplier(usage: dict[str, Any]) -> float:
     """Extra stretch when little time remains before reset but credits are already low."""
+    rc = get_risk_execution_config()
     sec = seconds_until_mda_reset(usage)
     frac = credit_fraction(usage)
     if sec is None or frac is None:
         return 1.0
     hours = sec / 3600.0
     m = 1.0
-    if hours < 1.0 and frac < 0.28:
+    if hours < 1.0 and frac < rc.mda_soft_credit_fraction * 0.58:
         m = max(m, 2.0)
-    elif hours < 3.0 and frac < 0.38:
+    elif hours < 3.0 and frac < rc.mda_soft_credit_fraction * 0.79:
         m = max(m, 1.6)
-    elif hours < 8.0 and frac < 0.48:
+    elif hours < 8.0 and frac < rc.mda_soft_credit_fraction:
         m = max(m, 1.3)
-    elif hours < 14.0 and frac < 0.55:
+    elif hours < 14.0 and frac < rc.mda_soft_credit_fraction * 1.15:
         m = max(m, 1.15)
     return m
 
@@ -112,17 +108,21 @@ def _mda_burn_multiplier_and_note(usage: dict[str, Any]) -> tuple[float, Optiona
         return mult, note
 
     rem = float(rem_raw)
+    rc = get_risk_execution_config()
     if _prev_mda_rem is not None and _prev_mda_ts > 0.0:
         spent = _prev_mda_rem - rem
         dt = now - _prev_mda_ts
-        if dt > 0.5 and spent > 0.0:
+        if dt > rc.mda_burn_min_dt_seconds and spent > 0.0:
             cps = spent / dt
             sec = seconds_until_mda_reset(usage)
-            if sec is not None and sec > 120.0:
+            if sec is not None and sec > rc.mda_runway_reset_skew_s:
                 sustainable = rem / sec
-                if sustainable > 0 and cps > sustainable * 1.18:
-                    ratio = min(4.0, cps / sustainable)
-                    mult = min(5.0, 1.0 + 0.35 * (ratio - 1.0))
+                if sustainable > 0 and cps > sustainable * rc.mda_burn_sustainable_ratio:
+                    ratio = min(rc.mda_burn_ratio_cap, cps / sustainable)
+                    mult = min(
+                        rc.mda_burn_multiplier_cap,
+                        1.0 + 0.35 * (ratio - 1.0),
+                    )
                     note = (
                         f"MDA burn {cps:.0f} cr/s vs runway budget {sustainable:.0f} cr/s "
                         f"({sec / 3600:.1f}h to reset)"
@@ -137,7 +137,8 @@ def mda_total_sleep_multiplier(usage: dict[str, Any]) -> tuple[float, Optional[s
     bal = mda_cadence_multiplier(usage)
     rwy = mda_runway_multiplier(usage)
     burn, note = _mda_burn_multiplier_and_note(usage)
-    total = max(1.0, min(float(MDA_MAX_SLEEP_MULTIPLIER), bal * rwy * burn))
+    cap = get_risk_execution_config().mda_max_sleep_multiplier
+    total = max(1.0, min(float(cap), bal * rwy * burn))
     return total, note
 
 
@@ -146,7 +147,7 @@ def should_skip_subdaily_candle_fetches(usage: dict[str, Any]) -> bool:
     frac = credit_fraction(usage)
     if frac is None:
         return False
-    return frac < MDA_SKIP_SUBDAILY_FRACTION
+    return frac < get_risk_execution_config().mda_skip_subdaily_fraction
 
 
 def persist_mda_snapshot_to_db(usage: dict[str, Any], cadence_mult: float) -> None:

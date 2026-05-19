@@ -154,32 +154,7 @@ logger = get_logger(__name__)
 # here for backward compatibility with every caller that did
 # ``from tools.tools_executor import ToolResult``.
 from tools.tool_contract import ToolResult, validate_envelope  # noqa: E402,F401
-from tools.tools_account import HANDLERS as _ACCOUNT
-from tools.tools_instruments import HANDLERS as _INSTRUMENTS
-from tools.tools_multiagent import HANDLERS as _MULTIAGENT
-from tools.tools_options import HANDLERS as _OPTIONS
 from tools.tools_options import _normalize_expiration
-from tools.tools_orders import HANDLERS as _ORDERS
-
-# Build unified handler registry from submodules
-from tools.tools_research import HANDLERS as _RESEARCH
-from tools.tools_signal_breakdown import HANDLERS as _SIGNAL_BREAKDOWN
-from tools.tools_sizing import HANDLERS as _SIZING
-from tools.tools_stats import HANDLERS as _STATS
-from tools.tools_working_memory import HANDLERS as _WORKING_MEMORY
-
-_REGISTRY: dict[str, Any] = {}
-_REGISTRY.update(_RESEARCH)
-_REGISTRY.update(_ACCOUNT)
-_REGISTRY.update(_ORDERS)
-_REGISTRY.update(_OPTIONS)
-_REGISTRY.update(_STATS)
-_REGISTRY.update(_SIZING)
-_REGISTRY.update(_INSTRUMENTS)
-_REGISTRY.update(_MULTIAGENT)
-_REGISTRY.update(_WORKING_MEMORY)
-_REGISTRY.update(_SIGNAL_BREAKDOWN)
-
 
 # ── plan_order / enter_option handler wrappers ────────────────
 # These are instance methods on ToolExecutor but must live in _REGISTRY
@@ -213,8 +188,6 @@ async def _handle_enter_option(executor, params: dict) -> Any:
     )
 
 
-_REGISTRY["plan_order"] = _handle_plan_order
-_REGISTRY["enter_option"] = _handle_enter_option
 
 
 # ── Tool Aliases (common LLM misspellings) ───────────────────
@@ -422,15 +395,33 @@ def _allowed_trade_universe() -> set[str]:
     try:
         from core.runtime.focus_universe import get_focus_symbols
         from memory import get_db
-        allowed.update(get_focus_symbols(get_db(), limit=64))
+        from core.memory_config import get_memory_config
+
+        allowed.update(
+            get_focus_symbols(
+                get_db(),
+                limit=get_memory_config().focus_symbols_trade_universe_limit,
+            )
+        )
     except Exception:
         pass
     return allowed
 
 
 def get_valid_actions() -> list[str]:
-    """Return sorted list of all valid action names from the tool registry."""
-    return sorted(_REGISTRY.keys())
+    """Return sorted list of enabled agent-callable tools from :mod:`core.tool_registry`."""
+    from core.tool_registry import get_tool_registry
+
+    return get_tool_registry().agent_action_names()
+
+
+def __getattr__(name: str) -> Any:
+    """Lazy access to handler map (backward compat for ``_REGISTRY``)."""
+    if name == "_REGISTRY":
+        from core.tool_registry import get_tool_registry
+
+        return get_tool_registry().handlers
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
 
 class ToolExecutor:
@@ -459,8 +450,9 @@ class ToolExecutor:
         # Order action names for structured trade logging
         self._order_actions = _ORDER_ACTIONS
 
-        # Load cash_only flag from env
-        self.cash_only = os.environ.get("CASH_ONLY", "true").lower() == "true"
+        from core.config import CASH_ONLY
+
+        self.cash_only = CASH_ONLY
 
         if self.market_hours_provider is None:
             from data.market_hours import get_market_hours_provider
@@ -1801,11 +1793,29 @@ class ToolExecutor:
 
             # Basic validation: check action exists in registry
             # buy/sell pass through — _dispatch restructures their params into plan_order
-            if action not in _REGISTRY and action not in ("wait", "think", "feedback", "done", "buy", "sell"):
+            from core.tool_registry import get_tool_registry
+
+            registry = get_tool_registry()
+            if (
+                registry.get_handler(action) is None
+                and action not in ("wait", "think", "feedback", "done", "buy", "sell")
+            ):
                 err = {"error": f"Unknown action: {action}", "valid_actions": get_valid_actions()[:25]}
                 return ToolResult(
                     action=action, data=err, success=False,
                     raw_json=json.dumps(err, separators=(',',':'), default=str),
+                )
+
+            reg_err = registry.validate_dispatch(
+                action,
+                params if isinstance(params, dict) else {},
+                gateway_connected=bool(self.gateway),
+            )
+            if reg_err:
+                err = {"error": reg_err, "valid_actions": get_valid_actions()[:25]}
+                return ToolResult(
+                    action=action, data=err, success=False,
+                    raw_json=json.dumps(err, separators=(",", ":"), default=str),
                 )
 
             # Check broker connection for order actions
@@ -2106,7 +2116,9 @@ class ToolExecutor:
             if _ev:
                 params[_ek] = _normalize_expiration(str(_ev))
 
-        handler = _REGISTRY.get(action)
+        from core.tool_registry import get_tool_registry
+
+        handler = get_tool_registry().get_handler(action)
         if handler is None:
             valid = get_valid_actions()
             return {

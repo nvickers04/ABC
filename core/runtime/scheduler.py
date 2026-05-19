@@ -29,6 +29,7 @@ from typing import Any, Awaitable, Callable, Optional, Protocol
 from zoneinfo import ZoneInfo
 
 from core.async_utils import safe_sleep as _safe_sleep
+from core.loop_config import get_loop_config
 from core.log_context import get_logger
 from core.runtime.interfaces import MarketHoursProtocol, WakeBusProtocol
 
@@ -63,12 +64,6 @@ class CycleScheduler:
     timing concerns (Era-B churn hotspot) from cycle / decision logic.
     """
 
-    # Tunables — exposed as class attributes so tests can override per-call.
-    halted_poll_seconds: int = 300
-    after_hours_sleep_seconds: int = 1800
-    after_hours_threshold_hour: int = 20  # 8 PM ET
-    cycle_error_cooldown_seconds: int = 30
-
     def __init__(
         self,
         agent: _AgentProtocol,
@@ -78,6 +73,11 @@ class CycleScheduler:
         now_et: Callable[[], datetime] = _now_et,
         sleep: Callable[[float], Awaitable[Any]] = _safe_sleep,
     ) -> None:
+        sched = get_loop_config().scheduler_defaults()
+        self.halted_poll_seconds: int = sched["halted_poll_seconds"]
+        self.after_hours_sleep_seconds: int = sched["after_hours_sleep_seconds"]
+        self.after_hours_threshold_hour: int = sched["after_hours_threshold_hour"]
+        self.cycle_error_cooldown_seconds: int = sched["cycle_error_cooldown_seconds"]
         self.agent = agent
         self.wake_bus = wake_bus
         self.market_hours = market_hours_provider

@@ -19,29 +19,25 @@ from xai_sdk.chat import user as sdk_user
 
 from core.async_utils import safe_sleep as _safe_sleep
 from core.config import (
-    AGENT_TOOL_FEEDBACK_MAX_CHARS,
     CYCLE_SLEEP_SECONDS,
     EOD_FLATTEN_MINUTES,
     INTRADAY_DRAWDOWN_PCT,
-    LLM_MAX_TOKENS,
-    LLM_SEED,
-    LLM_TEMPERATURE,
     MAX_DAILY_LLM_COST,
     MAX_DAILY_LOSS_PCT,
-    MIN_RR_RATIO,
     PAPER_AGGRESSIVE,
     PRESCAN_PROMPT_EXPENSIVE_RESEARCH,
     RISK_PER_TRADE,
-    SYSTEM_PROMPT,
-    TOOL_PLAYBOOK_MAX_CHARS,
     TRADING_MODE,
+    _system_prompt_inputs,
 )
+from core.loop_config import get_loop_config
 from core.grok_llm import get_grok_llm
 from core.json_parse import _parse_json_objects
 from core.log_context import (
     bind_trader_cycle_context,
     get_logger,
 )
+from core.prompt_config import get_prompt_config
 from core.research_topics import _categorize_query
 from core.runtime import SafetyController, StateContextBuilder
 from core.runtime.cycle import evaluate_gap_guard
@@ -63,9 +59,10 @@ def _truncate_for_react_context(text: str, max_chars: int) -> str:
     """Bound tool payloads re-appended each ReAct turn (full history is re-sent)."""
     if max_chars <= 0 or len(text) <= max_chars:
         return text
+    lc = get_loop_config()
     marker = "\n... [truncated for prompt budget]\n"
     room = max_chars - len(marker)
-    if room < 200:
+    if room < lc.react_tool_feedback_truncate_min_room:
         return text[:max_chars]
     return text[:room] + marker
 
@@ -96,7 +93,11 @@ class TradingAgent:
 
         # Best-effort detection of researcher availability at startup
         if not self._operating_context.sync_researcher_from_heartbeat():
-            self._operating_context.quality.working_memory_completeness = 0.5
+            from core.memory_config import get_memory_config
+
+            self._operating_context.quality.working_memory_completeness = (
+                get_memory_config().wm_completeness_startup_degraded
+            )
             logger.warning(
                 "Starting in INDEPENDENT MODE — researcher unavailable. "
                 "Using local memory fallback and reduced risk."
@@ -125,8 +126,9 @@ class TradingAgent:
         # Circuit breaker
         self._consecutive_failures = 0
         self._cycle_failures = 0
-        self._max_consecutive = 5
-        self._max_per_cycle = 8
+        _lc = get_loop_config()
+        self._max_consecutive = _lc.react_max_consecutive_tool_failures
+        self._max_per_cycle = _lc.react_max_failures_per_cycle
 
         # Session state
         self._cycle_id = 0
@@ -165,12 +167,13 @@ class TradingAgent:
 
     def _append_snapshot(self, summary: str):
         """Append a compact cycle snapshot for rolling continuity."""
-        from core.runtime.prompt_budget import CYCLE_SNAPSHOT_CHARS, CYCLE_SNAPSHOT_MAX
+        from core.memory_config import get_memory_config
 
-        short = (summary or "")[:CYCLE_SNAPSHOT_CHARS]
+        mem = get_memory_config()
+        short = (summary or "")[: mem.cycle_snapshot_chars]
         self._market_snapshots.append(f"C{self._cycle_id}:{short}")
-        if len(self._market_snapshots) > CYCLE_SNAPSHOT_MAX:
-            self._market_snapshots = self._market_snapshots[-CYCLE_SNAPSHOT_MAX:]
+        if len(self._market_snapshots) > mem.cycle_snapshot_max:
+            self._market_snapshots = self._market_snapshots[-mem.cycle_snapshot_max :]
 
     def _prune_research_cache(self, current_session: str):
         """Remove expired research entries by TTL and session boundary."""
@@ -334,6 +337,7 @@ class TradingAgent:
         Returns cooldown seconds.
         """
         self._cycle_failures = 0
+        lc = get_loop_config()
         self._cycle_id += 1
         bind_trader_cycle_context(cycle_id=self._cycle_id)
         self._last_step = "detect_session"
@@ -390,7 +394,7 @@ class TradingAgent:
         loss_pct = self._check_daily_loss()
         if loss_pct is not None:
             await self._emergency_flatten(f"Daily loss: -{loss_pct:.1f}%")
-            return 999999
+            return lc.react_halt_cooldown_seconds
 
         # Check intraday drawdown (peak-to-trough)
         dd_pct = self._check_intraday_drawdown()
@@ -398,7 +402,7 @@ class TradingAgent:
             await self._emergency_flatten(
                 f"Intraday drawdown: -{dd_pct:.1f}% from session high"
             )
-            return 999999
+            return lc.react_halt_cooldown_seconds
 
         # EOD flatten: close all positions N minutes before market close
         if self._current_session == "regular":
@@ -423,13 +427,13 @@ class TradingAgent:
         if self._check_llm_cost():
             logger.warning(f"LLM cost ceiling ${MAX_DAILY_LLM_COST} reached — halting")
             self._halted = True
-            return 999999
+            return lc.react_halt_cooldown_seconds
 
         tok_reason = self._check_llm_token_limits()
         if tok_reason:
             logger.warning("LLM token daily limit (%s) reached — halting", tok_reason)
             self._halted = True
-            return 999999
+            return lc.react_halt_cooldown_seconds
 
         # Build context
         cost_line = ""
@@ -464,11 +468,14 @@ class TradingAgent:
         self._last_step = "chat_create"
         self._last_step_ts = time.time()
         logger.info("CYCLE %d step=chat_create", self._cycle_id)
-        _system_content = SYSTEM_PROMPT
+        pc = get_prompt_config()
+        _system_content = pc.build_system_prompt(_system_prompt_inputs())
         try:
             from tools.tool_playbook import render_compact_playbook
 
-            _system_content = SYSTEM_PROMPT + "\n\n" + render_compact_playbook(TOOL_PLAYBOOK_MAX_CHARS)
+            _system_content = _system_content + "\n\n" + render_compact_playbook(
+                get_loop_config().react_playbook_max_chars
+            )
         except Exception as e:
             logger.warning("tool playbook append failed: %s", e)
         prompt_metrics.system_chars = len(_system_content)
@@ -480,8 +487,8 @@ class TradingAgent:
         logger.debug(
             "CYCLE %d prompt caps: playbook_max=%d tool_feedback_max=%d wm_max via env CYCLE_WM_MAX_CHARS",
             self._cycle_id,
-            TOOL_PLAYBOOK_MAX_CHARS,
-            AGENT_TOOL_FEEDBACK_MAX_CHARS,
+            get_loop_config().react_playbook_max_chars,
+            get_loop_config().react_tool_feedback_max_chars,
         )
         # QualityMatrix controls temperature/max_tokens (host override).
         try:
@@ -489,14 +496,14 @@ class TradingAgent:
             svc = get_quality_matrix_service()
             m = svc.get_matrix()
             cfg = m.get_llm_call_config()
-            eff_temp = float(cfg.get("temperature", LLM_TEMPERATURE))
-            eff_max_tokens = int(cfg.get("max_tokens", LLM_MAX_TOKENS))
+            eff_temp = float(cfg.get("temperature", pc.llm_temperature))
+            eff_max_tokens = int(cfg.get("max_tokens", pc.llm_max_tokens))
             q_for_log = m.overall_quality
         except Exception:
             ctx = self._operating_context
             model_over = ctx.get_model_overrides()
-            eff_temp = float(model_over.get("temperature", LLM_TEMPERATURE))
-            eff_max_tokens = int(model_over.get("max_tokens", LLM_MAX_TOKENS))
+            eff_temp = float(model_over.get("temperature", pc.llm_temperature))
+            eff_max_tokens = int(model_over.get("max_tokens", pc.llm_max_tokens))
             q_for_log = getattr(ctx.quality_matrix, "overall_quality", "unknown")
 
         logger.info(
@@ -511,7 +518,7 @@ class TradingAgent:
             ],
             temperature=eff_temp,
             max_tokens=eff_max_tokens,
-            seed=LLM_SEED,
+            seed=pc.llm_seed,
         )
 
         # ── Inner ReAct loop ────────────────────────────────────
@@ -522,19 +529,25 @@ class TradingAgent:
 
         while True:
             turn += 1
+            if lc.react_max_turns_per_cycle > 0 and turn > lc.react_max_turns_per_cycle:
+                logger.warning(
+                    "ReAct turn cap %d reached — ending cycle",
+                    lc.react_max_turns_per_cycle,
+                )
+                return lc.react_circuit_breaker_cooldown_seconds
 
             # Re-check daily loss every turn
             loss_pct = self._check_daily_loss()
             if loss_pct is not None:
                 await self._emergency_flatten(f"Daily loss mid-cycle: -{loss_pct:.1f}%")
-                return 999999
+                return lc.react_halt_cooldown_seconds
 
             logger.info(f"Cycle {self._cycle_id} turn {turn}")
 
             try:
                 # Retry Grok API with exponential backoff
                 response = None
-                for _api_attempt in range(3):
+                for _api_attempt in range(lc.react_grok_api_max_attempts):
                     try:
                         lim = self._check_llm_token_limits()
                         if lim:
@@ -543,13 +556,16 @@ class TradingAgent:
                                 lim,
                             )
                             self._halted = True
-                            return 999999
+                            return lc.react_halt_cooldown_seconds
                         response = await chat.sample()
                         break
                     except Exception as api_err:
-                        if _api_attempt < 2:
-                            wait = 2 ** (_api_attempt + 1)  # 2s, 4s
-                            logger.warning(f"Grok API error (attempt {_api_attempt+1}/3): {api_err} — retrying in {wait}s")
+                        if _api_attempt < lc.react_grok_api_max_attempts - 1:
+                            wait = lc.grok_api_backoff_seconds(_api_attempt)
+                            logger.warning(
+                                f"Grok API error (attempt {_api_attempt+1}/"
+                                f"{lc.react_grok_api_max_attempts}): {api_err} — retrying in {wait}s"
+                            )
                             await _safe_sleep(wait)
                         else:
                             raise  # Last attempt, propagate
@@ -588,10 +604,10 @@ class TradingAgent:
                         lim2,
                     )
                     self._halted = True
-                    return 999999
+                    return lc.react_halt_cooldown_seconds
 
                 # Log what the model actually said
-                logger.info(f"Grok -> {(raw or '(empty)')[:500]}")
+                logger.info(f"Grok -> {(raw or '(empty)')[:lc.react_grok_response_log_chars]}")
 
                 # ── Parse JSON actions ──────────────────────────
                 json_objects = _parse_json_objects(raw or "")
@@ -602,17 +618,17 @@ class TradingAgent:
                         f"No valid JSON (streak={invalid_json_streak}): {(raw or '')[:100]}"
                     )
                     chat.append(response)
-                    if invalid_json_streak >= 3:
+                    if invalid_json_streak >= lc.react_invalid_json_streak_limit:
                         logger.warning(
                             "Circuit breaker: repeated invalid JSON responses "
                             f"({invalid_json_streak})"
                         )
-                        return 60
+                        return lc.react_circuit_breaker_cooldown_seconds
                     chat.append(sdk_user(
                         "Respond with exactly ONE JSON object and no prose/code fences.\n"
                         "Required shape: {\"action\":\"<tool_or_done>\", ...params}.\n"
                         "If waiting, use: "
-                        "{\"action\":\"done\",\"summary\":\"...\",\"cooldown\":30}."
+                        f'{{"action":"done","summary":"...","cooldown":{lc.react_json_reprompt_cooldown_hint}}}.'
                     ))
                     continue
                 invalid_json_streak = 0
@@ -625,27 +641,30 @@ class TradingAgent:
 
                     # "done" ends the cycle
                     if action in ("done", "wait", "FINAL_DECISION"):
-                        summary = action_data.get('summary', action_data.get('reason', action_data.get('reasoning', '')))[:200]
+                        summary = action_data.get(
+                            'summary',
+                            action_data.get('reason', action_data.get('reasoning', '')),
+                        )[: lc.react_done_summary_max_chars]
                         cooldown = action_data.get('cooldown', CYCLE_SLEEP_SECONDS)
                         try:
-                            cooldown = max(5, min(int(cooldown), 3600))  # 5s–1hr bounds
+                            cooldown = lc.clamp_cooldown(cooldown)
                         except (TypeError, ValueError):
                             cooldown = CYCLE_SLEEP_SECONDS
-                        wait_reason = str(action_data.get('wait_reason', '') or '').strip()[:160]
+                        wait_reason = str(action_data.get('wait_reason', '') or '').strip()[
+                            : lc.react_wait_reason_max_chars
+                        ]
                         self._last_wait_reason = wait_reason
                         wr_log = f" | waiting because: {wait_reason}" if wait_reason else ""
                         logger.info(f"Decision: done ({cooldown}s) | {summary}{wr_log}")
                         cycle_actions.append("done")
-                        from core.runtime.prompt_budget import (
-                            CYCLE_LAST_SUMMARY_CHARS,
-                            truncate_text,
-                        )
+                        from core.memory_config import get_memory_config
+                        from core.runtime.prompt_budget import truncate_text
 
                         self._last_cycle_summary = truncate_text(
                             f"C{self._cycle_id}: "
-                            + ", ".join(cycle_actions[-4:])
+                            + ", ".join(cycle_actions[-lc.react_cycle_actions_tail :])
                             + (f" — {summary}" if summary else ""),
-                            CYCLE_LAST_SUMMARY_CHARS,
+                            get_memory_config().cycle_last_summary_chars,
                             marker="…",
                         )
                         self._append_snapshot(f"C{self._cycle_id}: done")
@@ -668,7 +687,9 @@ class TradingAgent:
                                     symbol=getattr(t, 'symbol', None),
                                     success=getattr(t, 'success', True),
                                 )
-                                for t in svc.get_matrix().recent_tool_usage[-5:]
+                                for t in svc.get_matrix().recent_tool_usage[
+                                    -lc.react_provenance_tools_tail :
+                                ]
                             ]
                             snap = DecisionProvenanceSnapshot(
                                 ts=_dt.now(_tz.utc),
@@ -679,7 +700,7 @@ class TradingAgent:
                                 quality_state={"overall": svc.get_matrix().overall_quality},
                                 context_quality=svc.get_matrix().overall_quality,
                                 outcome="done",
-                                notes=summary[:120],
+                                notes=summary[: lc.react_done_summary_max_chars],
                             )
                             svc.record_decision_snapshot(snap)
                         except Exception as _prov_err:
@@ -698,7 +719,7 @@ class TradingAgent:
                             if isinstance(data, dict) and 'result' in data:
                                 import time as _time
                                 query = action_data.get('query', '')
-                                summary_text = str(data['result'])[:2000]
+                                summary_text = str(data['result'])[: lc.react_research_summary_max_chars]
                                 ts = datetime.now().strftime('%H:%M')
                                 cat, ttl = _categorize_query(query)
                                 self._research_results[query] = {
@@ -710,7 +731,7 @@ class TradingAgent:
                                     "created": _time.time(),
                                 }
                                 # Evict oldest if > 15 cached queries
-                                if len(self._research_results) > 15:
+                                if len(self._research_results) > lc.react_session_research_cache_max:
                                     oldest_key = next(iter(self._research_results))
                                     del self._research_results[oldest_key]
 
@@ -725,12 +746,21 @@ class TradingAgent:
                                 if summary:
                                     logger.info(f"Tool OK: {action}({sym}) -> {summary}")
                                 else:
-                                    logger.info(f"Tool OK: {action}({sym}) -> {str(data)[:200]}")
+                                    logger.info(
+                                        f"Tool OK: {action}({sym}) -> "
+                                        f"{str(data)[:lc.react_tool_log_data_chars]}"
+                                    )
                             else:
-                                logger.info(f"Tool OK: {action}({sym}) -> {str(data)[:200]}")
+                                logger.info(
+                                    f"Tool OK: {action}({sym}) -> "
+                                    f"{str(data)[:lc.react_tool_log_data_chars]}"
+                                )
                         else:
                             err = last_result.error if hasattr(last_result, 'error') else str(last_result)
-                            logger.warning(f"Tool FAIL: {action}({sym}) -> {str(err)[:300]}")
+                            logger.warning(
+                                f"Tool FAIL: {action}({sym}) -> "
+                                f"{str(err)[:lc.react_tool_log_error_chars]}"
+                            )
                         cycle_actions.append(f"{action}({sym})")
                         break
 
@@ -745,16 +775,16 @@ class TradingAgent:
                     # Circuit breaker
                     if self._consecutive_failures >= self._max_consecutive:
                         logger.warning(f"Circuit breaker: {self._consecutive_failures} consecutive failures")
-                        return 60
+                        return lc.react_circuit_breaker_cooldown_seconds
                     if self._cycle_failures >= self._max_per_cycle:
                         logger.warning(f"Circuit breaker: {self._cycle_failures} failures this cycle")
-                        return 60
+                        return lc.react_circuit_breaker_cooldown_seconds
 
                     chat.append(response)
                     # State is provided once at cycle start; agent calls
                     # refresh_state tool when it needs an updated snapshot.
                     _fb = _truncate_for_react_context(
-                        str(last_result), AGENT_TOOL_FEEDBACK_MAX_CHARS
+                        str(last_result), lc.react_tool_feedback_max_chars
                     )
                     chat.append(sdk_user(
                         f"TOOL RESULT:\n{_fb}\n\nWhat's your next action?"
@@ -762,7 +792,7 @@ class TradingAgent:
 
             except Exception as e:
                 logger.error(f"Turn error: {e}", exc_info=True)
-                return 60
+                return lc.react_circuit_breaker_cooldown_seconds
 
 
 # ── Entry Point ─────────────────────────────────────────────────
@@ -771,7 +801,8 @@ async def run_agent():
     """Main entry point for the autonomous trading agent."""
     logger.info("=" * 60)
     logger.info("GROK TRADER — Pure ReAct")
-    logger.info(f"Risk per trade: {RISK_PER_TRADE*100:.1f}%  |  Min R:R: {MIN_RR_RATIO}:1")
+    min_rr = get_prompt_config().min_rr_for_mode(TRADING_MODE)
+    logger.info(f"Risk per trade: {RISK_PER_TRADE*100:.1f}%  |  Min R:R: {min_rr}:1")
     logger.info(f"Trading mode: {TRADING_MODE}")
     if PAPER_AGGRESSIVE:
         logger.info(">>> AGGRESSIVE PAPER MODE — stress testing complex orders <<<")
@@ -807,7 +838,14 @@ async def run_agent():
     tools._state_builder = agent._build_state_context
     tools._agent = agent
 
-    logger.info("Agent started (paper mode recommended)")
+    from core.tool_registry import get_tool_registry
+
+    _reg = get_tool_registry()
+    logger.info(
+        "Agent started (paper mode recommended); ToolRegistry: %d enabled / %d agent tools",
+        len(_reg.agent_action_names()),
+        sum(1 for s in _reg.tools.values() if s.agent_callable),
+    )
     agent._capture_start_of_day_cash()
 
     # ── Main loop (delegated to CycleScheduler) ─────────────────

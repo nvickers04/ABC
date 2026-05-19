@@ -6,6 +6,7 @@ from typing import Any
 import numpy as np
 
 from research.config import CV_BOOTSTRAP_SAMPLES
+from core.runtime.operating_context import get_operating_context
 
 logger = logging.getLogger(__name__)
 
@@ -91,6 +92,20 @@ async def handle_calculate_size(executor, params: dict) -> Any:
         risk_shares = int(risk_dollars / stop_loss_per_share)
     else:
         risk_shares = 0
+
+    # Host applies risk_multiplier via QualityMatrix.get_scaled_quantity() on orders.
+    # Do not scale here — avoids double-reduction when calculate_size → plan_order.
+    try:
+        ctx = get_operating_context()
+        rm = ctx.risk_multiplier
+        if rm < 1.0:
+            reasoning.append(
+                f"Host policy: order quantities will be scaled to {rm*100:.0f}% "
+                f"at execution (QualityMatrix enforcement)."
+            )
+    except Exception:
+        pass
+
     reasoning.append(
         f"Risk-based: {risk_shares} shares "
         f"(risking ${risk_dollars:,.0f} = {risk_per_trade_pct}% of NL, "

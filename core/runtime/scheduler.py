@@ -140,6 +140,17 @@ class CycleScheduler:
         try:
             wait_seconds = await self.agent.run_cycle()
             logger.info(f"Cooldown: up to {wait_seconds}s (event-driven)")
+            # PR2 wiring: surface QualityMatrix state at scheduler boundary (orchestration visibility)
+            try:
+                from core.runtime.operating_context import get_operating_context
+                _qctx = get_operating_context()
+                _qm = _qctx.quality_matrix
+                logger.info(
+                    "QualityMatrix@cycle: overall=%s risk_mult=%.2f blocked=%s",
+                    _qm.overall_quality, _qctx.risk_multiplier, _qctx.get_blocked_tool_categories()
+                )
+            except Exception:
+                pass
             wake_reason = await self.wake_bus.wait(wait_seconds)
             self.agent._last_wake_reason = wake_reason
             logger.info(f"Woke: {wake_reason}")

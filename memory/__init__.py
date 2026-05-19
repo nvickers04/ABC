@@ -549,6 +549,40 @@ def init_db():
         CREATE INDEX IF NOT EXISTS idx_grad_params_active ON graduated_params(active);
         CREATE INDEX IF NOT EXISTS idx_grad_params_key ON graduated_params(param_key);
         CREATE INDEX IF NOT EXISTS idx_calib_slip_lookup ON calibrated_slippage(order_type, time_bucket, atr_bucket);
+
+        -- PR1 QualityMatrix provenance (tool-usage purist + decision snapshots)
+        -- Additive, decision-scoped (no per-trade attribution). Populated by
+        -- QualityMatrixService hooks in review + agent cycle.
+        CREATE TABLE IF NOT EXISTS tool_usage_log (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            ts TEXT NOT NULL,
+            cycle_id INTEGER DEFAULT 0,
+            tool_name TEXT NOT NULL,
+            symbol TEXT,
+            success INTEGER DEFAULT 1,
+            latency_ms REAL DEFAULT 0,
+            decision_context TEXT            -- JSON or free text (cycle_id is advisory)
+        );
+
+        CREATE TABLE IF NOT EXISTS decision_provenance (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            ts TEXT NOT NULL,
+            cycle_id INTEGER DEFAULT 0,
+            decision_type TEXT NOT NULL,     -- cycle_decision | entry_idea | sizing | review | done
+            symbol TEXT,
+            tools_json TEXT,                 -- JSON array of ToolUsageRecord summaries
+            quality_state_json TEXT,         -- snapshot of QualityMatrix state at decision
+            context_quality TEXT,
+            outcome TEXT,
+            notes TEXT
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_tool_usage_ts ON tool_usage_log(ts);
+        CREATE INDEX IF NOT EXISTS idx_tool_usage_name ON tool_usage_log(tool_name, ts);
+        CREATE INDEX IF NOT EXISTS idx_tool_usage_symbol ON tool_usage_log(symbol, ts);
+        CREATE INDEX IF NOT EXISTS idx_provenance_ts ON decision_provenance(ts);
+        CREATE INDEX IF NOT EXISTS idx_provenance_cycle ON decision_provenance(cycle_id);
+        CREATE INDEX IF NOT EXISTS idx_provenance_type ON decision_provenance(decision_type);
     """)
 
     # ── Signal combination engine tables ─────────────────────────
@@ -765,7 +799,7 @@ def init_db():
 # takes a connection and does whatever work is needed.  Migrations run
 # inside the init_db transaction so a failure leaves the DB unchanged.
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 
 
 def _migration_v2_reset_forward_return_pipeline(conn) -> None:
@@ -779,9 +813,21 @@ def _migration_v2_reset_forward_return_pipeline(conn) -> None:
             conn.execute(f"DELETE FROM {tbl}")
 
 
+def _migration_v3_add_quality_provenance_tables(conn) -> None:
+    """PR1: Additive tables for QualityMatrix provenance (tool usage + decision
+    snapshots).  Tables use IF NOT EXISTS inside the main schema script as well,
+    so this migration is primarily for version stamping + future non-additive work.
+    """
+    # Tables are created idempotently in the main init script; migration just records
+    # that v3 was applied. No data transform needed.
+    pass
+
+
 _MIGRATIONS: list[tuple[int, str, callable]] = [
     (2, "reset forward-return pipeline for per-signal entry_bar_ts keying",
      _migration_v2_reset_forward_return_pipeline),
+    (3, "add tool_usage_log + decision_provenance tables for QualityMatrix (PR1)",
+     _migration_v3_add_quality_provenance_tables),
 ]
 
 
@@ -1549,6 +1595,108 @@ def get_calibrated_slippage() -> dict[tuple[str, str, str], float]:
     # Implementation lives in memory.repos.execution_repo (PR13 split).
     from memory.repos.execution_repo import get_calibrated_slippage as _impl
     return _impl()
+
+
+# ── QualityMatrix provenance helpers (PR1) ────────────────────────
+# Thin wrappers used by core.quality.quality_matrix; keep logic in the
+# service but expose simple insert / query for tests and direct use.
+
+
+def insert_tool_usage_log(
+    tool_name: str,
+    symbol: str | None = None,
+    success: bool = True,
+    latency_ms: float = 0.0,
+    cycle_id: int = 0,
+    decision_context: str | None = None,
+) -> int | None:
+    """Insert a tool usage record. Returns new id or None."""
+    db = get_db()
+    try:
+        cur = db.execute(
+            """INSERT INTO tool_usage_log
+               (ts, cycle_id, tool_name, symbol, success, latency_ms, decision_context)
+               VALUES (?, ?, ?, ?, ?, ?, ?)
+               RETURNING id""",
+            (
+                datetime.now(timezone.utc).isoformat(),
+                cycle_id,
+                tool_name,
+                symbol,
+                1 if success else 0,
+                latency_ms,
+                decision_context,
+            ),
+        )
+        db.commit()
+        row = cur.fetchone()
+        return int(row["id"]) if row else None
+    except Exception as e:
+        logger.warning(f"insert_tool_usage_log failed: {e}")
+        return None
+
+
+def insert_decision_provenance(
+    decision_type: str,
+    cycle_id: int = 0,
+    symbol: str | None = None,
+    tools_json: str | None = None,
+    quality_state_json: str | None = None,
+    context_quality: str = "full",
+    outcome: str | None = None,
+    notes: str = "",
+) -> int | None:
+    """Insert a decision provenance snapshot."""
+    db = get_db()
+    try:
+        cur = db.execute(
+            """INSERT INTO decision_provenance
+               (ts, cycle_id, decision_type, symbol, tools_json, quality_state_json,
+                context_quality, outcome, notes)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+               RETURNING id""",
+            (
+                datetime.now(timezone.utc).isoformat(),
+                cycle_id,
+                decision_type,
+                symbol,
+                tools_json,
+                quality_state_json,
+                context_quality,
+                outcome,
+                notes,
+            ),
+        )
+        db.commit()
+        row = cur.fetchone()
+        return int(row["id"]) if row else None
+    except Exception as e:
+        logger.warning(f"insert_decision_provenance failed: {e}")
+        return None
+
+
+def get_recent_tool_usage(limit: int = 50) -> list[dict]:
+    db = get_db()
+    try:
+        rows = db.execute(
+            "SELECT * FROM tool_usage_log ORDER BY ts DESC LIMIT ?",
+            (limit,),
+        ).fetchall()
+        return [dict(r) for r in rows]
+    except Exception:
+        return []
+
+
+def get_recent_decision_provenance(limit: int = 20) -> list[dict]:
+    db = get_db()
+    try:
+        rows = db.execute(
+            "SELECT * FROM decision_provenance ORDER BY ts DESC LIMIT ?",
+            (limit,),
+        ).fetchall()
+        return [dict(r) for r in rows]
+    except Exception:
+        return []
 
 
 # -- Back-compat re-exports (PR13 split) -------------------------

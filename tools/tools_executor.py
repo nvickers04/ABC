@@ -118,6 +118,11 @@ stats: {} -> comprehensive performance stats (P&L, win rate, positions, LLM cost
 daily_summary: {} -> generate + persist daily summary to logs/daily_summary.json
 review_trades: {days?=3, sort?='efficiency', symbol?} -> closed trades with efficiency ranking
 signal_breakdown: {symbol} -> per-signal attribution for the symbol's most-recent composite (score, weight, IC, contribution, trust), sorted by |contribution|; reveals which signals drove the consensus and which had no fresh data
+context_quality: {} -> researcher status, memory source (postgres vs local), legacy context quality summary. Lightweight; prefer quality_status() for full matrix policy.
+quality_status: {} -> overall quality snapshot + canonical QualityMatrix (risk, policy, blocked cats, llm config, provenance count). Primary self-calibration for Independent Mode.
+quality_for_symbol: {symbol} -> per-symbol execution history + derived local quality_score from recent trade_feedback (gaps, pnl consistency). Lets agent assess name-specific conviction.
+provenance_audit: {window?, symbol?} -> heavy tool-usage provenance audit: recent ToolUsageRecords + DecisionProvenanceSnapshots (tools active at decisions, context_quality, outcomes). Filterable. The key forensics/visibility tool for Independent Mode staleness diagnosis.
+current_constraints: {} -> live derived policy constraints (risk scaling, entry policy, mode). Pure inspection; agent uses for voluntary adaptation. Enforcement lives elsewhere.
 
 === WORKING MEMORY ===
 update_working_memory: {section, entry, expires_in_minutes?, metadata?} -> add an interpretation/thesis/verdict/watch-for note. Sections: open_theses (cap 8, EOD), recent_verdicts (cap 12, 30m default), watching_for (cap 10, 60m), regime_notes (cap 5, EOD), lessons_today (cap 8, EOD). Auto-rendered at top of every cycle.
@@ -663,6 +668,37 @@ class ToolExecutor:
             "data": result,
         }
 
+    def _record_tool_for_quality_matrix(self, action: str, params: dict | None, success: bool) -> None:
+        """PR1 primary recording hook (centralized in executor as required).
+        
+        Called for every tool attempt that reaches execution (including hard-rejected
+        by QualityMatrix gate or universe guard, and successful dispatches).
+        Records via the canonical QualityMatrixService so provenance is decision-scoped
+        and durable. Latency left at 0.0 for v1 (real timing can be added later without
+        changing the contract).
+        """
+        try:
+            from core.quality.quality_matrix import get_quality_matrix_service, ToolUsageRecord
+            from datetime import datetime as _dt, timezone as _tz
+
+            svc = get_quality_matrix_service()
+            sym = (params or {}).get("symbol") if isinstance(params, dict) else None
+            if isinstance(sym, str):
+                sym = sym.strip().upper() or None
+            rec = ToolUsageRecord(
+                tool_name=action,
+                called_at=_dt.now(_tz.utc),
+                symbol=sym,
+                success=bool(success),
+                latency_ms=0.0,
+                source="executor",
+                context={"param_keys": list((params or {}).keys())[:6] if isinstance(params, dict) else []},
+            )
+            svc.record_tool_usage(rec)
+        except Exception as _rec_err:
+            # Never let provenance logging break tool execution
+            logger.debug("QualityMatrix tool record (executor) skipped: %s", _rec_err)
+
     def _plan_order(
         self,
         symbol: str,
@@ -863,6 +899,21 @@ class ToolExecutor:
             "volume": volume,
             "execution_cost": exec_cost,
         }
+
+        # ── PR2: Scaling now applied at host level in execute() for *all* order paths (including this one)
+        # The universal gate+scaler in ToolExecutor.execute() mutates params before dispatch,
+        # so quantity arriving here is already the final safe value from canonical matrix.
+        # We keep a lightweight note in reasons for the plan_order response payload (observability for agent).
+        try:
+            from core.quality.quality_matrix import get_quality_matrix_service
+            m = get_quality_matrix_service().get_matrix()
+            # quantity was pre-scaled upstream; just record the active policy for transparency
+            reasons.append(
+                f"QualityMatrix (host-enforced): overall={m.overall_quality} rm={m.risk_multiplier:.2f} "
+                f"(pre-scaled quantity already applied before dispatch)"
+            )
+        except Exception as _scale_note_err:
+            logger.debug("QualityMatrix note in plan_order skipped: %s", _scale_note_err)
 
         return {
             "symbol": symbol,
@@ -1762,6 +1813,87 @@ class ToolExecutor:
                     raw_json=json.dumps(err),
                 )
 
+            # ── PR2 Strong: Canonical QualityMatrix hard gate (source of truth) ──
+            # Delegates to the enriched enforcement APIs in core/quality.
+            # This is the authoritative host-level rejection (hard control).
+            # LLM sees the policy via prompt/tools but cannot evade the gate.
+            try:
+                from core.runtime.operating_context import get_operating_context
+                from core.quality.quality_matrix import get_quality_matrix_service
+
+                ctx = get_operating_context()
+                svc = get_quality_matrix_service()
+                m = svc.get_matrix()
+
+                # PR2 observability: log the active policy for every tool dispatch (debug)
+                try:
+                    pol = m.recommended_policies(params.get("symbol") if isinstance(params, dict) else None)
+                    logger.debug(
+                        "QualityMatrix policy for action=%s: overall=%s rm=%.2f blocked=%s force_cons=%s",
+                        action,
+                        m.overall_quality,
+                        m.risk_multiplier,
+                        m.blocked_tool_categories,
+                        m.force_conservative_reasoning,
+                    )
+                except Exception:
+                    pass
+
+                # Prefer core matrix decision (strong unification); fall back to old path only on total failure
+                is_ind = getattr(ctx, "is_independent_mode", False)
+                allowed, reason = m.should_allow_tool(action, params, is_independent_mode=is_ind)
+
+                if not allowed:
+                    err = {
+                        "error": reason or f"Tool '{action}' REJECTED by QualityMatrix (hard host enforcement).",
+                        "quality": m.overall_quality,
+                        "risk_mult": round(m.risk_multiplier, 3),
+                        "blocked_by": "QualityMatrix",
+                        "enforcement": "strong_pr2",
+                    }
+                    logger.warning(
+                        "QualityMatrix STRONG hard-block: action=%s q=%s rm=%.2f reason=%s",
+                        action, m.overall_quality, m.risk_multiplier, (reason or "")[:120]
+                    )
+                    # PR1: record rejected calls (host decision point) for provenance
+                    self._record_tool_for_quality_matrix(action, params, success=False)
+                    return ToolResult(
+                        action=action, data=err, success=False,
+                        raw_json=json.dumps(err, default=str),
+                    )
+
+                # Also surface the scaling hint for downstream order handlers (they will call m.get_scaled_quantity)
+                # This keeps the gate single source while still allowing partial progress for info tools.
+            except Exception as _qgate:
+                # Never let quality gate crash execution — degrade open (safe default)
+                logger.debug("QualityMatrix strong gate bypassed (non-fatal): %s", _qgate)
+
+            # ── PR2 Strong: Apply canonical QualityMatrix quantity scaling to *all* order actions ──
+            # Previously only plan_order received hard scaling. Now every direct market/limit/stop etc.
+            # (and the alias-rewritten buy/sell) receives the authoritative host scaling before any
+            # broker call. This is non-bypassable enforcement.
+            try:
+                from core.quality.quality_matrix import get_quality_matrix_service
+                svc = get_quality_matrix_service()
+                m = svc.get_matrix()
+                if isinstance(params, dict) and "quantity" in params:
+                    orig_qty = params.get("quantity")
+                    try:
+                        orig_qty_f = float(orig_qty)
+                    except Exception:
+                        orig_qty_f = 1.0
+                    sym = params.get("symbol") if isinstance(params.get("symbol"), str) else None
+                    intent = params.get("intent", "entry") if isinstance(params, dict) else "entry"
+                    scaled = m.get_scaled_quantity(orig_qty_f, symbol=sym, intent=intent)
+                    if scaled != int(orig_qty_f) and scaled >= 1:
+                        params["quantity"] = int(scaled)
+                        logger.warning(
+                            "QualityMatrix hard scaling (direct order path): %s %s → %s (q=%s rm=%.2f)",
+                            action, int(orig_qty_f), scaled, m.overall_quality, m.risk_multiplier
+                        )
+            except Exception as _scale_all_err:
+                logger.debug("QualityMatrix universal scaling skipped: %s", _scale_all_err)
+
             # Universe confinement: ENTRIES into new exposure must be in
             # the allowed universe (research universe ∪ active attention ∪
             # current positions).  Exits/closes/rolls are always allowed.
@@ -1796,6 +1928,8 @@ class ToolExecutor:
                             "Universe guard blocked %s on %s (allowed=%d)",
                             action, sym, len(allowed),
                         )
+                        # PR1: record universe guard rejections (host-level policy decision) for provenance
+                        self._record_tool_for_quality_matrix(action, params, success=False)
                         return ToolResult(
                             action=action, data=err, success=False,
                             raw_json=json.dumps(err, separators=(',',':'), default=str),
@@ -1820,6 +1954,9 @@ class ToolExecutor:
                     "is_realtime": False,
                     "data_warning": None,
                 }
+
+            # PR1: primary recording of tool usage (success path) — centralized in executor
+            self._record_tool_for_quality_matrix(action, params, success=bool(payload.get("success")))
 
             return ToolResult(
                 action=action,

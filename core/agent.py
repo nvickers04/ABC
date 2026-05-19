@@ -44,6 +44,7 @@ from xai_sdk.chat import system as sdk_system, user as sdk_user
 
 from core.grok_llm import get_grok_llm
 from core.runtime import SafetyController, StateContextBuilder
+from core.runtime.operating_context import get_operating_context, OperatingContext
 from core.runtime.scheduler import CycleScheduler, _now_et
 from core.runtime.cycle import evaluate_gap_guard
 # Re-exported for backward compatibility (these used to live in this module).
@@ -107,6 +108,31 @@ class TradingAgent:
 
         # Runtime modules (extracted from this class).
         self._state_context_builder = StateContextBuilder(gateway)
+        self._operating_context = get_operating_context()
+
+        # Best-effort detection of researcher availability at startup
+        if not self._operating_context.sync_researcher_from_heartbeat():
+            self._operating_context.quality.working_memory_completeness = 0.5
+            logger.warning(
+                "Starting in INDEPENDENT MODE — researcher unavailable. "
+                "Using local memory fallback and reduced risk."
+            )
+
+        # PR2: Initial population of canonical QualityMatrix at agent startup.
+        # Ensures first cycle sees up-to-date risk_multiplier, LLM config, blocked categories,
+        # and prompt block derived from trade_feedback + current researcher state.
+        try:
+            from core.quality.quality_matrix import get_quality_matrix_service
+            svc = get_quality_matrix_service()
+            svc.populate()
+            logger.info(
+                "QualityMatrix initial populate at startup: overall=%s rm=%.2f",
+                svc.get_matrix().overall_quality,
+                svc.get_matrix().risk_multiplier,
+            )
+        except Exception as _init_qm:
+            logger.debug("QualityMatrix startup populate skipped (non-fatal): %s", _init_qm)
+
         self._safety = SafetyController(
             gateway,
             self.cost_tracker,
@@ -533,6 +559,16 @@ If no changes warranted: []"""
             set_research_config("last_analysis_snapshot_id", float(max_id), "execution_analysis_complete")
             logger.info(f"Execution analysis complete: analyzed {len(snapshots)} snapshots")
 
+            # PR1: QualityMatrix hook (conservative reuse after execution analysis)
+            try:
+                from core.quality.quality_matrix import get_quality_matrix_service
+                svc = get_quality_matrix_service()
+                svc.update_from_execution_analysis(
+                    snapshots, calibrated_count, [], db
+                )
+            except Exception as _qm_err:
+                logger.debug(f"QualityMatrix execution_analysis hook skipped: {_qm_err}")
+
         except Exception as e:
             logger.warning(f"Execution analysis failed: {e}", exc_info=True)
 
@@ -727,18 +763,42 @@ If no changes warranted: []"""
 
         from zoneinfo import ZoneInfo
         _et_now = datetime.now(ZoneInfo("America/New_York"))
+        # ── Operating Context & Researcher Status (PR2: QualityMatrix driven) ──
+        # The matrix is the source of truth for orchestration. Its prompt block
+        # is richer and explicitly calls out HARD policies (model, risk, blocked tools).
+        # PR2: Refresh canonical matrix before prompt construction so any
+        # inter-cycle tool provenance, daily updates, or state flips are reflected
+        # in the injected block + any downstream policy lookups.
+        ctx = self._operating_context
+        ctx.sync_researcher_from_heartbeat()
+
+        try:
+            from core.quality.quality_matrix import get_quality_matrix_service
+
+            svc = get_quality_matrix_service()
+            svc.maybe_populate(max_age_seconds=60.0)
+        except Exception as _cycle_pop:
+            logger.debug("QualityMatrix cycle refresh skipped: %s", _cycle_pop)
+        # Use the matrix block (enhanced for PR2); legacy .quality kept for tools/compat
+        status_block = ctx.quality_matrix.to_prompt_block(ctx.risk_multiplier) + "\n\n"
+
         # ── Working Memory: curate then render ──────────────────
-        # Auto-injected at the top so the agent sees its own prior
-        # interpretations (theses, verdicts, watch-fors) before today's
-        # state.  See docs/PLAN_COGNITIVE_ARCHITECTURE.md §2-§3.
+        # Prefers local store in Independent Mode for resilience.
         wm_block = ""
         try:
-            from memory.working_memory import get_working_memory
-            wm = get_working_memory()
+            from core.runtime.working_memory_access import get_active_working_memory
+
+            wm = get_active_working_memory()
             wm.curate()
             wm_block = wm.render() + "\n\n"
+            ctx.quality.working_memory_completeness = 0.85 if ctx.is_independent_mode else 0.95
         except Exception as e:
-            logger.debug("working_memory render failed: %s", e)
+            logger.warning("Working Memory load failed: %s", e)
+            wm_block = "(Working Memory currently unavailable)\n\n"
+            ctx.quality.working_memory_completeness = 0.0
+
+        # (status_block already set from QualityMatrix above; duplicate removed for PR2)
+        # status_block remains the rich matrix version for prompt injection.
 
         # ── Attention: sync new watching_for into triggers, render fires ──
         # Rendered ABOVE working memory so the agent sees "what just
@@ -769,12 +829,14 @@ If no changes warranted: []"""
         except Exception as e:
             logger.debug("intuition render failed: %s", e)
 
-        context = f"""{attn_block}{intu_block}{wm_block}{state_text}
+        _guidance = ctx.cycle_guidance_footer()
+        context = f"""{status_block}{attn_block}{intu_block}{wm_block}{state_text}
 {cost_line}
 Time: {_et_now.strftime('%Y-%m-%d %H:%M:%S')} ET
 {continuity}{pre_scan_prompt}{gap_guard_prompt}
-Account state above. Start by calling briefing() to assess research status."""
-
+Account state above.
+{_guidance}
+"""
         # ── Build xAI SDK chat instance ─────────────────────────
         self._last_step = "chat_create"
         self._last_step_ts = time.time()
@@ -795,14 +857,37 @@ Account state above. Start by calling briefing() to assess research status."""
             TOOL_PLAYBOOK_MAX_CHARS,
             AGENT_TOOL_FEEDBACK_MAX_CHARS,
         )
+        # ── PR2 Strong: Canonical QualityMatrix LLM config (unconditional host override) ──
+        # The matrix decides sampling params. This is hard control at the orchestration
+        # layer — the model never sees "full creativity" when the matrix says otherwise.
+        # Falls back to legacy only if core service is unreachable (never during normal op).
+        try:
+            from core.quality.quality_matrix import get_quality_matrix_service
+            svc = get_quality_matrix_service()
+            m = svc.get_matrix()
+            cfg = m.get_llm_call_config()
+            eff_temp = float(cfg.get("temperature", LLM_TEMPERATURE))
+            eff_max_tokens = int(cfg.get("max_tokens", LLM_MAX_TOKENS))
+            q_for_log = m.overall_quality
+        except Exception:
+            ctx = self._operating_context
+            model_over = ctx.get_model_overrides()
+            eff_temp = float(model_over.get("temperature", LLM_TEMPERATURE))
+            eff_max_tokens = int(model_over.get("max_tokens", LLM_MAX_TOKENS))
+            q_for_log = getattr(ctx.quality_matrix, "overall_quality", "unknown")
+
+        logger.info(
+            "CYCLE %d model-config from QualityMatrix (strong): temp=%.2f max_tokens=%d (quality=%s)",
+            self._cycle_id, eff_temp, eff_max_tokens, q_for_log
+        )
         chat = self.grok.client.chat.create(
             model=self.grok.model,
             messages=[
                 sdk_system(_system_content),
                 sdk_user(context),
             ],
-            temperature=LLM_TEMPERATURE,
-            max_tokens=LLM_MAX_TOKENS,
+            temperature=eff_temp,
+            max_tokens=eff_max_tokens,
             seed=LLM_SEED,
         )
 
@@ -926,12 +1011,51 @@ Account state above. Start by calling briefing() to assess research status."""
                             + ", ".join(cycle_actions[-5:])
                         )
                         self._append_snapshot(f"C{self._cycle_id}: done")
+
+                        # PR1: Record decision provenance snapshot at cycle end (tool purist)
+                        try:
+                            from core.quality.quality_matrix import (
+                                get_quality_matrix_service,
+                                DecisionProvenanceSnapshot,
+                                ToolUsageRecord,
+                            )
+                            from datetime import datetime as _dt, timezone as _tz
+                            svc = get_quality_matrix_service()
+                            # Capture recent tool usages as provenance (lightweight copy)
+                            recent_tools = [
+                                ToolUsageRecord(
+                                    tool_name=getattr(t, 'tool_name', str(t)),
+                                    called_at=getattr(t, 'called_at', _dt.now(_tz.utc)),
+                                    symbol=getattr(t, 'symbol', None),
+                                    success=getattr(t, 'success', True),
+                                )
+                                for t in svc.get_matrix().recent_tool_usage[-5:]
+                            ]
+                            snap = DecisionProvenanceSnapshot(
+                                ts=_dt.now(_tz.utc),
+                                cycle_id=self._cycle_id,
+                                decision_type="done",
+                                symbol=None,
+                                tools_used=recent_tools,
+                                quality_state={"overall": svc.get_matrix().overall_quality},
+                                context_quality=svc.get_matrix().overall_quality,
+                                outcome="done",
+                                notes=summary[:120],
+                            )
+                            svc.record_decision_snapshot(snap)
+                        except Exception as _prov_err:
+                            logger.debug(f"QualityMatrix provenance snapshot skipped: {_prov_err}")
+
                         return cooldown
 
                     else:
                         # ── Execute tool action ────────────────
                         last_result = await self.tools.execute(action, action_data)
                         sym = action_data.get('symbol', '')
+
+                        # PR1: Recording now centralized in ToolExecutor._record_tool_for_quality_matrix
+                        # (primary hook per PR1 spec). Kept here only as no-op comment for traceability.
+                        # The executor records on every dispatch (including gate/universe rejects).
 
                         # Cache research results for cross-cycle memory
                         if action == 'research' and last_result.success:

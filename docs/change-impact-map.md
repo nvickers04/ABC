@@ -47,6 +47,9 @@ Before changing code, use this map to check what else might be affected.
   - DB compatibility
   - startup migrations
   - data quality assumptions
+- Working memory / Independent Mode: `memory/working_memory.py`,
+  `core/runtime/working_memory_access.py`, `core/runtime/local_memory_fallback.py`
+  — policy in `docs/policy-independent-mode-memory.md`
 - Must verify:
   - schema version/migration path
   - no silent compatibility break

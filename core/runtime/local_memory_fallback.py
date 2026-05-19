@@ -1,0 +1,202 @@
+"""
+Simple local persistent fallback for Working Memory.
+
+Used when the main Postgres DB is unreachable (Independent Mode).
+
+Stores the five working memory sections in a local JSON file so the trader
+keeps its theses, watching_for, lessons, etc. across restarts even when
+the research machine is down.
+
+API mirrors memory.working_memory.WorkMemory public surface used by tools/agent.
+"""
+
+from __future__ import annotations
+
+import json
+import threading
+import time
+from pathlib import Path
+from typing import Any
+
+from memory.working_memory import (
+    SECTIONS,
+    SECTION_CAPS,
+    DEFAULT_SECTION_SCORES,
+    _resolve_expiry_ts,
+    _validate_section,
+)
+
+LOCAL_MEMORY_FILE = Path("data/local_working_memory.json")
+LOCAL_MEMORY_FILE.parent.mkdir(parents=True, exist_ok=True)
+
+
+class LocalWorkingMemoryStore:
+    """
+    Lightweight JSON-backed store for the five working memory sections.
+    Thread-safe. Survives trader restarts when Postgres is unavailable.
+    """
+
+    def __init__(self, filepath: Path = LOCAL_MEMORY_FILE):
+        self.filepath = filepath
+        self._lock = threading.RLock()
+        self._entries: dict[str, list[dict]] = {s: [] for s in SECTIONS}
+        self._section_scores: dict[str, dict] = {}
+        self._load()
+
+    def ensure_section_scores(self) -> dict[str, dict]:
+        """Guarantee _section_scores exist with defaults (local fallback)."""
+        if not self._section_scores or not isinstance(self._section_scores, dict):
+            self._section_scores = {k: v.copy() for k, v in DEFAULT_SECTION_SCORES.items()}
+            now = time.time()
+            for section in self._section_scores:
+                self._section_scores[section]["last_updated"] = now
+        return self._section_scores
+
+    def _load(self) -> None:
+        if self.filepath.exists():
+            try:
+                with open(self.filepath, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+                for section in SECTIONS:
+                    self._entries[section] = data.get(section, [])
+                self._section_scores = data.get("_section_scores", {}) or {}
+            except Exception:
+                pass
+        self.ensure_section_scores()
+
+    def _save(self) -> None:
+        try:
+            payload = {s: self._entries.get(s, []) for s in SECTIONS}
+            payload["_section_scores"] = self._section_scores or {}
+            with open(self.filepath, "w", encoding="utf-8") as f:
+                json.dump(payload, f, indent=2, default=str)
+        except Exception:
+            pass
+
+    def _enforce_cap(self, section: str) -> None:
+        cap = SECTION_CAPS.get(section, 20)
+        bucket = self._entries[section]
+        while len(bucket) > cap:
+            bucket.sort(key=lambda e: e.get("expires_ts", 0))
+            bucket.pop(0)
+
+    def add(
+        self,
+        section: str,
+        entry: str,
+        *,
+        expires_in_minutes: int | float | None = None,
+        metadata: dict[str, Any] | None = None,
+        now_ts: float | None = None,
+    ) -> int:
+        """Append an entry; evict oldest-expires-first when at cap."""
+        _validate_section(section)
+        text = (entry or "").strip()
+        if not text:
+            raise ValueError("working-memory entry must be non-empty")
+
+        ts = float(now_ts if now_ts is not None else time.time())
+        expires = _resolve_expiry_ts(section, expires_in_minutes, ts)
+        entry_id = int(ts * 1000)
+
+        record = {
+            "id": entry_id,
+            "entry_text": text,
+            "created_ts": ts,
+            "expires_ts": expires,
+            "metadata": dict(metadata or {}),
+        }
+
+        with self._lock:
+            self._entries[section].append(record)
+            self._enforce_cap(section)
+            self._save()
+        return entry_id
+
+    def clear(self, section: str, entry_id: int | None = None) -> int:
+        """Remove one entry by id, or clear the whole section."""
+        _validate_section(section)
+        with self._lock:
+            bucket = self._entries[section]
+            if entry_id is None:
+                removed = len(bucket)
+                self._entries[section] = []
+            else:
+                new_bucket = [e for e in bucket if e.get("id") != entry_id]
+                removed = len(bucket) - len(new_bucket)
+                self._entries[section] = new_bucket
+            self._save()
+            return removed
+
+    def get_all(self, section: str) -> list[dict]:
+        with self._lock:
+            return list(self._entries.get(section, []))
+
+    def curate(self) -> int:
+        """Remove expired entries. Returns count removed."""
+        now = time.time()
+        removed = 0
+        with self._lock:
+            for section in SECTIONS:
+                before = len(self._entries[section])
+                self._entries[section] = [
+                    e for e in self._entries[section] if e.get("expires_ts", 0) > now
+                ]
+                removed += before - len(self._entries[section])
+            self._save()
+        return removed
+
+    def render(self, *, now_ts: float | None = None) -> str:
+        """Render compatible with WorkingMemory.render() (abbreviated in local mode)."""
+        now = float(now_ts if now_ts is not None else time.time())
+        lines = ["═══ WORKING MEMORY (local fallback) ═══"]
+        any_content = False
+        for section in SECTIONS:
+            entries = [
+                e for e in self.get_all(section)
+                if e.get("expires_ts", 0) > now
+            ]
+            if not entries:
+                continue
+            any_content = True
+            lines.append(f"**{section.upper()}**")
+            for e in entries[-5:]:
+                text = str(e.get("entry_text", ""))[:300]
+                lines.append(f"- {text}")
+            lines.append("")
+        if not any_content:
+            return "(Local working memory empty)"
+        return "\n".join(lines)
+
+    def snapshot(self) -> dict[str, Any]:
+        """JSON-friendly snapshot including _section_scores."""
+        with self._lock:
+            out: dict[str, Any] = {
+                s: list(self._entries.get(s, [])) for s in SECTIONS
+            }
+            out["_section_scores"] = {
+                k: dict(v) for k, v in (self._section_scores or {}).items()
+            }
+            return out
+
+
+_local_store: LocalWorkingMemoryStore | None = None
+
+
+def get_local_working_memory(filepath: Path | None = None) -> LocalWorkingMemoryStore:
+    """Return the local WM singleton, optionally bound to a specific file (tests)."""
+    global _local_store
+    if filepath is not None:
+        _local_store = LocalWorkingMemoryStore(filepath=filepath)
+        return _local_store
+    if _local_store is None:
+        _local_store = LocalWorkingMemoryStore()
+    return _local_store
+
+
+def reset_local_working_memory_for_tests(filepath: Path | None = None) -> None:
+    """Reset singleton; pass filepath to bind the next store to an isolated file."""
+    global _local_store
+    _local_store = None
+    if filepath is not None:
+        get_local_working_memory(filepath=filepath)

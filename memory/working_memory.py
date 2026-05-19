@@ -36,7 +36,7 @@ import logging
 import threading
 import time
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Any
 
 logger = logging.getLogger(__name__)
@@ -70,6 +70,17 @@ SECTION_DEFAULT_EXPIRY: dict[str, str | int] = {
     "watching_for":    60,
     "regime_notes":    "EOD",
     "lessons_today":   "EOD",
+}
+
+
+# ── Quality metadata defaults (for per-entry tracking + section trust) ──
+
+DEFAULT_SECTION_SCORES: dict[str, dict[str, Any]] = {
+    "lessons_today": {"score": 0.92, "last_updated": None, "sample_size": 0},
+    "open_theses":   {"score": 0.70, "last_updated": None, "sample_size": 0},
+    "watching_for":  {"score": 0.78, "last_updated": None, "sample_size": 0},
+    "regime_notes":  {"score": 0.75, "last_updated": None, "sample_size": 0},
+    "recent_verdicts": {"score": 0.85, "last_updated": None, "sample_size": 0},
 }
 
 
@@ -140,6 +151,22 @@ class WorkingMemory:
         self._entries: dict[str, list[WorkingMemoryEntry]] = {
             s: [] for s in SECTIONS
         }
+        # Top-level section trust aggregates (longer-lived than daily entries)
+        self._section_scores: dict[str, dict[str, Any]] = {}
+        self.ensure_section_scores()  # populate defaults immediately
+
+    def ensure_section_scores(self) -> dict[str, Any]:
+        """Instance method: ensure _section_scores exist with defaults on this WM.
+
+        Idempotent.  Returns the live _section_scores dict (mutatable by caller
+        or via the module-level update_section_score).
+        """
+        if not self._section_scores:
+            self._section_scores = {k: v.copy() for k, v in DEFAULT_SECTION_SCORES.items()}
+            now = datetime.now(timezone.utc).isoformat()
+            for section in self._section_scores:
+                self._section_scores[section]["last_updated"] = now
+        return self._section_scores
 
     # ── Public API ──────────────────────────────────────────────
 
@@ -258,8 +285,13 @@ class WorkingMemory:
         return dropped_total
 
     def snapshot(self) -> dict[str, list[dict[str, Any]]]:
-        """Return a JSON-friendly snapshot of all live entries."""
-        out: dict[str, list[dict[str, Any]]] = {}
+        """Return a JSON-friendly snapshot of all live entries.
+
+        The returned dict now also contains the top-level "_section_scores"
+        key (for quality tracking integration).  Callers that only access
+        known section keys remain unaffected.
+        """
+        out: dict[str, Any] = {}
         with self._lock:
             for section in SECTIONS:
                 out[section] = [
@@ -272,6 +304,9 @@ class WorkingMemory:
                     }
                     for e in self._entries[section]
                 ]
+            out["_section_scores"] = {
+                k: dict(v) for k, v in self._section_scores.items()
+            }
         return out
 
     def render(self, *, now_ts: float | None = None) -> str:
@@ -366,6 +401,8 @@ class WorkingMemory:
             # Defensive: enforce caps after bulk restore
             for s in SECTIONS:
                 self._enforce_cap(s)
+            # Ensure quality scores survive (they are not daily-scoped)
+            self.ensure_section_scores()
             return restored
 
     # ── Internals ───────────────────────────────────────────────
@@ -427,3 +464,176 @@ def reset_working_memory_for_tests() -> None:
     global _singleton
     with _singleton_lock:
         _singleton = None
+
+
+# ── Quality scoring helpers (per-entry metadata + section-level trust) ──
+#
+# These enable outcome-feedback paths to track reliability of WM content.
+# Per-entry fields live *inside* each entry's existing "metadata" dict for
+# 100% backward compatibility with legacy entries (pre-quality fields).
+# Old entries receive sensible defaults on first reinforce/mark.
+#
+# The _section_scores live as a top-level key alongside the 5 section arrays
+# in snapshot() output and in the local fallback JSON.  Section scores are
+# long-lived (survive daily curate/restore); entry metadata is per-utterance.
+#
+# Typical usage from feedback:
+#   entry = ... from snapshot ...
+#   reinforce_wm_entry(entry, success=True)
+#   update_section_score(scores, entry_section, success=True)
+#
+
+
+def ensure_section_scores(wm: dict[str, Any]) -> dict[str, Any]:
+    """Guarantees the _section_scores structure exists with defaults.
+
+    Operates on a dict representation of Working Memory (e.g. snapshot()
+    result or the internal structure of LocalWorkingMemoryStore).  Safe to
+    call repeatedly.  Initializes last_updated to now on first creation.
+
+    Returns the (possibly newly created) _section_scores sub-dict.
+    """
+    if "_section_scores" not in wm or not isinstance(wm.get("_section_scores"), dict):
+        wm["_section_scores"] = {k: v.copy() for k, v in DEFAULT_SECTION_SCORES.items()}
+        now = datetime.now(timezone.utc).isoformat()
+        for section in wm["_section_scores"]:
+            wm["_section_scores"][section]["last_updated"] = now
+    return wm["_section_scores"]
+
+
+def create_wm_entry(
+    text: str,
+    confidence: float = 0.85,
+    source: str = "agent",
+    tags: Optional[list[str]] = None,
+    **extra: Any,
+) -> dict[str, Any]:
+    """Create a quality-aware metadata payload for a new WM entry.
+
+    Returns a dict intended to be passed via the existing `metadata=`
+    parameter to WorkingMemory.add() / update_working_memory tool.
+
+    All quality fields are placed inside the caller's metadata dict so that
+    the on-disk / snapshot shape (id, entry_text, created_ts, expires_ts, metadata)
+    is unchanged.  Legacy entries without these keys are fully supported.
+
+    The `text` arg is accepted for caller convenience / documentation but is
+    *not* included in the return (text belongs in the `entry` param of add()).
+
+    Example:
+        meta = create_wm_entry("NVDA thesis...", confidence=0.9, tags=["earnings"])
+        wm.add("open_theses", "NVDA thesis...", metadata=meta)
+    """
+    now = datetime.now(timezone.utc).isoformat()
+    payload: dict[str, Any] = {
+        "created_at": now,
+        "last_used": now,
+        "last_reinforced": now,
+        "success_count": 0,
+        "failure_count": 0,
+        "confidence": max(0.5, min(1.0, float(confidence))),
+        "source": source or "agent",
+        "tags": list(tags) if tags else [],
+        "version": 1,
+    }
+    payload.update(extra)  # allow symbol, condition, etc. to coexist
+    return payload
+
+
+def _ensure_quality_meta(meta: Any) -> dict[str, Any]:
+    """Internal: coerce/return a dict for the quality fields, with defaults."""
+    if not isinstance(meta, dict):
+        meta = {}
+    now = datetime.now(timezone.utc).isoformat()
+    meta.setdefault("created_at", now)
+    meta.setdefault("last_used", now)
+    meta.setdefault("last_reinforced", now)
+    meta.setdefault("success_count", 0)
+    meta.setdefault("failure_count", 0)
+    meta.setdefault("confidence", 0.85)
+    meta.setdefault("source", "unknown")
+    meta.setdefault("tags", [])
+    meta.setdefault("version", 1)
+    return meta
+
+
+def reinforce_wm_entry(entry: dict[str, Any], success: bool) -> dict[str, Any]:
+    """Record outcome for an existing WM entry (from .snapshot() or local store).
+
+    Updates success/failure counts and last_reinforced inside entry["metadata"].
+    Returns a (shallow) copy of the entry with the mutated metadata so callers
+    can persist if the store requires explicit write-back.
+
+    Old entries without quality keys receive defaults on first call.
+    Safe to call multiple times; does not touch the rendered entry_text.
+    """
+    entry = dict(entry)  # top-level copy
+    meta = entry.get("metadata")
+    meta = _ensure_quality_meta(meta)
+    entry["metadata"] = meta
+
+    now = datetime.now(timezone.utc).isoformat()
+    if success:
+        meta["success_count"] = int(meta.get("success_count", 0)) + 1
+    else:
+        meta["failure_count"] = int(meta.get("failure_count", 0)) + 1
+    meta["last_reinforced"] = now
+    return entry
+
+
+def mark_wm_entry_used(entry: dict[str, Any]) -> dict[str, Any]:
+    """Mark that this WM entry was read/used in a decision or reasoning step.
+
+    Updates only last_used inside the metadata.  Returns a copy for the same
+    reasons as reinforce_wm_entry().
+    """
+    entry = dict(entry)
+    meta = entry.get("metadata")
+    meta = _ensure_quality_meta(meta)
+    entry["metadata"] = meta
+    meta["last_used"] = datetime.now(timezone.utc).isoformat()
+    return entry
+
+
+def update_section_score(
+    section_scores: dict[str, Any],
+    section: str,
+    success: bool,
+    decay_days: int = 14,
+) -> None:
+    """Exponentially update a section's aggregate trust score with time decay.
+
+    Mutates `section_scores` (the value of _section_scores[section]) in place.
+    This is the primitive called by outcome feedback loops after a decision
+    that consumed content from that WM section produced a measurable result.
+
+    Formula: EMA (alpha=0.12) blended with success (1.0/0.0), then gentle
+    multiplicative decay based on days since last update (floor 0.55 after 14d).
+    Score clamped [0.30, 1.00].  sample_size incremented on every call.
+    """
+    if not isinstance(section_scores, dict):
+        return
+    if section not in section_scores or not isinstance(section_scores[section], dict):
+        section_scores[section] = {"score": 0.70, "last_updated": None, "sample_size": 0}
+
+    data = section_scores[section]
+    now = datetime.now(timezone.utc)
+    alpha = 0.12
+    current = float(data.get("score", 0.70))
+    target = 1.0 if success else 0.0
+    new_score = (1.0 - alpha) * current + alpha * target
+
+    # Time decay
+    last_str = data.get("last_updated")
+    if last_str:
+        try:
+            last = datetime.fromisoformat(last_str)
+            days = max(0, (now - last).days)
+            decay = max(0.55, 1.0 - (days / float(decay_days)) * 0.45)
+            new_score *= decay
+        except Exception:
+            pass  # ignore bad timestamps
+
+    data["score"] = round(max(0.30, min(1.0, new_score)), 4)
+    data["last_updated"] = now.isoformat()
+    data["sample_size"] = int(data.get("sample_size", 0)) + 1

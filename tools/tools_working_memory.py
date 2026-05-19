@@ -17,11 +17,12 @@ from __future__ import annotations
 import logging
 from typing import Any
 
+from core.runtime.working_memory_access import get_active_working_memory
+
 from memory.working_memory import (
     SECTIONS,
     SECTION_CAPS,
     SECTION_DEFAULT_EXPIRY,
-    get_working_memory,
 )
 
 logger = logging.getLogger(__name__)
@@ -76,10 +77,9 @@ async def handle_update_working_memory(executor, params: dict) -> Any:
         return {"error": "metadata must be an object/dict"}
 
     try:
-        wm = get_working_memory()
-    except Exception as e:
-        logger.warning("working_memory unavailable: %s", e)
-        return {"error": "working_memory unavailable"}
+        wm = get_active_working_memory()
+    except Exception as e2:
+        return {"error": f"working_memory unavailable: {e2}"}
 
     try:
         eid = wm.add(
@@ -94,13 +94,17 @@ async def handle_update_working_memory(executor, params: dict) -> Any:
         logger.error("update_working_memory failed: %s", e)
         return {"error": f"update failed: {e}"}
 
-    snap = wm.snapshot().get(section, [])
+    try:
+        snap = wm.snapshot().get(section, []) if hasattr(wm, "snapshot") else wm.get_all(section)
+    except Exception:
+        snap = []
+
     return {
         "success": True,
         "section": section,
         "entry_id": eid,
         "section_size": len(snap),
-        "section_cap": SECTION_CAPS[section],
+        "section_cap": SECTION_CAPS.get(section, 20),
     }
 
 
@@ -127,7 +131,7 @@ async def handle_clear_working_memory_entry(executor, params: dict) -> Any:
             return {"error": f"entry_id must be int, got {entry_id!r}"}
 
     try:
-        wm = get_working_memory()
+        wm = get_active_working_memory()
     except Exception as e:
         logger.warning("working_memory unavailable: %s", e)
         return {"error": "working_memory unavailable"}

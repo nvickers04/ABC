@@ -7,6 +7,7 @@ _PRECISE: dict[str, str] = {
     "research": "Deep web/X discovery when cheap tools cannot answer; cost=llm.",
     "research_engine": "In-process scorer only; evolution lives in research_daemon.py.",
     "prior_research": "Pull cached multi-agent runs; cost=free (reads DB).",
+    "context_quality": "Inspect researcher status, memory source (postgres vs local), risk multiplier, and overall context quality. Call this at the start of any cycle in Independent Mode to know exactly how much you can trust your information.",
     "briefing": "Default summary includes template OOS track_record on ACTION_REQUIRED + template_leaderboard; detail=strategies for full table.",
     "plan_order": "Size/type/stop plan before any live order; universe guard on entries.",
     "enter_option": "Contract pick + optional execute; prefer after plan_order/chain.",
@@ -21,6 +22,10 @@ _PRECISE: dict[str, str] = {
     "execution_status": "Autoresearch snapshot stats + slippage tables.",
     "trader_rules": "Engine + risk rails status; alias for status/engine_status.",
     "open_hypotheses": "Review queued trader hypotheses.",
+    "quality_status": "Read-only inspect tool (PR3). Returns canonical QualityMatrix status: overall_quality (full/limited/minimal/degraded), risk_multiplier, blocked_tool_categories, force_conservative_reasoning, llm_call_config, can_initiate_new_risk, global/symbol aggregates, recent_provenance count, and to_prompt_block summary. Primary calibration entrypoint; call early in every Independent Mode cycle. Pure inspection — enforcement is host-side.",
+    "quality_for_symbol": "Read-only inspect tool (PR3). Per-symbol SymbolQuality view: local quality_score (0-1 from recent trade_feedback gaps + volume), avg_execution_gap, feedback_count, recent_pnl_samples. Use to differentiate strong local track-record names vs weak before any sizing or conviction in Independent Mode. Cross with provenance_audit for tool history on that symbol.",
+    "provenance_audit": "Read-only inspect tool (PR3 Tool-Provenance Heavy core). Heavy forensics: recent ToolUsageRecords (tool_name, called_at, symbol, success, latency_ms, source, context) + DecisionProvenanceSnapshots (ts, cycle_id, decision_type, tools_used list at that moment, context_quality, outcome, notes, quality_state). Supports window (1-30, default 12) and symbol filter. The key signal for detecting tool staleness, decision coverage gaps, and what the system actually had when it made prior choices. Filter per-symbol to audit your thesis support. Pure read-only; no mutation.",
+    "current_constraints": "Compat policy summary (Balanced polish). Risk scale, mode, new_entry_policy. Prefer the three canonical quality_* tools above for full matrix + provenance depth.",
     "update_working_memory": "Structured memory for thesis/watchlist; caps per section.",
     "clear_working_memory_entry": "Remove one WM row by section+entry_id.",
     "multi_leg": "Generic spread dispatcher; validate strikes exist on chain first.",
@@ -118,7 +123,7 @@ _STATS = frozenset({"stats", "daily_summary", "review_trades"})
 
 SECTION: dict[str, str] = {}
 
-for _t in _RESEARCH_DATA | {"research", "research_engine", "prior_research", "briefing"}:
+for _t in _RESEARCH_DATA | {"research", "research_engine", "prior_research", "briefing", "context_quality"}:
     SECTION[_t] = "RESEARCH & DATA"
 for _t in _KNOWLEDGE:
     SECTION[_t] = "SESSION & COST"
@@ -142,7 +147,7 @@ for _t in ("option_chain", "option_quote", "option_greeks", "position_greeks"):
     SECTION[_t] = "RESEARCH & DATA"
 for _t in ("multi_leg",):
     SECTION[_t] = "OPTION ORDERS"
-for _t in ("execution_status", "trader_rules", "open_hypotheses", "signal_breakdown"):
+for _t in ("execution_status", "trader_rules", "open_hypotheses", "signal_breakdown", "quality_status", "quality_for_symbol", "provenance_audit", "current_constraints"):
     SECTION[_t] = "OBSERVABILITY"
 for _t in _STATS:
     SECTION[_t] = "OBSERVABILITY"
@@ -178,8 +183,8 @@ def _line_for(name: str) -> str:
         return "Options path; listed strikes+exp; margin/cash rules apply. cost=broker."
     if name in _STATS:
         return "Performance introspection; cost=free(DB)."
-    if name in ("execution_status", "trader_rules", "open_hypotheses", "signal_breakdown"):
-        return "Engine/rules/hypothesis/signal forensics. cost=free."
+    if name in ("execution_status", "trader_rules", "open_hypotheses", "signal_breakdown", "quality_status", "quality_for_symbol", "provenance_audit", "current_constraints"):
+        return "Quality/constraints/provenance forensics. cost=free."
     if name in ("update_working_memory", "clear_working_memory_entry"):
         return "Human-in-loop memory; keep entries short. cost=free."
     return "Utility tool; see tools_executor AVAILABLE TOOLS for params. cost=mixed."

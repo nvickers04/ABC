@@ -69,6 +69,14 @@ async def run_daily_review(agent) -> None:
         if TRADING_MODE == "live":
             evaluate_risk_ramp(db, today)
 
+        # PR1: QualityMatrix population hook (hybrid reuse of daily review data)
+        try:
+            from core.quality.quality_matrix import get_quality_matrix_service
+            svc = get_quality_matrix_service()
+            svc.update_from_daily_review(rows, db, today)
+        except Exception as _qm_err:
+            logger.debug(f"QualityMatrix daily review hook skipped: {_qm_err}")
+
         logger.info(f"Daily review complete for {today}: {day_trade_count} trades, {new_snaps} new snapshots")
     except Exception as e:
         logger.warning(f"Daily review failed: {e}")

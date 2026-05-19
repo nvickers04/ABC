@@ -1,7 +1,7 @@
 """Research and market data tool handlers."""
 
 import datetime
-from datetime import date
+from datetime import date, timezone, datetime as dt_datetime
 import logging
 from dataclasses import asdict
 from typing import Any
@@ -530,6 +530,15 @@ async def handle_briefing(executor, params: dict) -> Any:
     if not data:
         return {"briefing": "No research data available yet. Run research pipeline first."}
 
+    # Add Independent Mode awareness
+    try:
+        from core.runtime.operating_context import get_operating_context
+        ctx = get_operating_context()
+        if ctx.is_independent_mode:
+            data["note"] = "Running in Independent Mode (researcher unavailable). Data may be stale."
+    except Exception:
+        pass
+
     if detail == "signals":
         return _briefing_signals(data)
     elif detail == "strategies":
@@ -832,6 +841,454 @@ async def handle_research_engine(executor, params: dict) -> dict:
     return result
 
 
+# ── Context Quality Tool (Independent Mode support) ──────────────────────────
+from core.runtime.operating_context import get_operating_context
+
+
+async def handle_context_quality(executor, params: dict) -> dict:
+    """Return the current quality and reliability of the trader's information.
+
+    The agent should call this explicitly when it wants to understand how good
+    its own context is (especially in Independent Mode when the researcher is down).
+    """
+    ctx = get_operating_context()
+    q = ctx.quality
+
+    return {
+        "researcher_available": q.researcher_available,
+        "memory_source": q.memory_source,
+        "last_research_update_minutes_ago": (
+            (dt_datetime.now(timezone.utc) - q.last_research_update).total_seconds() / 60
+            if q.last_research_update else None
+        ),
+        "working_memory_completeness": round(q.working_memory_completeness, 2),
+        "hypotheses_available": q.hypotheses_available,
+        "overall_quality": q.overall_quality,
+        "summary": q.to_prompt_block(ctx.risk_multiplier),
+    }
+
+
+# ── PR3: Quality Inspection Tools (Tool-Provenance Heavy + Balanced polish) ────
+#
+# Exactly three canonical read-only inspect-only tools (plus legacy compat):
+#   quality_status()             -> system-wide + full canonical QualityMatrix snapshot + policy
+#   quality_for_symbol(symbol)   -> per-symbol execution conviction + local quality_score
+#   provenance_audit(window?, symbol?) -> heavy tool-usage provenance + decision snapshots
+#
+# All three are pure inspection (never mutate state, never cause side-effects).
+# They give the agent (especially in Independent Mode) first-class visibility into:
+#   - Current risk posture and host policy (from QualityMatrix)
+#   - Name-specific execution track record
+#   - Exact recent ToolUsageRecords and DecisionProvenanceSnapshots (the provenance signal)
+#
+# Enforcement (should_allow_tool, get_scaled_quantity, llm config overrides, blocks)
+# stays exclusively in the host (PR2 wiring in executor + agent + QualityMatrixService).
+# The tools surface the state so the LLM can reason and self-limit voluntarily.
+#
+# Strong Independent Mode support: these three are the primary "what do I actually know
+# and what tools were live when decisions were made?" mechanism.
+# Follows the Tool-Provenance Heavy winner (light Balanced polish via compat layer).
+#
+# See core/quality/quality_matrix.py for the dataclass + service contract.
+# See core/agent.py for the INDEPENDENT MODE RULES that mandate early calls to these tools.
+
+from core.runtime.operating_context import get_operating_context
+from datetime import datetime as _dt_datetime, timezone as _tz
+
+
+def _validate_symbol(raw: Any) -> str | None:
+    """Local symbol validator (keeps the quality tools self-contained)."""
+    if not isinstance(raw, str):
+        return None
+    sym = raw.strip().upper()
+    if not sym or len(sym) > 10:
+        return None
+    if not all(c.isalnum() or c in ".-" for c in sym):
+        return None
+    return sym
+
+
+def _recent_feedback_for_symbol(sym: str, limit: int = 30) -> list[dict]:
+    """Recent trade_feedback rows for a symbol (robust)."""
+    try:
+        from memory import get_db
+        db = get_db()
+        cur = db.execute(
+            "SELECT * FROM trade_feedback WHERE symbol = ? ORDER BY ts DESC LIMIT ?",
+            (sym, limit),
+        )
+        rows: list[dict] = []
+        for r in cur.fetchall():
+            if hasattr(r, "keys"):
+                rows.append(dict(r))
+            else:
+                rows.append({"symbol": sym})
+        return rows
+    except Exception as e:
+        logger.debug("quality feedback read failed for %s: %s", sym, e)
+        return []
+
+
+def _maybe_refresh_matrix(svc) -> None:
+    """Lightweight freshness helper for the PR3 inspect tools.
+    If the matrix last_populated is >5min old, trigger populate() so the agent
+    calling quality_status / provenance_audit in Independent Mode sees current data.
+    Non-fatal best-effort only (populate reuses existing sources and is cheap).
+    """
+    try:
+        from datetime import datetime as _dt, timezone as _tz
+        m = svc.get_matrix()
+        age_min = (_dt.now(_tz.utc) - m.last_populated).total_seconds() / 60
+        if age_min > 5:
+            svc.populate()
+    except Exception:
+        pass
+
+
+async def handle_quality_status(executor, params: dict) -> dict:
+    """PR3 canonical read-only inspect tool: quality_status()
+
+    Returns a rich snapshot of system quality posture driven by the canonical
+    QualityMatrixService (PR1) plus legacy operating context for compat.
+
+    Primary fields (authoritative from QualityMatrix when available):
+      - overall_quality, risk_multiplier, blocked_tool_categories,
+        force_conservative_reasoning, suggested model config
+      - matrix_llm_config (the exact temp/max_tokens/reasoning_bias the host will use)
+      - matrix_can_new_risk, matrix_recent_provenance_count
+      - summary: the compact to_prompt_block() string
+      - aggregate_execution from trade_feedback
+      - researcher/memory status for context
+
+    This is the #1 tool the agent must call early in Independent Mode (see
+    agent.py INDEPENDENT MODE RULES). It tells the agent the hard policy surface
+    without the agent having to guess.
+
+    Pure inspection. Never causes trades, research, or state changes.
+    """
+    ctx = get_operating_context()
+    q = ctx.quality
+
+    # Lightweight aggregate (synthesizes what a future QualityMatrix will provide)
+    agg: dict[str, Any] = {"n_recent_trades": 0, "avg_gap": None, "symbols_covered": 0}
+    try:
+        from memory import get_db
+        db = get_db()
+        rows = db.execute(
+            "SELECT symbol, execution_gap FROM trade_feedback ORDER BY ts DESC LIMIT 150"
+        ).fetchall()
+        syms: set[str] = set()
+        gaps: list[float] = []
+        for r in rows:
+            d = dict(r) if hasattr(r, "keys") else {}
+            s = d.get("symbol") or (r[0] if isinstance(r, (list, tuple)) and len(r) > 0 else None)
+            if s:
+                syms.add(str(s).upper())
+            g = d.get("execution_gap")
+            if g is not None:
+                try:
+                    gaps.append(float(g))
+                except Exception:
+                    pass
+        agg = {
+            "n_recent_trades": len(rows),
+            "avg_gap": round(sum(gaps) / len(gaps), 2) if gaps else None,
+            "symbols_covered": len(syms),
+        }
+    except Exception as e:
+        logger.debug("quality_status agg failed: %s", e)
+
+    last_age = None
+    if q.last_research_update:
+        last_age = (_dt_datetime.now(_tz.utc) - q.last_research_update).total_seconds() / 60
+
+    # PR2 Strong: also surface the canonical core QualityMatrix (the real policy engine)
+    matrix_enrichment: dict[str, Any] = {}
+    try:
+        from core.quality.quality_matrix import get_quality_matrix_service
+        svc = get_quality_matrix_service()
+        _maybe_refresh_matrix(svc)  # PR3: give the agent a fresh view when it inspects
+        m = svc.get_matrix()
+        pol = m.recommended_policies()
+        llm_cfg = m.get_llm_call_config()
+        matrix_enrichment = {
+            "matrix_overall_quality": m.overall_quality,
+            "matrix_risk_multiplier": round(m.risk_multiplier, 3),
+            "matrix_blocked_categories": list(m.blocked_tool_categories),
+            "matrix_force_conservative": bool(m.force_conservative_reasoning),
+            "matrix_llm_config": {
+                "temperature": llm_cfg.get("temperature"),
+                "max_tokens": llm_cfg.get("max_tokens"),
+                "reasoning_bias": llm_cfg.get("reasoning_bias"),
+                "source": llm_cfg.get("source"),
+            },
+            "matrix_can_new_risk": m.can_initiate_new_risk(),
+            "matrix_recent_provenance_count": len(m.recent_provenance),
+            "matrix_recent_tool_count": len(m.recent_tool_usage),
+            "matrix_global_exec_quality": getattr(m, "global_execution_quality", None),
+            "matrix_last_populated_minutes_ago": round(
+                (_dt_datetime.now(_tz.utc) - m.last_populated).total_seconds() / 60, 1
+            ),
+        }
+        # Prefer matrix values for the primary keys when available (source of truth)
+        overall_for_return = m.overall_quality
+        rm_for_return = m.risk_multiplier
+        summary_block = m.to_prompt_block(m.risk_multiplier)
+    except Exception as _mat_err:
+        logger.debug("quality_status matrix enrichment failed: %s", _mat_err)
+        overall_for_return = q.overall_quality
+        rm_for_return = ctx.risk_multiplier
+        summary_block = q.to_prompt_block(ctx.risk_multiplier)
+
+    return {
+        "overall_quality": overall_for_return,
+        "researcher_available": q.researcher_available,
+        "memory_source": q.memory_source,
+        "last_research_update_minutes_ago": last_age,
+        "working_memory_completeness": round(q.working_memory_completeness, 2),
+        "hypotheses_available": q.hypotheses_available,
+        "risk_multiplier": round(rm_for_return, 3),
+        "aggregate_execution": agg,
+        "summary": summary_block,
+        "matrix": matrix_enrichment or {"note": "core matrix unavailable this call (fallback to legacy context)"},
+        "enforcement_note": (
+            "Hard controls (model config via get_llm_call_config, tool blocks via should_allow_tool, "
+            "quantity scaling via get_scaled_quantity) live exclusively in the host QualityMatrix and executor. "
+            "This tool + provenance_audit give the agent full visibility for voluntary self-adaptation. "
+            "Call provenance_audit() for the actual recent tool call + decision history."
+        ),
+        "pr3_note": "quality_status + quality_for_symbol + provenance_audit are the three official PR3 inspect tools.",
+    }
+
+
+async def handle_quality_for_symbol(executor, params: dict) -> dict:
+    """PR3 canonical read-only inspect tool: quality_for_symbol({symbol})
+
+    Returns per-symbol quality metrics derived from trade_feedback (the same source
+    that feeds SymbolQuality in the canonical matrix).
+
+    Response includes:
+      - quality_score (0.3–0.95 heuristic: lower |avg_gap| + higher feedback count = higher)
+      - avg_execution_gap_pct, feedback_count, recent_pnl_samples, last_feedback_ts
+
+    In Independent Mode the agent is expected to call this for every name it is
+    considering before using local WM or signals for conviction or sizing.
+
+    Pure read-only. Complements quality_status() (system) and provenance_audit()
+    (tool history on that symbol's decisions).
+    """
+    sym = _validate_symbol(params.get("symbol"))
+    if sym is None:
+        return {"error": "symbol required (1-10 alphanumeric chars)"}
+
+    rows = _recent_feedback_for_symbol(sym, limit=25)
+
+    if not rows:
+        return {
+            "symbol": sym,
+            "feedback_count": 0,
+            "quality_score": 0.45,
+            "notes": "No recent trade feedback. Treat any thesis for this symbol as lower conviction in Independent Mode.",
+            "last_feedback": None,
+        }
+
+    gaps: list[float] = []
+    pnls: list[float] = []
+    last_ts = None
+    for r in rows:
+        g = r.get("execution_gap")
+        if g is not None:
+            try:
+                gaps.append(float(g))
+            except Exception:
+                pass
+        p = r.get("actual_pnl")
+        if p is not None:
+            try:
+                pnls.append(float(p))
+            except Exception:
+                pass
+        if last_ts is None and r.get("ts"):
+            last_ts = r.get("ts")
+
+    avg_gap = round(sum(gaps) / len(gaps), 2) if gaps else None
+    score = 0.72
+    if avg_gap is not None:
+        penalty = min(0.35, max(0.0, (abs(avg_gap) - 5.0) / 40.0))
+        score -= penalty
+    score += min(0.12, len(rows) * 0.004)
+    score = max(0.30, min(0.95, round(score, 3)))
+
+    return {
+        "symbol": sym,
+        "feedback_count": len(rows),
+        "avg_execution_gap_pct": avg_gap,
+        "recent_pnl_samples": [round(p, 2) for p in pnls[:5]],
+        "quality_score": score,
+        "last_feedback_ts": last_ts,
+        "notes": (
+            "Lower |gap| and higher sample count increase local trust. "
+            "Always cross-check against quality_status() (global posture) + "
+            "provenance_audit(window, symbol) (what tools + decisions were actually recorded for this name)."
+        ),
+    }
+
+
+async def handle_current_constraints(executor, params: dict) -> dict:
+    """Legacy / Balanced-polish constraints summary (kept for backward compat).
+
+    New code and Independent Mode prompts should prefer the three PR3 tools
+    (quality_status for full matrix policy, quality_for_symbol for per-name, and
+    especially provenance_audit for the heavy tool-usage + decision history).
+    This is a lightweight derived view only.
+    """
+    ctx = get_operating_context()
+    q = ctx.quality
+    mult = ctx.risk_multiplier
+    is_ind = ctx.is_independent_mode
+
+    if mult < 0.5:
+        policy = "conservative_minimal"
+    elif mult < 0.8:
+        policy = "elevated_caution"
+    else:
+        policy = "standard"
+
+    return {
+        "risk_multiplier": round(mult, 3),
+        "effective_mode": "independent" if is_ind else "full_research",
+        "overall_quality": q.overall_quality,
+        "new_entry_policy": "high_conviction_only" if is_ind else "standard",
+        "prefer_position_management": bool(mult < 0.75),
+        "max_risk_scaling_hint": round(1.5 * mult, 2),
+        "reason": (
+            "Researcher unavailable or memory on local fallback; automatic risk reduction active."
+            if is_ind
+            else "Full research context available."
+        ),
+        "enforcement_note": "Legacy view. Use quality_status() + provenance_audit() for the authoritative QualityMatrix state and tool provenance.",
+        "pr3_note": "Prefer the three canonical tools for PR3 Tool-Provenance Heavy experience.",
+    }
+
+
+async def handle_provenance_audit(executor, params: dict) -> dict:
+    """PR3 canonical read-only inspect tool: provenance_audit({window?, symbol?})
+
+    The Tool-Provenance Heavy flagship tool.
+
+    Returns two rich arrays directly from the canonical QualityMatrix (populated
+    by record_tool_usage + record_decision_snapshot calls throughout the host):
+
+    recent_tool_usage: list of ToolUsageRecord dicts
+        {tool_name, called_at, symbol, success, latency_ms, source, context}
+
+    recent_provenance: list of DecisionProvenanceSnapshot dicts
+        {ts, cycle_id, decision_type, symbol, tools_used (list of names active at decision),
+         context_quality, outcome, notes, quality_state_keys}
+
+    Supports:
+      - window (int, default 12, clamped 1-30): how many most-recent items
+      - symbol (str): filter both lists to records mentioning that symbol
+
+    This is the mechanism that gives the agent real visibility into "what tools
+    did we actually invoke and what was the decision context at the time?"
+    Critical for Independent Mode staleness detection, over-reliance diagnosis,
+    and deciding whether local WM + signals have solid historical tool backing.
+
+    Pure read-only. The act of calling this tool itself is recorded (via executor)
+    so it appears in future provenance_audit calls — useful for self-audit.
+
+    See QualityMatrixService.record_* and the dataclass definitions in
+    core/quality/quality_matrix.py.
+    """
+    try:
+        from core.quality.quality_matrix import get_quality_matrix_service
+        svc = get_quality_matrix_service()
+        _maybe_refresh_matrix(svc)
+        m = svc.get_matrix()
+
+        # Parse window safely
+        raw_window = params.get("window")
+        try:
+            window = int(raw_window) if raw_window is not None else 12
+        except Exception:
+            window = 12
+        window = max(1, min(30, window))
+
+        # Symbol filter (reuse validator)
+        sym_filter = _validate_symbol(params.get("symbol")) if params.get("symbol") else None
+
+        # Recent tool usage (most recent last; apply filter + slice)
+        tools_src = m.recent_tool_usage
+        if sym_filter:
+            tools_src = [t for t in tools_src if (t.symbol or "").upper() == sym_filter]
+        tools_recent = tools_src[-window:] if tools_src else []
+
+        tool_records = []
+        for t in tools_recent:
+            tool_records.append({
+                "tool_name": t.tool_name,
+                "called_at": getattr(t.called_at, "isoformat", lambda: str(t.called_at))(),
+                "symbol": t.symbol,
+                "success": bool(t.success),
+                "latency_ms": round(float(t.latency_ms or 0), 1),
+                "source": getattr(t, "source", None) or "executor",
+                "context": getattr(t, "context", {}) or {},
+            })
+
+        # Recent provenance snapshots (decision-scoped tool sets)
+        prov_src = m.recent_provenance
+        if sym_filter:
+            prov_src = [p for p in prov_src if (p.symbol or "").upper() == sym_filter]
+        prov_recent = prov_src[-window:] if prov_src else []
+
+        prov_records = []
+        for p in prov_recent:
+            tools_in_snap = [tt.tool_name for tt in (p.tools_used or [])[-6:]]
+            prov_records.append({
+                "ts": getattr(p.ts, "isoformat", lambda: str(p.ts))(),
+                "cycle_id": int(p.cycle_id or 0),
+                "decision_type": p.decision_type or "cycle_decision",
+                "symbol": p.symbol,
+                "tools_used": tools_in_snap,
+                "context_quality": p.context_quality or "full",
+                "outcome": p.outcome,
+                "notes": (p.notes or "")[:120],
+                "quality_state_keys": list((p.quality_state or {}).keys())[:5],
+            })
+
+        return {
+            "window": window,
+            "symbol_filter": sym_filter,
+            "total_tool_records": len(m.recent_tool_usage),
+            "total_provenance_snapshots": len(m.recent_provenance),
+            "returned_tool_records": len(tool_records),
+            "returned_provenance": len(prov_records),
+            "recent_tool_usage": tool_records,
+            "recent_provenance": prov_records,
+            "summary": (
+                f"Provenance audit (Tool-Provenance Heavy): {len(tool_records)} tool calls + "
+                f"{len(prov_records)} decision snapshots (filtered to {sym_filter or 'all'}, last {window}). "
+                "High context_quality + diverse tools_used = stronger historical backing for current decisions."
+            ),
+            "enforcement_note": (
+                "Inspect-only. The three PR3 tools surface state for agent reasoning. "
+                "All hard enforcement (blocks, scaling, model params) is performed by QualityMatrix "
+                "in the host before any tool or order is executed. See should_allow_tool and get_llm_call_config."
+            ),
+            "pr3_design": "Tool-Provenance Heavy (primary) + light Balanced polish. Exactly the three inspect tools specified.",
+        }
+    except Exception as exc:
+        logger.debug("provenance_audit failed: %s", exc)
+        return {
+            "error": str(exc),
+            "note": "QualityMatrix provenance not available (first run, disabled, or DB schema pending). Tables are created on startup in memory/__init__.py.",
+            "recent_tool_usage": [],
+            "recent_provenance": [],
+            "pr3_design": "Tool-Provenance Heavy: quality_status + quality_for_symbol + provenance_audit",
+        }
+
+
 HANDLERS = {
     "quote": handle_quote,
     "candles": handle_candles,
@@ -858,4 +1315,19 @@ HANDLERS = {
     "trader_rules": handle_execution_status,
     "open_hypotheses": handle_open_hypotheses,
     "research_engine": handle_research_engine,
+    "context_quality": handle_context_quality,
 }
+
+
+# PR3 quality tools registration (executes at import time)
+# Deliver exactly the three read-only inspect tools per the Tool-Provenance Heavy + Balanced hybrid:
+#   quality_status, quality_for_symbol, provenance_audit
+# current_constraints kept only as thin compat layer (point users at the canonical three).
+HANDLERS["quality_status"] = handle_quality_status
+HANDLERS["quality_for_symbol"] = handle_quality_for_symbol
+HANDLERS["provenance_audit"] = handle_provenance_audit
+HANDLERS["current_constraints"] = handle_current_constraints  # legacy/Balanced compat only
+
+
+
+

@@ -24,15 +24,15 @@ Design notes
 
 from __future__ import annotations
 
-import logging
 from datetime import datetime
 from typing import Any, Awaitable, Callable, Optional, Protocol
 from zoneinfo import ZoneInfo
 
 from core.async_utils import safe_sleep as _safe_sleep
+from core.log_context import get_logger
 from core.runtime.interfaces import MarketHoursProtocol, WakeBusProtocol
 
-logger = logging.getLogger(__name__)
+logger = get_logger(__name__)
 
 
 def _now_et() -> datetime:

@@ -8,11 +8,13 @@ PAPER_MODE env var provides an additional safety check.
 """
 from __future__ import annotations
 
+from core.log_context import get_logger
+
 import logging
 import os
 from typing import Tuple
 
-logger = logging.getLogger(__name__)
+logger = get_logger(__name__)
 
 # Standard IBKR ports
 PAPER_PORT = 7497

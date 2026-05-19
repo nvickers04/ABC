@@ -1,11 +1,14 @@
 #!/usr/bin/env python3
 """Paper-mode trader tool smoke (safe, full registry, or order path).
 
+Platform checks (Postgres, heartbeat, token cap, MDA) run before tool tests unless
+``--skip-platform``. Exit codes: 0 OK, 1 warnings, 2 failures.
+
+  python scripts/smoke_tools.py --platform-only
+  python scripts/smoke_tools.py --preflight --client-id 11
   python scripts/smoke_tools.py --client-id 11
   python scripts/smoke_tools.py --client-id 11 --all
-  python scripts/smoke_tools.py --client-id 11 --all --allow-market
   python scripts/smoke_tools.py --client-id 11 --order-test
-  python scripts/smoke_tools.py --preflight --client-id 11
   python scripts/smoke_tools.py --list-skipped
 """
 
@@ -20,8 +23,10 @@ import sys
 from pathlib import Path
 
 _ROOT = Path(__file__).resolve().parent.parent
-if str(_ROOT) not in sys.path:
-    sys.path.insert(0, str(_ROOT))
+_SCRIPTS = Path(__file__).resolve().parent
+for _p in (_ROOT, _SCRIPTS):
+    if str(_p) not in sys.path:
+        sys.path.insert(0, str(_p))
 
 logger = logging.getLogger("smoke_tools")
 
@@ -83,11 +88,42 @@ async def _run_order_test(tools, sym: str) -> int:
     return 0 if lim.success else 1
 
 
+async def _run_platform_checks(*, client_id: int | None, skip_ibkr: bool) -> int:
+    from health_common import (
+        Reporter,
+        check_ibkr_async,
+        load_dotenv_repo,
+        run_platform_checks,
+    )
+
+    load_dotenv_repo(_ROOT)
+    rep = Reporter("ABC Smoke — platform checks")
+    run_platform_checks(rep, role="trader", include_mda=True, include_trader_context=True)
+    if not skip_ibkr:
+        await check_ibkr_async(rep, client_id=client_id)
+    rep.print_report()
+    return rep.exit_code()
+
+
 async def main_async() -> int:
     parser = argparse.ArgumentParser(description="Trader tool smoke (paper)")
     parser.add_argument("--symbol", default=None)
     parser.add_argument("--client-id", type=int, default=None)
-    parser.add_argument("--preflight", action="store_true", help="Connect + open_orders only")
+    parser.add_argument(
+        "--platform-only",
+        action="store_true",
+        help="Postgres + heartbeat + token + MDA (+ IBKR if --client-id)",
+    )
+    parser.add_argument(
+        "--skip-platform",
+        action="store_true",
+        help="Skip platform checks (not recommended)",
+    )
+    parser.add_argument(
+        "--preflight",
+        action="store_true",
+        help="Platform checks + IBKR connect + open_orders summary",
+    )
     parser.add_argument("--list-skipped", action="store_true", help="Print tools not auto-tested")
     parser.add_argument("--with-research", action="store_true", help="Include research() ($$$)")
     parser.add_argument("--all", action="store_true", help="Safe + broker-mutating tools")
@@ -104,6 +140,12 @@ async def main_async() -> int:
         print("BROKER_MUTATING:", ", ".join(sorted(broker_mutating_names())))
         return 0
 
+    if args.platform_only:
+        return await _run_platform_checks(
+            client_id=args.client_id,
+            skip_ibkr=args.client_id is None,
+        )
+
     if args.all and not args.client_id:
         parser.error("--all requires --client-id")
     if args.order_test and not args.client_id:
@@ -116,6 +158,17 @@ async def main_async() -> int:
     load_dotenv(_ROOT / ".env", override=True)
     if args.client_id is not None:
         os.environ["IBKR_CLIENT_ID"] = str(args.client_id)
+
+    plat = 0
+    if not args.skip_platform:
+        plat = await _run_platform_checks(
+            client_id=args.client_id,
+            skip_ibkr=not args.preflight and args.client_id is None,
+        )
+        if plat >= 2:
+            return plat
+        if args.preflight and args.client_id is None:
+            parser.error("--preflight requires --client-id for IBKR")
 
     symbol = (args.symbol or _default_symbol()).upper()
 
@@ -143,13 +196,13 @@ async def main_async() -> int:
     async def _minimal_state_builder() -> str:
         return "(smoke — minimal state)"
 
-    tools._state_builder = _minimal_state_builder
+    setattr(tools, "_state_builder", _minimal_state_builder)
 
     try:
         if args.preflight:
             out = await run_preflight_open_orders(tools, symbol=symbol)
             print(json.dumps(out, indent=2, default=str))
-            return 0
+            return plat if not args.skip_platform else 0
 
         if args.order_test:
             return await _run_order_test(tools, symbol)

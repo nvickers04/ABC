@@ -37,7 +37,7 @@ import threading
 import time
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
-from typing import Any
+from typing import Any, Optional
 
 logger = logging.getLogger(__name__)
 
@@ -308,14 +308,25 @@ class WorkingMemory:
             }
         return out
 
-    def render(self, *, now_ts: float | None = None) -> str:
+    def render(
+        self,
+        *,
+        now_ts: float | None = None,
+        max_entries_per_section: int | None = None,
+    ) -> str:
         """Render the WORKING MEMORY prompt block.
+
+        Args:
+            now_ts: Optional epoch seconds for expiry checks.
+            max_entries_per_section: When set, keep only the newest N live
+                entries per section (reduces prompt tokens).
 
         Empty sections are omitted entirely so the block stays compact
         early in the day.  If every section is empty we emit a single
         terse marker so the agent can see "memory is fresh."
         """
         ts = float(now_ts if now_ts is not None else time.time())
+        cap = max_entries_per_section
         lines: list[str] = ["WORKING MEMORY"]
         any_content = False
         with self._lock:
@@ -325,9 +336,14 @@ class WorkingMemory:
                     continue
                 any_content = True
                 lines.append(f"  [{section}]")
-                for e in live:
+                show = live[-cap:] if cap is not None and cap > 0 else live
+                omitted = len(live) - len(show)
+                for e in show:
                     age_min = max(0, int((ts - e.created_ts) // 60))
-                    lines.append(f"    - ({age_min}m ago) {e.entry_text}")
+                    text = (e.entry_text or "")[:400]
+                    lines.append(f"    - ({age_min}m ago) {text}")
+                if omitted > 0:
+                    lines.append(f"    … +{omitted} older in this section")
         if not any_content:
             lines.append("  (empty — fresh session or all entries expired)")
         return "\n".join(lines)

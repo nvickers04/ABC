@@ -33,13 +33,14 @@ evicts the oldest active row.
 from __future__ import annotations
 
 import json
-import logging
 import re
 import time
 from datetime import datetime
 from typing import Any, Iterable, Optional
 
-logger = logging.getLogger(__name__)
+from core.log_context import get_logger
+
+logger = get_logger(__name__)
 
 
 # ── Configuration ────────────────────────────────────────────────
@@ -465,8 +466,12 @@ def evaluate(
         pass
     if fired and wake:
         try:
-            from core.wake_events import wake_bus
-            wake_bus.signal(f"attention_{fired[0]['symbol']}")
+            from core.runtime.research_host_runtime import is_research_host_process
+
+            if not is_research_host_process():
+                from core.wake_events import wake_bus
+
+                wake_bus.signal(f"attention_{fired[0]['symbol']}")
         except Exception as e:
             logger.debug("attention.evaluate: wake_bus signal failed: %s", e)
     return fired
@@ -493,6 +498,8 @@ def render_attention_block(
     *,
     now: Optional[float] = None,
     window_s: float = RENDER_WINDOW_S,
+    max_rows: int = 10,
+    max_source_chars: int = 80,
 ) -> str:
     """Render the ATTENTION block for the cycle prompt.
 
@@ -516,6 +523,8 @@ def render_attention_block(
         return ""
     if not rows:
         return ""
+    if max_rows > 0:
+        rows = rows[:max_rows]
     lines = ["⚡ ATTENTION"]
     for (sym, cond, thr, confirm_json, source_text,
          fired_ts, fire_note, fire_value) in rows:
@@ -530,7 +539,10 @@ def render_attention_block(
         else:
             head = f"- {sym} watching: {cond} {float(thr):.2f}"
         if source_text:
-            head += f' (you said: "{source_text.strip()}")'
+            st = source_text.strip()
+            if max_source_chars > 0 and len(st) > max_source_chars:
+                st = st[: max_source_chars - 1] + "…"
+            head += f' (note: "{st}")'
         lines.append(head)
         if confirm_with:
             lines.append(f"  Confirm with: {', '.join(confirm_with)}")

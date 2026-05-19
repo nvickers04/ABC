@@ -17,13 +17,13 @@ Recovery on researcher reconnect: Option A (no merge) — see
 
 from __future__ import annotations
 
-import logging
 import time
-from typing import Any, Protocol, TypedDict, runtime_checkable
+from typing import Any, Protocol, TypedDict, cast, runtime_checkable
 
+from core.log_context import get_logger
 from core.runtime.operating_context import get_operating_context
 
-logger = logging.getLogger(__name__)
+logger = get_logger(__name__)
 
 
 @runtime_checkable
@@ -58,7 +58,12 @@ class WorkingMemoryStore(Protocol):
         """Drop expired entries; return count removed."""
         ...
 
-    def render(self, *, now_ts: float | None = None) -> str:
+    def render(
+        self,
+        *,
+        now_ts: float | None = None,
+        max_entries_per_section: int | None = None,
+    ) -> str:
         """Render WM text for prompts."""
         ...
 
@@ -106,7 +111,7 @@ def get_active_working_memory(*, prefer_local: bool = False) -> WorkingMemorySto
     try:
         from memory.working_memory import get_working_memory
 
-        return get_working_memory()
+        return cast(WorkingMemoryStore, get_working_memory())
     except Exception as exc:
         logger.warning("Postgres working memory unavailable, using local fallback: %s", exc)
         ctx.set_researcher_unavailable()
@@ -188,7 +193,9 @@ def summarize_wm_stores() -> WmStoreSummary:
     try:
         from memory.working_memory import get_working_memory
 
-        summary["postgres"] = count_live_wm_entries(get_working_memory())
+        summary["postgres"] = count_live_wm_entries(
+            cast(WorkingMemoryStore, get_working_memory())
+        )
     except Exception as exc:
         summary["postgres"] = {"total": 0, "by_section": {}, "error": str(exc)}
 

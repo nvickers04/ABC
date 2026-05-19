@@ -1,3 +1,4 @@
+from core.log_context import get_logger
 """
 IBKR Orders Mixin - Order Placement and Management
 
@@ -24,7 +25,7 @@ from ib_insync.contract import Stock
 # Memory integration for autoresearch snapshots
 from memory import insert_execution_snapshot, get_pending_order_context
 
-logger = logging.getLogger(__name__)
+logger = get_logger(__name__)
 
 
 class IBKROrdersMixin:

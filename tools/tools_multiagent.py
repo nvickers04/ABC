@@ -9,13 +9,14 @@ disabled with ``MULTI_AGENT_RESEARCH_ENABLED=0``.
 No custom tools — multi-agent only supports built-in server-side tools.
 """
 
-import logging
 import os
 import time
 from datetime import date
 from typing import Any
 
-logger = logging.getLogger(__name__)
+from core.log_context import get_logger
+
+logger = get_logger(__name__)
 
 # ── Research cache: exact-query TTL to avoid repeated expensive calls ──
 _research_cache: dict[str, tuple[dict, float]] = {}   # query -> (result_dict, timestamp)
@@ -112,13 +113,14 @@ async def handle_research(executor, params: dict) -> Any:
         from xai_sdk import AsyncClient
         from xai_sdk.chat import user as sdk_user
         from xai_sdk.tools import web_search, x_search
+
         from core.grok_llm import MULTI_AGENT_MODEL
 
         api_key = os.environ.get("XAI_API_KEY") or os.environ.get("GROK_API_KEY")
         client = AsyncClient(api_key=api_key)
 
         # Build multi-agent chat with built-in tools
-        create_kwargs = {
+        create_kwargs: dict[str, Any] = {
             "model": MULTI_AGENT_MODEL,
             "messages": [sdk_user(query)],
             "tools": [web_search(), x_search()],

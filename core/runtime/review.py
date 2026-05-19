@@ -7,12 +7,12 @@ methods that delegate here so tools and tests stay stable.
 
 from __future__ import annotations
 
-import logging
 from datetime import datetime, timezone
 
 from core.config import TRADING_MODE
+from core.log_context import get_logger
 
-logger = logging.getLogger(__name__)
+logger = get_logger(__name__)
 
 
 async def run_daily_review(agent) -> None:

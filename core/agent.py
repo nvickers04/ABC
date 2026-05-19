@@ -10,52 +10,53 @@ Grok chains actions until it signals 'done' to refresh context.
 research() is the primary discovery mechanism.
 """
 
-import asyncio
-import json
-import logging
-import re
 import time
-from datetime import datetime, timezone, timedelta
-from typing import Any, Optional
+from datetime import datetime, timedelta, timezone
+from typing import Callable, Optional, cast
+
+from xai_sdk.chat import system as sdk_system
+from xai_sdk.chat import user as sdk_user
 
 from core.async_utils import safe_sleep as _safe_sleep
 from core.config import (
-    SYSTEM_PROMPT,
-    RISK_PER_TRADE,
-    CYCLE_SLEEP_SECONDS,
-
-    MAX_DAILY_LOSS_PCT,
-    INTRADAY_DRAWDOWN_PCT,
-    EOD_FLATTEN_MINUTES,
-    OPEN_GAP_GUARD_PCT,
-    OPEN_GUARD_DELAY_MINUTES,
-    MAX_DAILY_LLM_COST,
-    LLM_TEMPERATURE,
-    LLM_SEED,
-    LLM_MAX_TOKENS,
-    TRADING_MODE,
-    PAPER_AGGRESSIVE,
-    MIN_RR_RATIO,
-    PRESCAN_PROMPT_EXPENSIVE_RESEARCH,
-    TOOL_PLAYBOOK_MAX_CHARS,
     AGENT_TOOL_FEEDBACK_MAX_CHARS,
+    CYCLE_SLEEP_SECONDS,
+    EOD_FLATTEN_MINUTES,
+    INTRADAY_DRAWDOWN_PCT,
+    LLM_MAX_TOKENS,
+    LLM_SEED,
+    LLM_TEMPERATURE,
+    MAX_DAILY_LLM_COST,
+    MAX_DAILY_LOSS_PCT,
+    MIN_RR_RATIO,
+    PAPER_AGGRESSIVE,
+    PRESCAN_PROMPT_EXPENSIVE_RESEARCH,
+    RISK_PER_TRADE,
+    SYSTEM_PROMPT,
+    TOOL_PLAYBOOK_MAX_CHARS,
+    TRADING_MODE,
 )
-from xai_sdk.chat import system as sdk_system, user as sdk_user
-
 from core.grok_llm import get_grok_llm
+from core.json_parse import _parse_json_objects
+from core.log_context import (
+    bind_trader_cycle_context,
+    get_logger,
+)
+from core.research_topics import _categorize_query
 from core.runtime import SafetyController, StateContextBuilder
-from core.runtime.operating_context import get_operating_context, OperatingContext
-from core.runtime.scheduler import CycleScheduler, _now_et
 from core.runtime.cycle import evaluate_gap_guard
+from core.runtime.operating_context import get_operating_context
+from core.runtime.scheduler import CycleScheduler
+
 # Re-exported for backward compatibility (these used to live in this module).
 from core.runtime.state_context import _SECTOR_MAP, _sector_of  # noqa: F401
+from data.broker_gateway import BrokerConfigError, create_gateway
 from data.cost_tracker import get_cost_tracker
 from data.data_provider import get_data_provider
-from data.broker_gateway import create_gateway, BrokerConfigError
 from data.market_hours import get_market_hours_provider
 from tools.tools_executor import ToolExecutor
 
-logger = logging.getLogger(__name__)
+logger = get_logger(__name__)
 
 
 def _truncate_for_react_context(text: str, max_chars: int) -> str:
@@ -67,10 +68,6 @@ def _truncate_for_react_context(text: str, max_chars: int) -> str:
     if room < 200:
         return text[:max_chars]
     return text[:room] + marker
-
-
-from core.json_parse import _parse_json_objects
-from core.research_topics import _categorize_query
 
 
 # Note: _now_et is now defined in core.runtime.scheduler and re-imported above
@@ -167,10 +164,13 @@ class TradingAgent:
         self._safety.session_high_water = value
 
     def _append_snapshot(self, summary: str):
-        """Append a cycle snapshot, keeping last 5."""
-        self._market_snapshots.append(f"[{datetime.now().strftime('%H:%M')}] {summary}")
-        if len(self._market_snapshots) > 5:
-            self._market_snapshots = self._market_snapshots[-5:]
+        """Append a compact cycle snapshot for rolling continuity."""
+        from core.runtime.prompt_budget import CYCLE_SNAPSHOT_CHARS, CYCLE_SNAPSHOT_MAX
+
+        short = (summary or "")[:CYCLE_SNAPSHOT_CHARS]
+        self._market_snapshots.append(f"C{self._cycle_id}:{short}")
+        if len(self._market_snapshots) > CYCLE_SNAPSHOT_MAX:
+            self._market_snapshots = self._market_snapshots[-CYCLE_SNAPSHOT_MAX:]
 
     def _prune_research_cache(self, current_session: str):
         """Remove expired research entries by TTL and session boundary."""
@@ -241,9 +241,9 @@ class TradingAgent:
 
     def _check_llm_token_limits(self) -> Optional[str]:
         """Return a reason string if any daily token bucket is exhausted."""
-        fn = getattr(self.cost_tracker, "check_daily_token_limits", None)
-        if callable(fn):
-            return fn()
+        checker = getattr(self.cost_tracker, "check_daily_token_limits", None)
+        if checker is not None and callable(checker):
+            return cast(Callable[[], Optional[str]], checker)()  # pylint: disable=not-callable
         return None
 
     def record_trade(self, symbol: str, side: str, pnl: float, held_minutes: int = 0):
@@ -335,9 +335,10 @@ class TradingAgent:
         """
         self._cycle_failures = 0
         self._cycle_id += 1
+        bind_trader_cycle_context(cycle_id=self._cycle_id)
         self._last_step = "detect_session"
         self._last_step_ts = time.time()
-        logger.info("CYCLE %d step=detect_session", self._cycle_id)
+        logger.info("cycle_step", step="detect_session")
 
         # Detect current market session and prune stale research
         try:
@@ -439,81 +440,26 @@ class TradingAgent:
         except Exception:
             pass
 
-        continuity = ""
-        if self._last_cycle_summary:
-            continuity = f"\nLAST CYCLE: {self._last_cycle_summary}\n"
-        if self._last_wait_reason or self._last_wake_reason:
-            wr = self._last_wait_reason or "(none stated)"
-            wk = self._last_wake_reason or "(timer)"
-            continuity += f"WAITED BECAUSE: {wr}\nWOKE BECAUSE: {wk}\n"
-        if self._market_snapshots:
-            continuity += "RECENT SNAPSHOTS:\n" + "\n".join(self._market_snapshots[-5:]) + "\n"
-
         from zoneinfo import ZoneInfo
+
+        from core.runtime.cycle_context import build_continuity_from_agent, build_cycle_user_context
+        from core.runtime.prompt_budget import log_cycle_prompt_budget
+
         _et_now = datetime.now(ZoneInfo("America/New_York"))
-        ctx = self._operating_context
-        ctx.sync_researcher_from_heartbeat()
+        continuity = build_continuity_from_agent(self)
+        if continuity:
+            continuity = continuity if continuity.endswith("\n") else continuity + "\n"
 
-        try:
-            from core.quality.quality_matrix import get_quality_matrix_service
-
-            svc = get_quality_matrix_service()
-            svc.maybe_populate(max_age_seconds=60.0)
-        except Exception as _cycle_pop:
-            logger.debug("QualityMatrix cycle refresh skipped: %s", _cycle_pop)
-        status_block = ctx.quality_matrix.to_prompt_block(ctx.risk_multiplier) + "\n\n"
-
-        # ── Working Memory: curate then render ──────────────────
-        wm_block = ""
-        try:
-            from core.runtime.working_memory_access import get_active_working_memory
-
-            wm = get_active_working_memory()
-            wm.curate()
-            wm_block = wm.render() + "\n\n"
-            ctx.quality.working_memory_completeness = 0.85 if ctx.is_independent_mode else 0.95
-        except Exception as e:
-            logger.warning("Working Memory load failed: %s", e)
-            wm_block = "(Working Memory currently unavailable)\n\n"
-            ctx.quality.working_memory_completeness = 0.0
-
-        # ── Attention: sync new watching_for into triggers, render fires ──
-        # Rendered ABOVE working memory so the agent sees "what just
-        # fired" before "what I was thinking earlier".
-        attn_block = ""
-        try:
-            from core.runtime import attention as _attention
-            from memory import get_db as _get_db
-            _conn = _get_db()
-            _attention.sync_from_working_memory(_conn)
-            rendered = _attention.render_attention_block(_conn)
-            if rendered:
-                attn_block = rendered + "\n\n"
-        except Exception as e:
-            logger.debug("attention render failed: %s", e)
-
-        # ── Intuition: top-N by attention score ──────────────────
-        # Rendered just below ATTENTION so "what just fired" comes
-        # before "where my edge is sitting".
-        intu_block = ""
-        try:
-            from core.runtime import intuition as _intuition
-            from memory import get_db as _get_db2
-            _conn2 = _get_db2()
-            rendered_i = _intuition.render_intuition_block(_conn2)
-            if rendered_i:
-                intu_block = rendered_i + "\n\n"
-        except Exception as e:
-            logger.debug("intuition render failed: %s", e)
-
-        _guidance = ctx.cycle_guidance_footer()
-        context = f"""{status_block}{attn_block}{intu_block}{wm_block}{state_text}
-{cost_line}
-Time: {_et_now.strftime('%Y-%m-%d %H:%M:%S')} ET
-{continuity}{pre_scan_prompt}{gap_guard_prompt}
-Account state above.
-{_guidance}
-"""
+        context, prompt_metrics = await build_cycle_user_context(
+            operating_context=self._operating_context,
+            state_text=state_text,
+            cost_line=cost_line,
+            continuity_text=continuity,
+            pre_scan_prompt=pre_scan_prompt,
+            gap_guard_prompt=gap_guard_prompt,
+            et_now=_et_now,
+        )
+        self._cycle_prompt_metrics = prompt_metrics
         # ── Build xAI SDK chat instance ─────────────────────────
         self._last_step = "chat_create"
         self._last_step_ts = time.time()
@@ -525,12 +471,15 @@ Account state above.
             _system_content = SYSTEM_PROMPT + "\n\n" + render_compact_playbook(TOOL_PLAYBOOK_MAX_CHARS)
         except Exception as e:
             logger.warning("tool playbook append failed: %s", e)
-        logger.info(
-            "CYCLE %d prompt sizes: system_chars=%d user_context_chars=%d "
-            "(playbook_max=%d tool_feedback_max=%d)",
+        prompt_metrics.system_chars = len(_system_content)
+        prompt_metrics.est_system_tokens = max(
+            1, int((len(_system_content) + 3) / 4)
+        )
+        prompt_metrics.record_user_total()
+        log_cycle_prompt_budget(self._cycle_id, prompt_metrics)
+        logger.debug(
+            "CYCLE %d prompt caps: playbook_max=%d tool_feedback_max=%d wm_max via env CYCLE_WM_MAX_CHARS",
             self._cycle_id,
-            len(_system_content),
-            len(context),
             TOOL_PLAYBOOK_MAX_CHARS,
             AGENT_TOOL_FEEDBACK_MAX_CHARS,
         )
@@ -625,6 +574,13 @@ Account state above.
                     cached_tok,
                     cost_summary.today_llm_cost,
                 )
+                if hasattr(self, "_cycle_prompt_metrics"):
+                    from core.runtime.prompt_budget import attach_turn_usage, log_cycle_prompt_budget
+
+                    m = self._cycle_prompt_metrics
+                    m.react_turn = turn
+                    attach_turn_usage(m, usage)
+                    log_cycle_prompt_budget(self._cycle_id, m)
                 lim2 = self._check_llm_token_limits()
                 if lim2:
                     logger.warning(
@@ -680,19 +636,29 @@ Account state above.
                         wr_log = f" | waiting because: {wait_reason}" if wait_reason else ""
                         logger.info(f"Decision: done ({cooldown}s) | {summary}{wr_log}")
                         cycle_actions.append("done")
-                        self._last_cycle_summary = (
-                            f"Cycle {self._cycle_id}: {len(cycle_actions)} actions — "
-                            + ", ".join(cycle_actions[-5:])
+                        from core.runtime.prompt_budget import (
+                            CYCLE_LAST_SUMMARY_CHARS,
+                            truncate_text,
+                        )
+
+                        self._last_cycle_summary = truncate_text(
+                            f"C{self._cycle_id}: "
+                            + ", ".join(cycle_actions[-4:])
+                            + (f" — {summary}" if summary else ""),
+                            CYCLE_LAST_SUMMARY_CHARS,
+                            marker="…",
                         )
                         self._append_snapshot(f"C{self._cycle_id}: done")
 
                         try:
+                            from datetime import datetime as _dt
+                            from datetime import timezone as _tz
+
                             from core.quality.quality_matrix import (
-                                get_quality_matrix_service,
                                 DecisionProvenanceSnapshot,
                                 ToolUsageRecord,
+                                get_quality_matrix_service,
                             )
-                            from datetime import datetime as _dt, timezone as _tz
                             svc = get_quality_matrix_service()
                             # Capture recent tool usages as provenance (lightweight copy)
                             recent_tools = [

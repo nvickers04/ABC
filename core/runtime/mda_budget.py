@@ -18,10 +18,10 @@ Beyond simple ``remaining / limit`` tiers, we also use:
 
 from __future__ import annotations
 
-import logging
 import time
 from typing import Any, Optional
 
+from core.log_context import get_logger
 from research.config import (
     MDA_CRITICAL_CREDIT_FRACTION,
     MDA_LOW_CREDIT_FRACTION,
@@ -30,7 +30,7 @@ from research.config import (
     MDA_SOFT_CREDIT_FRACTION,
 )
 
-logger = logging.getLogger(__name__)
+logger = get_logger(__name__)
 
 # Last observed credits + wall time (for burn-rate vs runway).
 _prev_mda_rem: Optional[float] = None

@@ -89,7 +89,6 @@ from datetime import datetime, time
 from typing import Optional
 from zoneinfo import ZoneInfo
 
-
 _ET = ZoneInfo("America/New_York")
 
 # Boundaries (ET local time-of-day).

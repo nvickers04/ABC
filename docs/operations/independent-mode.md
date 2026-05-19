@@ -5,7 +5,7 @@ fallback**, what happens on restart, and what happens when the researcher return
 
 Operational contract for `get_active_working_memory()` and `OperatingContext`.
 
-**Split-host context:** [deployment.md](deployment.md) · **Start commands:** [../entry-points.md](../entry-points.md)
+**See also:** [deployment.md](deployment.md) · [../entry-points.md](../entry-points.md) · [../plain-english-glossary.md](../plain-english-glossary.md) (WM routing, Independent Mode, QualityMatrix)
 
 ---
 
@@ -98,5 +98,6 @@ remain on Postgres; QualityMatrix reduces trust in research tools when degraded.
 ## Related
 
 - [deployment.md](deployment.md) — two-machine layout
-- [../engineering.md](../engineering.md) (glossary)
+- [../plain-english-glossary.md](../plain-english-glossary.md) — WM routing, QualityMatrix, heartbeat
+- [../codebase-layout.md](../codebase-layout.md) — module map
 - `memory/working_memory.py` — WM sections, caps, and persistence

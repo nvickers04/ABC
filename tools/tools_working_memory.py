@@ -13,18 +13,17 @@ already has.
 
 from __future__ import annotations
 
-import logging
 from typing import Any
 
+from core.log_context import get_logger
 from core.runtime.working_memory_access import get_active_working_memory
-
 from memory.working_memory import (
-    SECTIONS,
     SECTION_CAPS,
     SECTION_DEFAULT_EXPIRY,
+    SECTIONS,
 )
 
-logger = logging.getLogger(__name__)
+logger = get_logger(__name__)
 
 
 def _valid_sections_msg() -> str:

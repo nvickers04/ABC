@@ -28,14 +28,15 @@ DESIGN
 
 from __future__ import annotations
 
-import logging
 import time
 from collections import OrderedDict
 from dataclasses import dataclass
 from threading import Lock
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional
 
-logger = logging.getLogger(__name__)
+from core.log_context import get_logger
+
+logger = get_logger(__name__)
 
 
 # ---------- Tunables (also exposed via core.config) ----------
@@ -189,6 +190,8 @@ class IBKRQuoteSource:
         # move_to_end on access, popitem(last=False) to evict the oldest.
         self._streams: "OrderedDict[str, Any]" = OrderedDict()  # symbol -> ticker
         self._lock = Lock()
+        self._restore_symbols: List[str] = []
+        self._total_evictions: int = 0
 
     # ---------- introspection ----------
 
@@ -227,7 +230,7 @@ class IBKRQuoteSource:
                 return True
 
         # Need to subscribe.  Make room if at budget.
-        await self._evict_until_room()
+        await self._evict_until_room(incoming_symbol=sym)
 
         ticker = await self._subscribe(sym)
         if ticker is None:
@@ -260,21 +263,77 @@ class IBKRQuoteSource:
             logger.warning("demote(%s): cancelMktData failed: %s", sym, e)
             return False
 
-    async def _evict_until_room(self) -> None:
+    async def _evict_until_room(self, *, incoming_symbol: str | None = None) -> None:
         """Pop LRU streams until len(_streams) < budget."""
         while True:
             with self._lock:
                 if len(self._streams) < self._line_budget:
                     return
                 victim_sym, victim_ticker = self._streams.popitem(last=False)
+                lines_after = len(self._streams)
             try:
                 self._connector.ib.cancelMktData(victim_ticker.contract)
+                self._total_evictions += 1
                 logger.info(
-                    "IBKRQuoteSource evicted LRU stream %s (lines now %d/%d)",
-                    victim_sym, len(self._streams), self._line_budget,
+                    "ibkr_line_budget_eviction",
+                    evicted_symbol=victim_sym,
+                    incoming_symbol=incoming_symbol,
+                    lines_after=lines_after,
+                    line_budget=self._line_budget,
+                    total_evictions=self._total_evictions,
+                    reason="line_budget_lru",
                 )
             except Exception as e:
-                logger.warning("Eviction cancelMktData(%s) failed: %s", victim_sym, e)
+                logger.warning(
+                    "ibkr_line_budget_eviction_failed",
+                    evicted_symbol=victim_sym,
+                    error=str(e),
+                )
+
+    def on_connection_lost(self, *, cause: str = "unknown") -> None:
+        """Drop all streams after TWS/Gateway disconnect; queue symbols for restore."""
+        with self._lock:
+            symbols = list(self._streams.keys())
+            self._restore_symbols = list(
+                dict.fromkeys(self._restore_symbols + symbols)
+            )
+            streams_cleared = len(self._streams)
+            self._streams.clear()
+        logger.warning(
+            "ibkr_quote_streams_cleared",
+            cause=cause,
+            streams_cleared=streams_cleared,
+            restore_queued=len(self._restore_symbols),
+            line_budget=self._line_budget,
+        )
+
+    async def restore_streams_after_reconnect(self, symbols: List[str]) -> int:
+        """Re-promote symbols after reconnect. Returns count successfully streaming."""
+        merged = list(dict.fromkeys(symbols + self._restore_symbols))
+        self._restore_symbols = []
+        restored = 0
+        if not merged:
+            return 0
+        logger.info(
+            "ibkr_quote_restore_start",
+            symbol_count=len(merged),
+            symbols_sample=merged[:15],
+            line_budget=self._line_budget,
+        )
+        for sym in merged:
+            ok = await self.promote(sym.upper())
+            if ok:
+                restored += 1
+            else:
+                logger.warning("ibkr_quote_restore_failed", symbol=sym.upper())
+        logger.info(
+            "ibkr_quote_restore_complete",
+            restored=restored,
+            requested=len(merged),
+            lines_in_use=self.lines_in_use,
+            line_budget=self._line_budget,
+        )
+        return restored
 
     async def _subscribe(self, symbol: str) -> Optional[Any]:
         """Open a new streaming subscription for `symbol`. Returns ticker or None."""
@@ -296,9 +355,11 @@ class IBKRQuoteSource:
                 False,  # regulatorySnapshot
             )
             logger.info(
-                "IBKRQuoteSource subscribed %s (lines now %d/%d, ticks=%s)",
-                symbol, self.lines_in_use + 1, self._line_budget,
-                self._generic_tick_list or "default",
+                "ibkr_quote_subscribed",
+                symbol=symbol,
+                lines_after=self.lines_in_use,
+                line_budget=self._line_budget,
+                generic_ticks=self._generic_tick_list or "default",
             )
             return ticker
         except Exception as e:
@@ -463,8 +524,9 @@ def get_ibkr_quote_source() -> Optional[IBKRQuoteSource]:
             latest_quote_writer=writer,
         )
         logger.info(
-            "IBKRQuoteSource initialized (line_budget=%d, generic_ticks=%s)",
-            line_budget, DEFAULT_GENERIC_TICK_LIST,
+            "ibkr_quote_source_initialized",
+            line_budget=line_budget,
+            generic_ticks=DEFAULT_GENERIC_TICK_LIST,
         )
         return _singleton
 

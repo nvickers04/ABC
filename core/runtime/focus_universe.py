@@ -20,10 +20,11 @@ This module is pure read-only on the SQLite layer; no IBKR, no MDA.
 
 from __future__ import annotations
 
-import logging
-from typing import Iterable, List, Optional
+from typing import Iterable, List
 
-logger = logging.getLogger(__name__)
+from core.log_context import get_logger
+
+logger = get_logger(__name__)
 
 
 def get_focus_symbols(conn, *, limit: int = 32) -> List[str]:

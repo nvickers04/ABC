@@ -7,7 +7,7 @@ alwaysApply: true
 
 When asked to plan, implement, refactor, or review changes in this project:
 
-1. Use `docs/engineering.md` (Stabilization PR checklist section) as the default quality gate.
+1. Use `docs/stabilization-pr-checklist.md` as the default quality gate (see also `docs/engineering.md`, `docs/change-impact-map.md`, `docs/plain-english-glossary.md`).
 2. Explicitly evaluate hotspot risk when touching:
    - `core/agent.py`
    - `signals/scorer.py`

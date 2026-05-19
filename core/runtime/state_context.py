@@ -13,13 +13,13 @@ not drift as a side effect of refactoring.
 
 from __future__ import annotations
 
-import logging
 from datetime import datetime as _dt
 from typing import Optional
 
+from core.log_context import get_logger
 from core.runtime.interfaces import BrokerGatewayProtocol, MarketHoursProtocol
 
-logger = logging.getLogger(__name__)
+logger = get_logger(__name__)
 
 
 # ── Symbol → sector map for portfolio concentration summary ─────
@@ -164,7 +164,7 @@ class StateContextBuilder:
                         dte = "?"
                         try:
                             exp_date = _dt.strptime(str(exp)[:8], "%Y%m%d").date()
-                            dte = (exp_date - _dt.now().date()).days
+                            dte = str((exp_date - _dt.now().date()).days)
                         except Exception:
                             pass
                         lines.append(
@@ -308,8 +308,9 @@ class StateContextBuilder:
             # should discount it.
             age_str = "unknown"
             try:
-                from memory import get_research_config
                 import time as _time
+
+                from memory import get_research_config
                 ts = float(get_research_config("ir_snapshot_ts", 0.0))
                 if ts > 0:
                     age_s = _time.time() - ts
@@ -342,7 +343,8 @@ class StateContextBuilder:
             if not orders:
                 lines.append("No open orders.")
             else:
-                for o in orders:
+                _max_orders = 10
+                for o in orders[:_max_orders]:
                     sym = o.get("symbol", "?")
                     action = o.get("action", "?")
                     qty = o.get("quantity", 0)
@@ -366,6 +368,8 @@ class StateContextBuilder:
                     elif sec == "OPT":
                         tag = " [OPTION]"
                     lines.append(f"  #{oid} {action} {qty} {sym} {otype} {price_str}{tag}")
+                if len(orders) > _max_orders:
+                    lines.append(f"  … +{len(orders) - _max_orders} more orders")
         except Exception as e:
             lines.append(f"Order error: {e}")
 

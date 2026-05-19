@@ -1,7 +1,8 @@
 """
 Template evolution — continuous walk-forward boundary optimisation.
 
-Runs as third asyncio.gather() task alongside agent and research scorer.
+Runs on the research host (``python -m research``) or optionally in-process on the
+trader during dev. Never calls Grok or IBKR.
 Evolves template decision boundaries by mutating and testing on OOS data.
 Reuses existing simulator infrastructure — no new simulation code.
 """
@@ -132,9 +133,8 @@ def run_template_evolution_threaded() -> None:
     """Run run_template_evolution on a dedicated daemon thread with its own
     asyncio event loop. Returns immediately.
 
-    Isolates the long sync `time.sleep(cooldown)` (workaround for the
-    Python 3.13 asyncio deque bug) from the main event loop so the agent,
-    scorer, and heartbeat keep ticking.
+    Isolates the long sync ``time.sleep(cooldown)`` (workaround for the
+    Python 3.13 asyncio deque bug) from the research host scorer event loop.
     """
     import threading
 
@@ -163,7 +163,7 @@ def run_template_evolution_threaded() -> None:
 
 async def run_template_evolution() -> None:
     """
-    Continuous evolution loop — runs forever alongside agent and scorer.
+    Continuous evolution loop — runs on the research host alongside the scorer.
 
     Cooldown: 30min during market hours, 5min outside.
     Each round:
@@ -183,6 +183,14 @@ async def run_template_evolution() -> None:
         if _evolution_stop_event:
             logger.info("Template evolution stopped by request")
             break
+        try:
+            from core.runtime.research_host_runtime import shutdown_requested
+
+            if shutdown_requested():
+                logger.info("Template evolution exiting: research host shutdown")
+                break
+        except Exception:
+            pass
         if _evolution_paused:
             await asyncio.sleep(5)
             continue

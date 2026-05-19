@@ -1,0 +1,33 @@
+# Dev override — single machine runs Postgres + research + trader together.
+#
+# From repo root (after copying infra/postgres/.env.example → infra/postgres/.env):
+#
+#   docker network create postgres_default
+#   docker compose -f infra/postgres/docker-compose.yml --env-file infra/postgres/.env up -d
+#
+#   docker compose `
+#     -f infra/runtime/docker-compose.research.yml `
+#     -f infra/runtime/examples/docker-compose.dev.yml `
+#     --env-file .env up -d --build
+#
+#   docker compose `
+#     -f infra/runtime/docker-compose.trader.yml `
+#     -f infra/runtime/examples/docker-compose.dev.yml `
+#     --env-file .env up -d --build
+#
+# Trader starts without --require-research-host; in-process scorer allowed when
+# heartbeat is stale. NOT for production split-host.
+
+services:
+  abc-research:
+    environment:
+      ABC_RESEARCH_HOST: "1"
+      IBKR_QUOTES_ENABLED: "0"
+      DOCKER_HEALTHCHECK_MDA: "0"
+
+  abc-trader:
+    environment:
+      TRADER_IN_PROCESS_SCORER: auto
+      DOCKER_HEALTHCHECK_REQUIRE_RESEARCH: "0"
+      IBKR_HOST: host.docker.internal
+    command: ["python", "__main__.py", "--verbose"]

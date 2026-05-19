@@ -8,15 +8,17 @@ backward compatibility with characterization tests.
 from __future__ import annotations
 
 import json
-import logging
 import statistics as _stats
 from collections import defaultdict
 
+from xai_sdk.chat import system as sdk_system
+from xai_sdk.chat import user as sdk_user
+
 from core.async_utils import safe_sleep as _safe_sleep
 from core.json_parse import _parse_json_objects
-from xai_sdk.chat import system as sdk_system, user as sdk_user
+from core.log_context import get_logger
 
-logger = logging.getLogger(__name__)
+logger = get_logger(__name__)
 
 
 async def run_execution_analysis(agent) -> None:
@@ -28,16 +30,16 @@ async def run_execution_analysis(agent) -> None:
     """
     try:
         from memory import (
+            deactivate_graduated_param,
             get_db,
             get_filled_snapshots,
             get_graduated_params,
             get_research_config,
+            get_snapshots_for_param_review,
+            insert_graduated_param,
             set_research_config,
             upsert_calibrated_slippage,
-            insert_graduated_param,
             validate_param_key,
-            deactivate_graduated_param,
-            get_snapshots_for_param_review,
         )
         db = get_db()
         last_id = int(get_research_config("last_analysis_snapshot_id", 0.0))
@@ -204,48 +206,49 @@ If no changes warranted: []"""
                         else:
                             raise
 
-                usage = response.usage
-                agent.cost_tracker.log_llm_usage(
-                    agent.grok.model,
-                    usage=usage,
-                    purpose="execution_analysis",
-                )
+                if response is not None:
+                    usage = response.usage
+                    agent.cost_tracker.log_llm_usage(
+                        agent.grok.model,
+                        usage=usage,
+                        purpose="execution_analysis",
+                    )
 
-                raw = response.content or ""
-                proposals = _parse_json_objects(raw)
-                if not proposals:
-                    try:
-                        parsed = json.loads(raw.strip())
-                        if isinstance(parsed, list):
-                            proposals = parsed
-                    except Exception:
-                        pass
-                if len(proposals) == 1 and isinstance(proposals[0], list):
-                    proposals = proposals[0]
+                    raw = response.content or ""
+                    proposals = _parse_json_objects(raw)
+                    if not proposals:
+                        try:
+                            parsed = json.loads(raw.strip())
+                            if isinstance(parsed, list):
+                                proposals = parsed
+                        except Exception:
+                            pass
+                    if len(proposals) == 1 and isinstance(proposals[0], list):
+                        proposals = proposals[0]
 
-                for prop in proposals[:2]:
-                    if not isinstance(prop, dict) or not prop.get("param_key"):
-                        continue
-                    key_err = validate_param_key(prop["param_key"])
-                    if key_err:
-                        logger.info(f"Proposal rejected (bad key): {key_err}")
-                        continue
-                    p_value = test_proposal(prop, groups)
-                    if p_value is not None and p_value < 0.20:
-                        insert_graduated_param(
-                            param_key=prop["param_key"],
-                            param_value=str(prop.get("param_value", "")),
-                            previous_value=prop.get("previous_value"),
-                            evidence_json=json.dumps(prop.get("evidence_summary", "")),
-                            snapshots_analyzed=len(snapshots),
-                            improvement_bps=float(prop.get("estimated_improvement_bps", 0)),
-                            p_value=p_value,
-                        )
-                        logger.info(
-                            f"Graduated param: {prop['param_key']} = {prop['param_value']} (p={p_value:.3f})"
-                        )
-                    else:
-                        logger.info(f"Proposal rejected (p={p_value}): {prop.get('param_key')}")
+                    for prop in proposals[:2]:
+                        if not isinstance(prop, dict) or not prop.get("param_key"):
+                            continue
+                        key_err = validate_param_key(prop["param_key"])
+                        if key_err:
+                            logger.info(f"Proposal rejected (bad key): {key_err}")
+                            continue
+                        p_value = test_proposal(prop, groups)
+                        if p_value is not None and p_value < 0.20:
+                            insert_graduated_param(
+                                param_key=prop["param_key"],
+                                param_value=str(prop.get("param_value", "")),
+                                previous_value=prop.get("previous_value"),
+                                evidence_json=json.dumps(prop.get("evidence_summary", "")),
+                                snapshots_analyzed=len(snapshots),
+                                improvement_bps=float(prop.get("estimated_improvement_bps", 0)),
+                                p_value=p_value,
+                            )
+                            logger.info(
+                                f"Graduated param: {prop['param_key']} = {prop['param_value']} (p={p_value:.3f})"
+                            )
+                        else:
+                            logger.info(f"Proposal rejected (p={p_value}): {prop.get('param_key')}")
 
             except Exception as llm_err:
                 logger.warning(f"Execution analysis LLM call failed: {llm_err}")

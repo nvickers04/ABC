@@ -166,37 +166,47 @@ class QualityMatrix:
 
     last_populated: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
 
-    def to_prompt_block(self, risk_multiplier: float | None = None) -> str:
-        """Build a compact prompt block for the LLM system/user context.
+    def to_prompt_block(
+        self,
+        risk_multiplier: float | None = None,
+        *,
+        compact: bool = False,
+    ) -> str:
+        """Build a prompt block for the LLM user context.
 
         Args:
             risk_multiplier: Optional override for display; defaults to
                 :attr:`risk_multiplier`.
+            compact: When True, keep posture signals but drop verbose provenance
+                and model-config lines (saves prompt tokens each cycle).
 
         Returns:
-            Multi-line human-readable summary of posture, symbols, and recent provenance.
+            Multi-line human-readable summary of posture, symbols, and provenance.
         """
         rm = risk_multiplier if risk_multiplier is not None else self.risk_multiplier
         lines = ["═══ QUALITY MATRIX ═══"]
 
-        lines.append(f"Overall: {self.overall_quality.upper()} (risk ×{rm:.2f})")
-        if self.force_conservative_reasoning:
-            lines.append("Policy: CONSERVATIVE REASONING FORCED (higher bar for new risk)")
+        policy = " CONSERVATIVE" if self.force_conservative_reasoning else ""
+        lines.append(f"Overall: {self.overall_quality.upper()} (risk ×{rm:.2f}){policy}")
 
         if self.blocked_tool_categories:
-            lines.append(f"Restricted categories: {', '.join(self.blocked_tool_categories)}")
+            lines.append(f"Blocked: {', '.join(self.blocked_tool_categories)}")
 
-        lines.append(
-            f"Suggested model config: temp={self.suggested_temperature:.2f}, "
-            f"max_tokens={self.suggested_max_tokens}"
-        )
+        if not compact:
+            if self.force_conservative_reasoning:
+                lines.append("Policy: CONSERVATIVE REASONING FORCED (higher bar for new risk)")
+            lines.append(
+                f"Suggested model config: temp={self.suggested_temperature:.2f}, "
+                f"max_tokens={self.suggested_max_tokens}"
+            )
 
+        sym_cap = 1 if compact else 3
         if self.symbol_quality:
             sorted_syms = sorted(
                 self.symbol_quality.values(),
                 key=lambda s: (s.trade_count_7d + s.recent_feedback_count, -abs(s.avg_execution_gap)),
                 reverse=True,
-            )[:3]
+            )[:sym_cap]
             sym_lines = []
             for sq in sorted_syms:
                 sym_lines.append(
@@ -205,22 +215,23 @@ class QualityMatrix:
                     f"n={sq.trade_count_7d + sq.recent_feedback_count}"
                 )
             if sym_lines:
-                lines.append("Symbol quality (recent):")
+                prefix = "Top symbol:" if compact and len(sym_lines) == 1 else "Symbol quality:"
+                lines.append(prefix)
                 lines.extend(sym_lines)
 
+        prov_cap = 1 if compact else 2
         if self.recent_provenance:
-            lines.append("Recent decisions (provenance):")
-            for p in self.recent_provenance[-2:]:
-                tools = ",".join(t.tool_name for t in p.tools_used[-3:]) or "none"
+            if not compact:
+                lines.append("Recent decisions (provenance):")
+            for p in self.recent_provenance[-prov_cap:]:
+                tools = ",".join(t.tool_name for t in p.tools_used[-2 if compact else -3:]) or "none"
                 lines.append(
-                    f"  C{p.cycle_id} {p.decision_type}({p.symbol or ''}) "
+                    f"  C{p.cycle_id} {p.decision_type}({p.symbol or '-'}) "
                     f"tools=[{tools}] q={p.context_quality}"
                 )
 
-        lines.append(
-            f"Last updated: "
-            f"{(datetime.now(timezone.utc) - self.last_populated).total_seconds() / 60:.0f}m ago"
-        )
+        age_m = (datetime.now(timezone.utc) - self.last_populated).total_seconds() / 60.0
+        lines.append(f"Updated {age_m:.0f}m ago")
         return "\n".join(lines)
 
     def recommended_policies(self, symbol: str | None = None) -> dict[str, Any]:

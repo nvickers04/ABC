@@ -1,4 +1,10 @@
-# Signal Formula Spec Matrix
+# Signal formula spec
+
+Maps each active signal to implementation style, article alignment, target hybrid formula, and fallbacks.
+
+**See also:** [data-sources.md](data-sources.md) · [codebase-layout.md](codebase-layout.md) · [plain-english-glossary.md](plain-english-glossary.md)
+
+---
 
 This document maps each active signal to:
 - current implementation style

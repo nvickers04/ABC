@@ -27,7 +27,7 @@ from __future__ import annotations
 
 import json
 from dataclasses import dataclass
-from typing import Any, Iterable, Optional
+from typing import Any, Optional
 
 # Required envelope keys (must always be present after normalization).
 ENVELOPE_KEYS: frozenset[str] = frozenset(

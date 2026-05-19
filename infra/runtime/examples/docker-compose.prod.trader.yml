@@ -1,0 +1,19 @@
+# Production override — trader machine (two-host split).
+#
+# Use ONLY this file on the trader box. Research runs on the other host via
+# docker-compose.research.yml (no trader compose there).
+#
+#   docker compose `
+#     -f infra/runtime/docker-compose.trader.yml `
+#     -f infra/runtime/examples/docker-compose.prod.trader.yml `
+#     --env-file .env up -d --build
+#
+# Requires research host already healthy (heartbeat + operational status).
+
+services:
+  abc-trader:
+    environment:
+      TRADER_IN_PROCESS_SCORER: never
+      DOCKER_HEALTHCHECK_REQUIRE_RESEARCH: "1"
+      IBKR_HOST: host.docker.internal
+    command: ["python", "__main__.py", "--require-research-host", "--verbose"]

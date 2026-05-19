@@ -1,47 +1,18 @@
-# Research stack ONLY — scorer + heartbeat (and optional template evolution).
+# Research stack ONLY — scorer + template evolution + heartbeat.
+# Never run the trader (__main__.py) on this machine.
 #
-# IMPORTANT: This is the RESEARCHER machine compose file.
-# It must run on a dedicated machine (or at least a dedicated Docker context)
-# that has good MarketData.app connectivity. It must NEVER run the trader (__main__.py).
+# Quick start (repo root):
+#   docker network create postgres_default
+#   docker compose -f infra/postgres/docker-compose.yml --env-file infra/postgres/.env up -d
+#   docker compose -f infra/runtime/docker-compose.research.yml --env-file .env up -d --build
 #
-# ─────────────────────────────────────────────────────────────────────────────
-# FIRST TIME SETUP ON A NEW RESEARCH MACHINE (do this once)
-# ─────────────────────────────────────────────────────────────────────────────
-# 1. Make sure Postgres is reachable from this machine (usually via Tailscale/VPN).
-#    Your .env must contain a valid DATABASE_URL or PGHOST/PGUSER/etc.
+# Two-host prod: add -f infra/runtime/examples/docker-compose.prod.research.yml
+# Single-machine dev: add -f infra/runtime/examples/docker-compose.dev.yml
 #
-# 2. (Recommended) Create the shared Docker network once:
-#    docker network create postgres_default
-#
-# 3. Start the researcher:
-#    docker compose -f infra/runtime/docker-compose.research.yml --env-file .env up -d --build
-#
-# 4. Check status (this is the explicit way to see if it started correctly):
-#    docker compose -f infra/runtime/docker-compose.research.yml ps
-#    docker compose -f infra/runtime/docker-compose.research.yml logs -f abc-research
-#
-#    Look for:
-#      - "MDA health check PASSED"
-#      - "Researcher boundaries OK"
-#      - No "MDA HEALTH CHECK FAILED" or "DAILY TOKEN CAP" errors.
-#
-# If the container shows as "unhealthy", check the logs — it almost always means
-# either Postgres is unreachable or Market Data streaming is not working from this host.
-#
-# ─────────────────────────────────────────────────────────────────────────────
-# Normal usage (after first setup)
-#   docker compose -f infra/runtime/docker-compose.research.yml --env-file .env up -d
-#
-# Do NOT replace CMD with __main__.py — that starts the trading agent + Grok calls.
-# ─────────────────────────────────────────────────────────────────────────────
-
-# Postgres: this stack does not start Postgres itself.
-# The network `postgres_default` must exist (created above or by the postgres compose).
-# Use `host.docker.internal` in DATABASE_URL when Postgres runs directly on the host.
+# Logs: docker logs -f abc-research-host
+# Health: docker inspect --format='{{.State.Health.Status}}' abc-research-host
 
 networks:
-  # Same network as `infra/postgres/docker-compose.yml` (container name `abc-postgres`).
-  # Lets DATABASE_URL use host `abc-postgres` instead of 127.0.0.1 (see scripts/docker_research_up.ps1).
   postgres_default:
     external: true
 
@@ -56,25 +27,21 @@ services:
     env_file:
       - ../../.env
     environment:
+      ABC_RESEARCH_HOST: "1"
       IBKR_QUOTES_ENABLED: "0"
+      DOCKER_HEALTHCHECK_MDA: ${DOCKER_HEALTHCHECK_MDA:-0}
     extra_hosts:
       - "host.docker.internal:host-gateway"
     networks:
       - postgres_default
-    # The healthcheck is defined in the Dockerfile.
-    # This makes `docker compose ps` show a clear healthy/unhealthy status
-    # instead of the container just saying "running" while failing internally.
     healthcheck:
-      test: ["CMD", "python", "-c", "
-import os, sys
-from dotenv import load_dotenv
-load_dotenv(override=False)
-from data.data_provider import get_data_provider
-dp = get_data_provider()
-q = dp.get_quote('SPY')
-sys.exit(0 if (q and q.get('last')) else 1)
-"]
+      test: ["CMD", "python", "scripts/docker_healthcheck.py", "research"]
       interval: 60s
-      timeout: 20s
+      timeout: 25s
       retries: 3
-      start_period: 60s
+      start_period: 90s
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "5"

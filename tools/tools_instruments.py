@@ -5,10 +5,11 @@ This replaces the need to list every tool in the system prompt.
 The agent calls this to see what's available, then picks.
 """
 
-import logging
 from typing import Any
 
-logger = logging.getLogger(__name__)
+from core.log_context import get_logger
+
+logger = get_logger(__name__)
 
 
 # All instrument categories and their tools — single source of truth
@@ -226,14 +227,14 @@ _DIRECTION_MAP = {
 
 async def handle_instrument_selector(executor, params: dict) -> Any:
     """Return all available instruments, optionally filtered by outlook.
-    
+
     Args:
         symbol: Stock ticker (optional — used to add context like IV, price)
         outlook: bullish | bearish | neutral | volatile (optional — highlights relevant instruments)
     """
     symbol = params.get("symbol")
     outlook = (params.get("outlook") or "").lower().strip()
-    
+
     # Gather optional context for the symbol
     context = {}
     if symbol and executor.data_provider:
@@ -277,18 +278,18 @@ async def handle_instrument_selector(executor, params: dict) -> Any:
         "outlook": outlook or "all (specify outlook to highlight relevant instruments)",
         "market_regime": regime_label,
     }
-    
+
     if context:
         result["symbol_context"] = context
-    
+
     # Determine which directions to highlight
     relevant_dirs = set()
     if outlook and outlook in _DIRECTION_MAP:
         relevant_dirs = set(_DIRECTION_MAP[outlook])
-    
+
     categories = []
     for cat_key, cat_data in _INSTRUMENTS.items():
-        cat_out = {
+        cat_out: dict[str, Any] = {
             "category": cat_data["label"],
             "instruments": [],
         }
@@ -315,7 +316,7 @@ async def handle_instrument_selector(executor, params: dict) -> Any:
                             entry["matches_outlook"] = is_relevant
                         cat_out["instruments"].append(entry)
                         continue
-            
+
             entry = {
                 "tool": tool_name,
                 "description": tool_info["desc"],
@@ -323,9 +324,9 @@ async def handle_instrument_selector(executor, params: dict) -> Any:
             }
             if relevant_dirs:
                 entry["matches_outlook"] = is_relevant
-            
+
             cat_out["instruments"].append(entry)
-        
+
         # If filtering by outlook, only include categories with at least 1 relevant instrument
         if relevant_dirs:
             has_relevant = any(i.get("matches_outlook") for i in cat_out["instruments"])
@@ -333,9 +334,9 @@ async def handle_instrument_selector(executor, params: dict) -> Any:
                 categories.append(cat_out)
         else:
             categories.append(cat_out)
-    
+
     result["categories"] = categories
-    
+
     # Add smart suggestions based on context
     suggestions = []
     if context.get("iv_rank") and context["iv_rank"] > 50:
@@ -348,7 +349,7 @@ async def handle_instrument_selector(executor, params: dict) -> Any:
         suggestions.append(f"Regime is {regime_label} — bearish instruments, puts, and hedges may be appropriate")
     if regime_label in ("RISK-ON",):
         suggestions.append(f"Regime is {regime_label} — bullish entries and momentum plays favorable")
-    
+
     if suggestions:
         result["suggestions"] = suggestions
 
@@ -361,7 +362,7 @@ async def handle_instrument_selector(executor, params: dict) -> Any:
         )
 
     result["note"] = "Use plan_order for stock entries (auto-selects order type + stop). Use enter_option for options (auto-selects contract). Use direct tools (vertical_spread, etc.) when you want explicit control."
-    
+
     return result
 
 

@@ -2,7 +2,7 @@
 
 Which external providers we use, what each cannot do, and which process owns each feed.
 
-**Start commands:** [entry-points.md](entry-points.md)
+**See also:** [entry-points.md](entry-points.md) · [operations/deployment.md](operations/deployment.md) · [plain-english-glossary.md](plain-english-glossary.md)
 
 ## Overview
 
@@ -93,3 +93,10 @@ Prompt order is intentional: ATTENTION → INTUITION → WORKING MEMORY → stat
 | Trader | `__main__.py` |
 | Combiner / IC | `signals/combiner.py`, `signals/scorer.py` |
 | Heartbeat | `core/runtime/heartbeat.py` |
+
+---
+
+## Related
+
+- [plain-english-glossary.md](plain-english-glossary.md) — research host, MDA, IBKR, Grok
+- [operations/independent-mode.md](operations/independent-mode.md) — when research host is down

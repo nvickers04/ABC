@@ -3,7 +3,10 @@
 FROM python:3.11-slim-bookworm
 
 ENV PYTHONUNBUFFERED=1 \
-    PYTHONDONTWRITEBYTECODE=1
+    PYTHONDONTWRITEBYTECODE=1 \
+    ABC_RESEARCH_HOST=1 \
+    IBKR_QUOTES_ENABLED=0 \
+    DOCKER_HEALTHCHECK_MDA=0
 
 WORKDIR /app
 
@@ -13,29 +16,7 @@ RUN pip install --no-cache-dir --upgrade pip \
 
 COPY . .
 
-# research.host disables IBKR quote routing internally; no TWS in this container.
 CMD ["python", "-m", "research"]
 
-# Healthcheck: verifies that Market Data streaming is reachable (the hard gate
-# the researcher daemon enforces at startup). This makes `docker compose ps`
-# show a clear "healthy" / "unhealthy" state instead of the container just
-# appearing to be "running" while actually failing inside.
-HEALTHCHECK --interval=60s --timeout=20s --start-period=45s --retries=3 \
-    CMD python -c "
-import os, sys
-try:
-    from dotenv import load_dotenv
-    load_dotenv(override=False)
-    from data.data_provider import get_data_provider
-    dp = get_data_provider()
-    quote = dp.get_quote('SPY')
-    if quote and quote.get('last') is not None:
-        print('MDA health OK')
-        sys.exit(0)
-    else:
-        print('MDA returned no usable quote')
-        sys.exit(1)
-except Exception as e:
-    print('MDA health check failed:', e)
-    sys.exit(1)
-" || exit 1
+HEALTHCHECK --interval=60s --timeout=25s --start-period=90s --retries=3 \
+    CMD ["python", "scripts/docker_healthcheck.py", "research"]

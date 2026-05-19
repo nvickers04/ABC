@@ -2,14 +2,14 @@
 
 from __future__ import annotations
 
-import logging
 from dataclasses import dataclass, field
 from typing import Any
 
+from core.log_context import get_logger
 from tools.smoke_manifest import NEVER_AUTOTEST, broker_mutating_names, safe_names
 from tools.tools_executor import ToolExecutor
 
-logger = logging.getLogger(__name__)
+logger = get_logger(__name__)
 
 
 @dataclass

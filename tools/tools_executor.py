@@ -129,44 +129,44 @@ update_working_memory: {section, entry, expires_in_minutes?, metadata?} -> add a
 clear_working_memory_entry: {section, entry_id?} -> remove one entry, or whole section if entry_id omitted
 """
 
-import asyncio
 import json
-import logging
 import os
 import re
-from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Any
 
 from core.async_utils import safe_sleep as _safe_sleep
-
-from core.config import TRADING_MODE, PAPER_AGGRESSIVE
+from core.config import PAPER_AGGRESSIVE
+from core.log_context import get_logger
 from memory import (
-    get_graduated_params, _time_bucket, _atr_bucket,
-    set_pending_graduated_param, set_pending_order_context,
+    _atr_bucket,
+    _time_bucket,
     get_execution_cost,
+    get_graduated_params,
+    set_pending_graduated_param,
+    set_pending_order_context,
 )
 
-logger = logging.getLogger(__name__)
+logger = get_logger(__name__)
 
 
 # ToolResult and envelope helpers now live in tools.tool_contract — re-exported
 # here for backward compatibility with every caller that did
 # ``from tools.tools_executor import ToolResult``.
 from tools.tool_contract import ToolResult, validate_envelope  # noqa: E402,F401
-
+from tools.tools_account import HANDLERS as _ACCOUNT
+from tools.tools_instruments import HANDLERS as _INSTRUMENTS
+from tools.tools_multiagent import HANDLERS as _MULTIAGENT
+from tools.tools_options import HANDLERS as _OPTIONS
+from tools.tools_options import _normalize_expiration
+from tools.tools_orders import HANDLERS as _ORDERS
 
 # Build unified handler registry from submodules
 from tools.tools_research import HANDLERS as _RESEARCH
-from tools.tools_account import HANDLERS as _ACCOUNT
-from tools.tools_orders import HANDLERS as _ORDERS
-from tools.tools_options import HANDLERS as _OPTIONS, _normalize_expiration
-from tools.tools_stats import HANDLERS as _STATS
-from tools.tools_sizing import HANDLERS as _SIZING
-from tools.tools_instruments import HANDLERS as _INSTRUMENTS
-from tools.tools_multiagent import HANDLERS as _MULTIAGENT
-from tools.tools_working_memory import HANDLERS as _WORKING_MEMORY
 from tools.tools_signal_breakdown import HANDLERS as _SIGNAL_BREAKDOWN
+from tools.tools_sizing import HANDLERS as _SIZING
+from tools.tools_stats import HANDLERS as _STATS
+from tools.tools_working_memory import HANDLERS as _WORKING_MEMORY
 
 _REGISTRY: dict[str, Any] = {}
 _REGISTRY.update(_RESEARCH)
@@ -420,8 +420,8 @@ def _allowed_trade_universe() -> set[str]:
     except Exception:
         pass
     try:
-        from memory import get_db
         from core.runtime.focus_universe import get_focus_symbols
+        from memory import get_db
         allowed.update(get_focus_symbols(get_db(), limit=64))
     except Exception:
         pass
@@ -592,7 +592,7 @@ class ToolExecutor:
 
     def _check_cash(self, estimated_cost: float):
         """Block if estimated cost exceeds available cash. Returns error dict or None.
-        
+
         CASH-ONLY account: Uses TotalCashValue (actual settled cash).
         AvailableFunds on IBKR paper includes margin purchasing power,
         which would allow buying on margin — we MUST NOT do that.
@@ -626,7 +626,7 @@ class ToolExecutor:
 
     def _standardize_tool_payload(self, result: Any) -> dict:
         """Normalize all tool outputs to a flat envelope shape.
-        
+
         Keys 'success', 'error', 'is_realtime', 'data_warning' are envelope metadata.
         All other keys from the handler result are merged at top level (no 'data' wrapper).
         """
@@ -678,8 +678,10 @@ class ToolExecutor:
         changing the contract).
         """
         try:
-            from core.quality.quality_matrix import get_quality_matrix_service, ToolUsageRecord
-            from datetime import datetime as _dt, timezone as _tz
+            from datetime import datetime as _dt
+            from datetime import timezone as _tz
+
+            from core.quality.quality_matrix import ToolUsageRecord, get_quality_matrix_service
 
             svc = get_quality_matrix_service()
             sym = (params or {}).get("symbol") if isinstance(params, dict) else None
@@ -1010,7 +1012,7 @@ class ToolExecutor:
         params = {"symbol": symbol, "side": side, "quantity": quantity}
 
         if session in ("premarket", "postmarket"):
-            reasons.append(f"Extended hours: limit order only")
+            reasons.append("Extended hours: limit order only")
             if price:
                 params["limit_price"] = round(price, 2)
             return ("limit_order", reasons, params)
@@ -1095,7 +1097,7 @@ class ToolExecutor:
     def _build_agent_stop(self, price, side, atr_value, atr_pct,
                           stop_distance_pct=None, stop_type=None, trail_pct=None):
         """Build stop recommendation from agent-provided parameters.
-        
+
         The agent controls the stop. We just do the math.
         Falls back to ATR-based defaults only for fields the agent didn't specify.
         """
@@ -1151,7 +1153,7 @@ class ToolExecutor:
 
     def _recommend_stop(self, price, atr_value, atr_pct, days_to_earnings):
         """Companion stop recommendation for long entry.
-        
+
         Uses plain stop orders (not stop_limit) to avoid Error 202
         'Limit Price too far through Stop Price' rejections from IBKR.
         For earnings plays, uses trailing stop instead of stop_limit.
@@ -1191,7 +1193,7 @@ class ToolExecutor:
 
     def _recommend_stop_short(self, price, atr_value, atr_pct, days_to_earnings):
         """Companion stop recommendation for short entry.
-        
+
         Uses plain stop orders to avoid Error 202 stop_limit rejections.
         """
         stop_price = round(price + atr_value * 1.5, 2)
@@ -1559,10 +1561,8 @@ class ToolExecutor:
         """Select contract for covered_call, cash_secured_put, or protective_put."""
         if strategy == "covered_call":
             contracts = chain.calls()
-            right = "C"
         else:
             contracts = chain.puts()
-            right = "P"
 
         contracts = [c for c in contracts
                      if c.dte is not None and abs(c.dte - dte_target) <= 15]
@@ -1789,6 +1789,9 @@ class ToolExecutor:
 
     async def execute(self, action: str, params: dict) -> 'ToolResult':
         """Execute a tool and return structured ToolResult."""
+        from core.log_context import bind_trade_context, refresh_trader_cycle_context, unbind_trade_context
+
+        refresh_trader_cycle_context()
         try:
             # Normalize case — LLMs sometimes send ATR, Quote, etc.
             action = action.strip().lower() if isinstance(action, str) else action
@@ -1818,8 +1821,8 @@ class ToolExecutor:
             # This is the authoritative host-level rejection (hard control).
             # LLM sees the policy via prompt/tools but cannot evade the gate.
             try:
-                from core.runtime.operating_context import get_operating_context
                 from core.quality.quality_matrix import get_quality_matrix_service
+                from core.runtime.operating_context import get_operating_context
 
                 ctx = get_operating_context()
                 svc = get_quality_matrix_service()
@@ -1827,7 +1830,7 @@ class ToolExecutor:
 
                 # Observability: log the active policy for every tool dispatch (debug)
                 try:
-                    pol = m.recommended_policies(params.get("symbol") if isinstance(params, dict) else None)
+                    m.recommended_policies(params.get("symbol") if isinstance(params, dict) else None)
                     logger.debug(
                         "QualityMatrix policy for action=%s: overall=%s rm=%.2f blocked=%s force_cons=%s",
                         action,
@@ -1955,6 +1958,21 @@ class ToolExecutor:
 
             self._record_tool_for_quality_matrix(action, params, success=bool(payload.get("success")))
 
+            if action in _ORDER_ACTIONS and isinstance(payload, dict):
+                inner = payload.get("data") if isinstance(payload.get("data"), dict) else payload
+                if isinstance(inner, dict):
+                    oid = inner.get("order_id")
+                    if oid is not None:
+                        bind_trade_context(trade_id=str(oid), order_id=oid)
+
+            sym = (params or {}).get("symbol") if isinstance(params, dict) else None
+            logger.info(
+                "tool_executed",
+                action=action,
+                symbol=sym,
+                success=bool(payload.get("success")),
+            )
+
             return ToolResult(
                 action=action,
                 data=payload,
@@ -1962,7 +1980,7 @@ class ToolExecutor:
                 raw_json=json.dumps(payload, separators=(',',':'), default=str),
             )
         except Exception as e:
-            logger.error(f"Tool error: {action} - {e}")
+            logger.error("tool_error", action=action, error=str(e))
             payload = {
                 "success": False,
                 "data": None,
@@ -1976,6 +1994,8 @@ class ToolExecutor:
                 success=False,
                 raw_json=json.dumps(payload),
             )
+        finally:
+            unbind_trade_context()
 
     async def _dispatch(self, action: str, params: dict) -> Any:
         """Route action to handler via registry."""

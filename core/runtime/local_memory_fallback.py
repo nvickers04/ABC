@@ -193,16 +193,23 @@ class LocalWorkingMemoryStore:
             self._save()
         return removed
 
-    def render(self, *, now_ts: float | None = None) -> str:
+    def render(
+        self,
+        *,
+        now_ts: float | None = None,
+        max_entries_per_section: int | None = None,
+    ) -> str:
         """Render WM text for prompts (abbreviated vs Postgres renderer).
 
         Args:
             now_ts: Optional epoch seconds; defaults to ``time.time()``.
+            max_entries_per_section: Keep only the newest N entries per section.
 
         Returns:
             Markdown-style block or a placeholder when empty.
         """
         now = float(now_ts if now_ts is not None else time.time())
+        cap = max_entries_per_section if max_entries_per_section is not None else 5
         lines = ["═══ WORKING MEMORY (local fallback) ═══"]
         any_content = False
         for section in SECTIONS:
@@ -214,9 +221,12 @@ class LocalWorkingMemoryStore:
                 continue
             any_content = True
             lines.append(f"**{section.upper()}**")
-            for e in entries[-5:]:
+            show = entries[-cap:] if cap > 0 else entries
+            for e in show:
                 text = str(e.get("entry_text", ""))[:300]
                 lines.append(f"- {text}")
+            if len(entries) > len(show):
+                lines.append(f"- … +{len(entries) - len(show)} older")
             lines.append("")
         if not any_content:
             return "(Local working memory empty)"

@@ -1,23 +1,18 @@
-# Trader stack — Grok ReAct agent + IBKR execution (paper or live).
-# Do NOT run alongside research on same container (LLM spend + IBKR client_id conflict).
-# Research host (scorer + evolution) runs on research machine or separate compose.
+# Trader stack — Grok agent + IBKR. Do not colocate with research in production.
 #
-# Requires:
-# - .env with GROK_API_KEY, IBKR_*, DATABASE_URL (or PG*) pointing at shared Postgres.
-# - TWS or IB Gateway running on host (or another machine) with API enabled on 7497/7496.
-# - For Docker Desktop on Windows: host.docker.internal resolves to host.
-#
-# Start:
+# Quick start (repo root, TWS/Gateway on host):
+#   docker network create postgres_default
 #   docker compose -f infra/runtime/docker-compose.trader.yml --env-file .env up -d --build
 #
-# Logs: docker logs -f abc-trader
-# Stop: docker compose -f infra/runtime/docker-compose.trader.yml down
+# Two-host prod: add -f infra/runtime/examples/docker-compose.prod.trader.yml
+# Single-machine dev: add -f infra/runtime/examples/docker-compose.dev.yml
 #
-# For full research + trader on one host (dev only): use two separate compose files
-# (research + trader) sharing the postgres_default network.
+# Logs: docker logs -f abc-trader
+# Health: docker inspect --format='{{.State.Health.Status}}' abc-trader
+
 networks:
   postgres_default:
-    external: true   # created by infra/postgres/docker-compose.yml
+    external: true
 
 services:
   abc-trader:
@@ -30,30 +25,21 @@ services:
     env_file:
       - ../../.env
     environment:
-      # Ensure IBKR host resolves inside container to the Windows host running TWS
-      IBKR_HOST: host.docker.internal
-      # Production safety: never fall back to in-process scorer
-      TRADER_IN_PROCESS_SCORER: never
+      IBKR_HOST: ${IBKR_HOST:-host.docker.internal}
+      TRADER_IN_PROCESS_SCORER: ${TRADER_IN_PROCESS_SCORER:-never}
+      DOCKER_HEALTHCHECK_REQUIRE_RESEARCH: ${DOCKER_HEALTHCHECK_REQUIRE_RESEARCH:-0}
     extra_hosts:
       - "host.docker.internal:host-gateway"
     networks:
       - postgres_default
-    # No ports exposed (IBKR is outbound to host TWS; no inbound API)
     healthcheck:
-      test: ["CMD", "python", "-c", "
-import os
-from dotenv import load_dotenv
-load_dotenv(override=False)
-from core.config import validate_config
-errs = validate_config()
-exit(1 if errs else 0)
-"]
+      test: ["CMD", "python", "scripts/docker_healthcheck.py", "trader"]
       interval: 60s
-      timeout: 10s
+      timeout: 20s
       retries: 3
-      start_period: 45s
+      start_period: 60s
     logging:
-      driver: "json-file"
+      driver: json-file
       options:
         max-size: "10m"
         max-file: "5"

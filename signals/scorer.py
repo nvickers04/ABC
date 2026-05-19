@@ -45,7 +45,7 @@ logger = logging.getLogger(__name__)
 # Public entry point
 # ---------------------------------------------------------------------------
 
-# Control state for agent-controlled scorer lifecycle.
+# Control state for scorer lifecycle (trader in-process thread or research host loop).
 _scorer_thread: "threading.Thread | None" = None  # type: ignore[name-defined]
 _scorer_stop_event: "threading.Event | None" = None  # type: ignore[name-defined]
 _scorer_pause_event: "threading.Event | None" = None  # type: ignore[name-defined]
@@ -146,12 +146,28 @@ async def run_research(*, verbose: bool = False, use_cadence: bool = False) -> N
     according to ``core.runtime.cadence.cadence_seconds()`` between
     rounds instead of ``ROUND_DELAY_SECS``.
     """
-    global _USE_CADENCE
+    global _USE_CADENCE, _scorer_stop_event, _scorer_pause_event
     _USE_CADENCE = bool(use_cadence)
+    if use_cadence and _scorer_stop_event is None:
+        import threading
+
+        _scorer_stop_event = threading.Event()
+        _scorer_pause_event = threading.Event()
+
     from data.data_provider import DataProvider
     from memory import get_db
 
-    logger.info("Signal scoring research loop started")
+    try:
+        from core.runtime.research_host_runtime import is_research_host_process
+
+        _on_research_host = is_research_host_process()
+    except Exception:
+        _on_research_host = False
+    logger.info(
+        "Signal scoring research loop started (cadence=%s research_host=%s)",
+        use_cadence,
+        _on_research_host,
+    )
     dp = DataProvider()
     conn = get_db()
     init_default_boundaries(conn)
@@ -162,6 +178,14 @@ async def run_research(*, verbose: bool = False, use_cadence: bool = False) -> N
     round_num = 0
     round_mda_sleep_mult = 1.0
     while True:
+        try:
+            from core.runtime.research_host_runtime import shutdown_requested
+
+            if shutdown_requested():
+                logger.info("Scoring loop exiting: research host shutdown requested")
+                break
+        except Exception:
+            pass
         # Honour stop/pause controls between rounds.
         if _scorer_stop_event is not None and _scorer_stop_event.is_set():
             logger.info("Scoring loop stopped by request after %d rounds", round_num)
@@ -171,6 +195,19 @@ async def run_research(*, verbose: bool = False, use_cadence: bool = False) -> N
             continue
         round_num += 1
         round_mda_sleep_mult = 1.0
+        if _on_research_host:
+            try:
+                from core.runtime.heartbeat import (
+                    ResearchHostStatus,
+                    publish_research_host_heartbeat,
+                )
+
+                publish_research_host_heartbeat(
+                    status=ResearchHostStatus.SCORING,
+                    round_num=round_num,
+                )
+            except Exception:
+                pass
         try:
             t0 = time.time()
             # Run the round directly on the main loop. The per-loop
@@ -188,15 +225,9 @@ async def run_research(*, verbose: bool = False, use_cadence: bool = False) -> N
                 round_num, elapsed, credits_used,
             )
             try:
-                from core.wake_events import wake_bus
-                wake_bus.signal(f"scorer_round_{round_num}")
-            except Exception:
-                pass
-            # Heartbeat — the trading agent uses this to decide whether
-            # to skip spawning its own in-process scorer.  Fail-soft.
-            try:
-                from core.runtime.heartbeat import write_heartbeat
-                write_heartbeat()
+                from core.runtime.research_host_runtime import notify_scorer_round_complete
+
+                notify_scorer_round_complete(round_num)
             except Exception:
                 pass
             try:
@@ -213,33 +244,48 @@ async def run_research(*, verbose: bool = False, use_cadence: bool = False) -> N
             except Exception:
                 pass
 
-            # ── Researcher Machine Daily Token / Activity Cap (hard 100k limit) ──
-            # Enforced on the dedicated researcher host. Trader side has separate
-            # Grok LLM caps. This prevents unbounded MDA burn on the research machine.
+            # Researcher daily activity cap (research host only; trader has separate Grok caps).
+            if not _on_research_host:
+                try:
+                    from core.runtime.heartbeat import write_heartbeat
+
+                    write_heartbeat()
+                except Exception:
+                    pass
+
+            cap_verdict = None
             try:
-                from core.config import RESEARCHER_DAILY_TOKEN_CAP
-                from memory import get_research_config, set_research_config
-                from datetime import datetime as _dt, timezone as _tz
-                today = _dt.now(_tz.utc).strftime("%Y-%m-%d")
-                cap_key = f"researcher_daily_usage_{today}"
-                # Conservative increment per round (MDA credits are tracked separately;
-                # this is an activity unit to guarantee hard stop even if MDA reporting lags).
-                delta = 75
-                current = float(get_research_config(cap_key, 0.0))
-                new_val = current + delta
-                set_research_config(cap_key, new_val, reason="researcher daily cap")
-                if new_val >= RESEARCHER_DAILY_TOKEN_CAP:
-                    logger.critical(
-                        "RESEARCHER DAILY TOKEN CAP HIT: %.0f >= %d. "
-                        "Further scoring rounds will be suppressed after this one. "
-                        "Restart after UTC midnight or raise RESEARCHER_DAILY_TOKEN_CAP (not recommended).",
-                        new_val, RESEARCHER_DAILY_TOKEN_CAP
-                    )
-                elif new_val > RESEARCHER_DAILY_TOKEN_CAP * 0.85:
-                    logger.warning(
-                        "Researcher daily usage at %.0f / %d (%.1f%%) — approaching hard cap.",
-                        new_val, RESEARCHER_DAILY_TOKEN_CAP, (new_val / RESEARCHER_DAILY_TOKEN_CAP) * 100
-                    )
+                from core.runtime.research_host_runtime import (
+                    is_research_host_process,
+                    record_round_usage,
+                    request_shutdown,
+                )
+
+                if is_research_host_process():
+                    cap_verdict = record_round_usage(round_delta=75.0)
+                    if _on_research_host:
+                        from core.runtime.heartbeat import (
+                            ResearchHostStatus,
+                            publish_research_host_heartbeat,
+                        )
+
+                        status = (
+                            ResearchHostStatus.CAP_STOPPED
+                            if cap_verdict.should_stop
+                            else ResearchHostStatus.RUNNING
+                        )
+                        publish_research_host_heartbeat(
+                            status=status,
+                            round_num=round_num,
+                            usage_pct=cap_verdict.pct,
+                        )
+                    if cap_verdict.should_stop:
+                        request_shutdown("daily_token_cap")
+                        logger.info(
+                            "Scoring loop stopping after round %d — daily token cap reached",
+                            round_num,
+                        )
+                        break
             except Exception:
                 pass  # never let cap tracking crash the scorer
         except asyncio.CancelledError:
@@ -537,8 +583,7 @@ async def _scoring_round(dp, conn, round_num: int) -> int:
     # ── Attention evaluator ────────────────────────────────
     # Sync any new watching_for entries into structured triggers, then
     # check every active trigger against this round's quotes &
-    # composites.  Fires post to wake_bus (waking the agent loop) and
-    # surface in the next cycle's ATTENTION block.  Fail-soft.
+    # composites.  May wake the trader loop (in-process dev only).  Fail-soft.
     try:
         from core.runtime import attention as _attention
         _attention.sync_from_working_memory(conn)

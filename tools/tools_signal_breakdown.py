@@ -31,10 +31,11 @@ Output schema::
 
 from __future__ import annotations
 
-import logging
 from typing import Any
 
-logger = logging.getLogger(__name__)
+from core.log_context import get_logger
+
+logger = get_logger(__name__)
 
 
 HANDLERS: dict[str, Any] = {}
@@ -114,7 +115,7 @@ async def handle_signal_breakdown(executor, params: dict) -> Any:
     # IC (re-use combiner's global IC).
     ic_by_sig: dict[str, float] = {}
     try:
-        from signals.combiner import _compute_signal_ic, SIGNAL_REGISTRY
+        from signals.combiner import SIGNAL_REGISTRY, _compute_signal_ic
         names = sorted(SIGNAL_REGISTRY.keys())
         if names:
             stats = _compute_signal_ic(conn, names)

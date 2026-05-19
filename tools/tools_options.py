@@ -1,15 +1,16 @@
 """Options tool handlers (single leg, spreads, management, chain/greeks)."""
 
-import logging
 from datetime import datetime, timezone
 from typing import Any
 
-logger = logging.getLogger(__name__)
+from core.log_context import get_logger
+
+logger = get_logger(__name__)
 
 
 def _normalize_expiration(exp: str) -> str:
     """Convert any expiration format to YYYYMMDD for IBKR.
-    
+
     Handles:
     - Unix timestamp string (e.g. '1773432000') -> 'YYYYMMDD'
     - YYYY-MM-DD -> 'YYYYMMDD'
@@ -558,10 +559,10 @@ async def handle_close_option(executor, params: dict) -> Any:
     strike = params.get("strike")
     right = _normalize_option_right(params.get("right"))
     limit_price = params.get("limit_price")
-    force = params.get("force", False)
+    params.get("force", False)
     if not all([symbol, expiration, strike, right]):
         return {"error": "Required: symbol, expiration, strike, right"}
-    
+
     # Snapshot unrealized P&L before closing for trade feedback
     pre_close_pnl = None
     try:
@@ -575,7 +576,7 @@ async def handle_close_option(executor, params: dict) -> Any:
                 break
     except Exception:
         pass
-    
+
     logger.info(f"CLOSE OPTION: {symbol} {right}{strike} exp={expiration} limit={limit_price}")
     result = await executor.gateway.close_option_position(
         symbol, expiration, float(strike), right.upper(),
@@ -694,7 +695,7 @@ async def handle_roll_option(executor, params: dict) -> Any:
 async def handle_option_chain(executor, params: dict) -> Any:
     """
     Get option chain with input normalization.
-    
+
     Accepts:
       symbol: required
       expiration: 'YYYYMMDD' or 'YYYY-MM-DD' (normalized to YYYY-MM-DD)
@@ -705,12 +706,12 @@ async def handle_option_chain(executor, params: dict) -> Any:
       date: 'YYYY-MM-DD' — historical chain snapshot (goes back to 2005)
     """
     import re
-    
+
     symbol = params.get("symbol")
     if not symbol:
         return {"error": "symbol required"}
     symbol = symbol.upper()
-    
+
     # --- Normalize expiration: YYYYMMDD -> YYYY-MM-DD ---
     expiration = params.get("expiration")
     if expiration:
@@ -719,7 +720,7 @@ async def handle_option_chain(executor, params: dict) -> Any:
             expiration = f"{expiration[:4]}-{expiration[4:6]}-{expiration[6:8]}"
         elif not re.match(r'^\d{4}-\d{2}-\d{2}$', expiration):
             return {"error": f"Invalid expiration format '{expiration}'. Use YYYYMMDD or YYYY-MM-DD."}
-    
+
     # --- Normalize side: C/P -> call/put ---
     side = params.get("side", params.get("right"))
     if side:
@@ -727,12 +728,12 @@ async def handle_option_chain(executor, params: dict) -> Any:
         if normalized_side is None:
             return {"error": f"Invalid side '{side}'. Use 'call' or 'put'."}
         side = normalized_side
-    
+
     # --- Build DTE range (None if not specified) ---
     dte_min = params.get("dte_min")
     dte_max = params.get("dte_max")
     dte_range = (dte_min, dte_max) if dte_min is not None or dte_max is not None else None
-    
+
     # --- Build strike range (None if not specified) ---
     strike_min = params.get("strike_min")
     strike_max = params.get("strike_max")
@@ -749,7 +750,7 @@ async def handle_option_chain(executor, params: dict) -> Any:
         hist_date = str(hist_date).strip()
         if not re.match(r'^\d{4}-\d{2}-\d{2}$', hist_date):
             return {"error": f"Invalid 'date' format '{hist_date}'. Use YYYY-MM-DD."}
-    
+
     limit = params.get("limit", 20)
 
     # --- Server-side filters (passed through to API) ---
@@ -772,7 +773,7 @@ async def handle_option_chain(executor, params: dict) -> Any:
     min_volume = params.get("min_volume")
     if min_volume is not None:
         min_volume = int(min_volume)
-    
+
     # --- Fetch from MarketData ---
     chain = executor.data_provider.get_option_chain(
         symbol,
@@ -789,7 +790,7 @@ async def handle_option_chain(executor, params: dict) -> Any:
         min_open_interest=min_open_interest,
         min_volume=min_volume,
     )
-    
+
     # --- No data: return what was requested + what to try ---
     if not chain or not chain.contracts:
         return {
@@ -823,7 +824,7 @@ async def handle_option_chain(executor, params: dict) -> Any:
                 "date": "optional - 'YYYY-MM-DD' for historical snapshot (back to 2005)",
             }
         }
-    
+
     # --- Format output ---
     include_greeks = str(params.get("include_greeks", "false")).lower() in ("true", "1", "yes")
     contracts_out = []
@@ -858,7 +859,7 @@ async def handle_option_chain(executor, params: dict) -> Any:
             entry["theta"] = c.theta
             entry["vega"] = c.vega
         contracts_out.append(entry)
-    
+
     return {
         "symbol": symbol,
         "count": len(contracts_out),
@@ -1041,8 +1042,8 @@ async def handle_multi_leg(executor, params: dict) -> Any:
         quantity = params.get("quantity", 1)
 
         if handler_name == "vertical_spread" and len(legs) >= 2:
-            long_leg = next((l for l in legs if l.get("side", "").upper() in ("BUY", "LONG")), legs[0])
-            short_leg = next((l for l in legs if l.get("side", "").upper() in ("SELL", "SHORT")), legs[1])
+            long_leg = next((leg for leg in legs if leg.get("side", "").upper() in ("BUY", "LONG")), legs[0])
+            short_leg = next((leg for leg in legs if leg.get("side", "").upper() in ("SELL", "SHORT")), legs[1])
             right = long_leg.get("right", params.get("right", "C"))
             dispatch_params = {
                 "symbol": symbol,

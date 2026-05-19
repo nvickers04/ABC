@@ -263,19 +263,9 @@ class _CompatConnection:
 
 
 def _resolve_postgres_dsn() -> str:
-    dsn = os.getenv("DATABASE_URL", "").strip()
-    if dsn:
-        return dsn
-    host = os.getenv("PGHOST", "").strip()
-    port = os.getenv("PGPORT", "5432").strip()
-    dbname = os.getenv("PGDATABASE", "").strip()
-    user = os.getenv("PGUSER", "").strip()
-    password = os.getenv("PGPASSWORD", "").strip()
-    if all([host, dbname, user, password]):
-        return f"postgresql://{user}:{password}@{host}:{port}/{dbname}"
-    raise RuntimeError(
-        "PostgreSQL is required. Set DATABASE_URL or PGHOST/PGPORT/PGDATABASE/PGUSER/PGPASSWORD."
-    )
+    from core.config import get_database_dsn
+
+    return get_database_dsn()
 
 
 def _ensure_column(conn, table: str, col: str, col_type: str) -> None:

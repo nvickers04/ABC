@@ -5,7 +5,6 @@ Research cache TTL categorization for agent research queries.
 
 from __future__ import annotations
 
-
 _TICKER_SYMBOLS: set[str] = set()
 
 

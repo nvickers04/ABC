@@ -1,14 +1,14 @@
 """Position sizing tool handlers — deterministic sizing the agent calls before orders."""
 
-import logging
 from typing import Any
 
 import numpy as np
 
-from research.config import CV_BOOTSTRAP_SAMPLES
+from core.log_context import get_logger
 from core.runtime.operating_context import get_operating_context
+from research.config import CV_BOOTSTRAP_SAMPLES
 
-logger = logging.getLogger(__name__)
+logger = get_logger(__name__)
 
 
 async def handle_calculate_size(executor, params: dict) -> Any:

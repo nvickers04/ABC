@@ -43,9 +43,12 @@ def get_research_config(key: str, default: float) -> float:
     return _impl(key, default)
 
 
-def set_research_config(key: str, value: float, reason: str = "") -> None:
+def set_research_config(
+    key: str, value: float, reason: str = "", *, log: bool = True
+) -> None:
     from memory.repos.config_repo import set_research_config as _impl
-    return _impl(key, value, reason)
+
+    return _impl(key, value, reason, log=log)
 
 
 # ═══════════════════════════════════════════════════════════════

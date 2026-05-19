@@ -1,3 +1,4 @@
+from core.log_context import get_logger
 """
 IBKR Gateway — Adapter implementing the Broker Gateway for Interactive Brokers.
 
@@ -18,7 +19,7 @@ from data.broker_gateway import (
 )
 from execution.ibkr_core import get_ibkr_connector
 
-logger = logging.getLogger(__name__)
+logger = get_logger(__name__)
 
 
 class IBKRGateway:

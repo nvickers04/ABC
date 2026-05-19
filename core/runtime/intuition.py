@@ -29,11 +29,11 @@ at DEBUG.  The agent prompt must never crash because of intuition.
 
 from __future__ import annotations
 
-import logging
-import time
 from typing import Any, Optional
 
-logger = logging.getLogger(__name__)
+from core.log_context import get_logger
+
+logger = get_logger(__name__)
 
 
 # ── Configuration ────────────────────────────────────────────────
@@ -141,7 +141,7 @@ def _global_ic(conn) -> dict[str, float]:
     weights are derived from) so the score is consistent with what the
     combiner already trusts."""
     try:
-        from signals.combiner import _compute_signal_ic, SIGNAL_REGISTRY
+        from signals.combiner import SIGNAL_REGISTRY, _compute_signal_ic
     except Exception as e:
         logger.debug("intuition: combiner import failed: %s", e)
         return {}

@@ -1,0 +1,9 @@
+# Dev / CI tooling (install after runtime deps):
+#   pip install -r requirements.txt -r requirements-dev.txt
+-r requirements.txt
+
+ruff>=0.9.0
+mypy>=1.15.0
+pylint>=3.3.0
+types-requests>=2.32.0
+pandas-stubs>=2.2.0

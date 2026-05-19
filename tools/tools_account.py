@@ -1,9 +1,10 @@
 """Account state and order management tool handlers — queries broker directly (no LiveState)."""
 
-import logging
 from typing import Any
 
-logger = logging.getLogger(__name__)
+from core.log_context import get_logger
+
+logger = get_logger(__name__)
 
 
 async def handle_cancel_order(executor, params: dict) -> Any:

@@ -163,7 +163,7 @@ def combine_signals(
     # ── Estimated IR + gate ─────────────────────────────────────
     # IR ≈ mean(positive IC) × √N_eff  (Fundamental Law of Active Mgmt).
     # Persist snapshot to research_config so the briefing can surface it
-    # to the trading agent as an ADVISORY conviction multiplier — not a
+    # to the trader agent as an ADVISORY conviction multiplier — not a
     # binary trade permission.
     estimated_ir, gate_open = _publish_ir_snapshot(
         db_conn,

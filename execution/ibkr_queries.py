@@ -1,3 +1,4 @@
+from core.log_context import get_logger
 """
 IBKR Queries Mixin - Account and Position Queries
 
@@ -19,7 +20,7 @@ from datetime import datetime, timezone
 from typing import Dict, List, Any, Optional
 from threading import Lock
 
-logger = logging.getLogger(__name__)
+logger = get_logger(__name__)
 
 
 class IBKRQueriesMixin:

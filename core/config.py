@@ -1,45 +1,82 @@
 """
-Core Configuration — All settings consolidated here + .env
+Core Configuration — module-level constants + .env via Pydantic.
 
 TRADING_MODE controls everything:
   aggressive_paper — stress-test mode, 5% risk, forces complex options
   paper            — normal paper trading, 1% risk, conservative
   live             — real money, 1% risk, strict rules, port 7496
+
+Environment parsing and cross-field rules live in :mod:`core.settings`.
 """
 
-import os
-from typing import Literal
+from __future__ import annotations
 
-# ── Load .env automatically (graceful fallback) ───────────────────────────────
+import os
+from typing import Literal, cast
+
+# ── Load .env before Pydantic settings (graceful fallback) ───────────────────
 try:
     from dotenv import load_dotenv
-    load_dotenv()  # Loads .env from project root if python-dotenv is installed
+
+    load_dotenv()
 except ImportError:
-    pass  # .env support optional (can be loaded in main script if preferred)
+    pass
 
-# Type for better IDE support and static analysis
-TradingMode = Literal["aggressive_paper", "paper", "live"]
+from pydantic import ValidationError
 
-# ── Trading Mode ────────────────────────────────────────────────────────────
-_raw_mode = os.getenv("TRADING_MODE", "paper").lower().strip()
-TRADING_MODE: TradingMode = (
-    _raw_mode if _raw_mode in ("aggressive_paper", "paper", "live") else "paper"
+from core.settings import (
+    AppSettings,
+    IbkrAccountType,
+    RuntimeConfigSnapshot,
+    TradingMode,
+    effective_env,
+    format_validation_errors,
+    load_app_settings,
 )
 
-# Backward compat — code that checks PAPER_AGGRESSIVE still works
-PAPER_AGGRESSIVE: bool = TRADING_MODE == "aggressive_paper"
+__all__ = [
+    "ConfigError",
+    "TradingMode",
+    "assert_config_valid",
+    "get_database_dsn",
+    "refresh_trading_identity_from_environ",
+    "validate_config",
+]
 
-# ── Mode-specific defaults ──────────────────────────────────────────────────
-MODE_DEFAULTS: dict[TradingMode, dict[str, float]] = {
-    "aggressive_paper": {"risk": 5.0, "rr": 1.5},
-    "paper":            {"risk": 1.0, "rr": 2.0},
-    "live":             {"risk": 0.5, "rr": 2.5},
-}
+_settings: AppSettings = load_app_settings()
 
-_defaults = MODE_DEFAULTS[TRADING_MODE]
+TRADING_MODE: TradingMode = _settings.trading_mode
+IBKR_ACCOUNT_TYPE: Literal["paper", "live"] = _settings.ibkr_account_type
+PAPER_AGGRESSIVE: bool = _settings.paper_aggressive
 
-RISK_PER_TRADE: float = float(os.getenv("RISK_PER_TRADE", str(_defaults["risk"]))) / 100.0
-MIN_RR_RATIO: float = float(os.getenv("MIN_RR", str(_defaults["rr"])))
+RISK_PER_TRADE: float = _settings.risk_per_trade_fraction
+MIN_RR_RATIO: float = float(_settings.min_rr_ratio)  # type: ignore[arg-type]
+DATABASE_URL: str | None = _settings.database_url
+
+MAX_DAILY_LLM_COST: float = _settings.max_daily_llm_cost
+MAX_DAILY_MULTI_AGENT_RESEARCH_USD: float = _settings.max_daily_multi_agent_research_usd
+MULTI_AGENT_RESEARCH_ENABLED: bool = _settings.multi_agent_research_enabled
+RESEARCHER_DAILY_TOKEN_CAP: int = _settings.researcher_daily_token_cap
+RESEARCHER_MDA_HEALTH_CHECK_ENABLED: bool = _settings.researcher_mda_health_check_enabled
+PRESCAN_PROMPT_EXPENSIVE_RESEARCH: bool = _settings.prescan_prompt_expensive_research
+IBKR_QUOTES_ENABLED: bool = _settings.ibkr_quotes_enabled
+IBKR_QUOTE_LINE_BUDGET: int = _settings.ibkr_quote_line_budget
+TRADER_IN_PROCESS_SCORER_NEVER: bool = _settings.trader_in_process_scorer_never
+TOOL_SMOKE_MODE: bool = _settings.tool_smoke_mode
+TOOL_PLAYBOOK_MAX_CHARS: int = _settings.tool_playbook_max_chars
+AGENT_TOOL_FEEDBACK_MAX_CHARS: int = _settings.agent_tool_feedback_max_chars
+BRIEFING_MIN_TEMPLATE_TRADES: int = _settings.briefing_min_template_trades
+BRIEFING_TEMPLATE_LEADERBOARD_K: int = _settings.briefing_template_leaderboard_k
+MAX_DAILY_LLM_NONCACHED_PROMPT_TEXT_TOKENS: int = (
+    _settings.max_daily_llm_noncached_prompt_text_tokens
+)
+MAX_DAILY_LLM_CACHED_PROMPT_TEXT_TOKENS: int = (
+    _settings.max_daily_llm_cached_prompt_text_tokens
+)
+MAX_DAILY_LLM_PROMPT_IMAGE_TOKENS: int = _settings.max_daily_llm_prompt_image_tokens
+MAX_DAILY_LLM_COMPLETION_TOKENS: int = _settings.max_daily_llm_completion_tokens
+MAX_DAILY_LLM_REASONING_TOKENS: int = _settings.max_daily_llm_reasoning_tokens
+MAX_DAILY_LLM_OUTPUT_PRICED_TOKENS: int = _settings.max_daily_llm_output_priced_tokens
 
 
 def get_effective_risk_per_trade() -> float:
@@ -76,9 +113,6 @@ MODE_TEXTS: dict[TradingMode, str] = {
 }
 MODE_DESCRIPTION = MODE_TEXTS[TRADING_MODE]
 
-# Optional prompt mode: force broad real-tool exercise in paper.
-# This is prompt-only guidance (no code-path changes). Default OFF.
-TOOL_SMOKE_MODE: bool = os.getenv("TOOL_SMOKE_MODE", "0").strip() == "1"
 TOOL_SMOKE_INSTRUCTIONS = (
     """\
 ═══ TOOL SMOKE MODE (TOOL_SMOKE_MODE=1) ═══
@@ -141,108 +175,19 @@ Cycle-end requirement:
 )
 
 # ── Risk Constants ──────────────────────────────────────────────────────────
-CYCLE_SLEEP_SECONDS = 30        # 30s cycles — fast iteration for paper
-MAX_DAILY_LOSS_PCT = 15.0       # Emergency flatten threshold
-INTRADAY_DRAWDOWN_PCT = 3.0     # Peak-to-trough drawdown limit within a session
-EOD_FLATTEN_MINUTES = 5         # Flatten all positions N minutes before close
-OPEN_GAP_GUARD_PCT = 2.0        # Skip entries if overnight gap exceeds this %
-OPEN_GUARD_DELAY_MINUTES = 15   # Wait N minutes after open if gap guard triggers
-MAX_DAILY_LLM_COST: float = float(
-    os.getenv("MAX_DAILY_LLM_COST", "4.5")
-)  # Tracked USD/day (halt agent); default under a small prepaid top-up; raise in .env.
+CYCLE_SLEEP_SECONDS = 30
+MAX_DAILY_LOSS_PCT = 15.0
+INTRADAY_DRAWDOWN_PCT = 3.0
+EOD_FLATTEN_MINUTES = 5
+OPEN_GAP_GUARD_PCT = 2.0
+OPEN_GUARD_DELAY_MINUTES = 15
 
-# Multi-agent research() tool (4–16 Grok agents + web_search + x_search) — the
-# largest surprise xAI bill. Tracked separately in research_config; see tools_multiagent.
-MAX_DAILY_MULTI_AGENT_RESEARCH_USD: float = float(
-    os.getenv("MAX_DAILY_MULTI_AGENT_RESEARCH_USD", "0.75")
-)
-MULTI_AGENT_RESEARCH_ENABLED: bool = os.getenv(
-    "MULTI_AGENT_RESEARCH_ENABLED", "1"
-).strip().lower() not in ("0", "false", "no", "off")
-
-# ── Researcher Machine Hard Boundaries (two-machine production) ─────────────
-# The research host (python -m research: scorer + template evolution) on the researcher machine
-# host must NEVER run unbounded. MDA streaming must be healthy, and total daily
-# research activity (MDA credits / equivalent "tokens") is capped at 100k.
-# Enforced early in research.host and per-round in signals/scorer.py.
-RESEARCHER_DAILY_TOKEN_CAP: int = int(
-    os.getenv("RESEARCHER_DAILY_TOKEN_CAP", "100000")
-)
-RESEARCHER_MDA_HEALTH_CHECK_ENABLED: bool = (
-    os.getenv("RESEARCHER_MDA_HEALTH_CHECK_ENABLED", "1").strip().lower()
-    not in ("0", "false", "no", "off")
-)
-
-# First-cycle pre-scan: when True, the prompt nudges immediate research(); default False
-# so the agent uses briefing / calendar / prior_research first (cheap).
-PRESCAN_PROMPT_EXPENSIVE_RESEARCH: bool = (
-    os.getenv("PRESCAN_PROMPT_EXPENSIVE_RESEARCH", "0").strip() == "1"
-)
-
-# ── Quote source (real-time vs. delayed) ───────────────────────────────────
-# When IBKR_QUOTES_ENABLED is True, get_quote()/get_quotes_bulk() route to
-# IBKR streaming subscriptions for real-time NBBO. If IBKR returns no data
-# the call returns None — we DO NOT silently fall back to MarketData's
-# 15-min delayed quotes (signals abstain on missing data instead).
-# Requires: IBKR Pro account, US Equity & Options Add-On Streaming Bundle
-# subscription, Market Data API Acknowledgement form completed.
-IBKR_QUOTES_ENABLED: bool = os.getenv("IBKR_QUOTES_ENABLED", "0") == "1"
-
-# Concurrent IBKR streaming subscriptions cap. IBKR allocates 100 lines by
-# default; we leave 10 headroom for transient snapshots and bracket-monitor
-# subscriptions that share the same per-user budget.
-IBKR_QUOTE_LINE_BUDGET: int = int(os.getenv("IBKR_QUOTE_LINE_BUDGET", "90"))
-
-# ── Trader: in-process signal scorer (__main__.py + research_engine tool) ───
-# When TRADER_IN_PROCESS_SCORER=never (aliases: 0, false, off, remote_only, no),
-# the trader never starts ``signals.scorer`` in this process and **refuses to
-# start** unless ``python -m research`` has a fresh DB heartbeat (same hard
-# gate as ``--require-research-host``). The ``research_engine`` tool cannot start or
-# resume the scorer. ``--force-in-process`` still overrides for dev/debug.
-_TRADER_IPS_RAW = os.getenv("TRADER_IN_PROCESS_SCORER", "auto").strip().lower()
-TRADER_IN_PROCESS_SCORER_NEVER: bool = _TRADER_IPS_RAW in (
-    "never", "0", "false", "off", "remote_only", "no",
-)
-
-# Backward compat alias
 MAX_RISK_PER_TRADE = RISK_PER_TRADE
 
 # ── LLM Parameters ──────────────────────────────────────────────────────────
-LLM_TEMPERATURE = 0.0           # Deterministic — no creativity in money decisions
-LLM_SEED = 42                   # Reproducibility
-LLM_MAX_TOKENS = 8192           # Generous reasoning space
-
-# Prompt budget (reasoning model): every ReAct ``chat.sample()`` resends the full
-# conversation, so oversized tool JSON dominates prompt_tokens. Playbook is appended
-# to the system message (see ``core.agent``).
-TOOL_PLAYBOOK_MAX_CHARS: int = int(os.getenv("TOOL_PLAYBOOK_MAX_CHARS", "1200"))
-AGENT_TOOL_FEEDBACK_MAX_CHARS: int = int(os.getenv("AGENT_TOOL_FEEDBACK_MAX_CHARS", "4500"))
-
-# briefing_summary(): min template_performance trades before surfacing OOS stats; top-K leaderboard.
-BRIEFING_MIN_TEMPLATE_TRADES: int = int(os.getenv("BRIEFING_MIN_TEMPLATE_TRADES", "5"))
-BRIEFING_TEMPLATE_LEADERBOARD_K: int = int(os.getenv("BRIEFING_TEMPLATE_LEADERBOARD_K", "8"))
-
-# Daily xAI token ceilings (hard stop via cost_tracker.check_daily_token_limits).
-# Defaults are tight — loosen via env once you trust spend; xAI UI can exceed our tracker.
-MAX_DAILY_LLM_NONCACHED_PROMPT_TEXT_TOKENS: int = int(
-    os.getenv("MAX_DAILY_LLM_NONCACHED_PROMPT_TEXT_TOKENS", "350000")
-)
-MAX_DAILY_LLM_CACHED_PROMPT_TEXT_TOKENS: int = int(
-    os.getenv("MAX_DAILY_LLM_CACHED_PROMPT_TEXT_TOKENS", "999999999")
-)
-MAX_DAILY_LLM_PROMPT_IMAGE_TOKENS: int = int(
-    os.getenv("MAX_DAILY_LLM_PROMPT_IMAGE_TOKENS", "50000")
-)
-MAX_DAILY_LLM_COMPLETION_TOKENS: int = int(
-    os.getenv("MAX_DAILY_LLM_COMPLETION_TOKENS", "80000")
-)
-MAX_DAILY_LLM_REASONING_TOKENS: int = int(
-    os.getenv("MAX_DAILY_LLM_REASONING_TOKENS", "120000")
-)
-# Output-priced = completion + reasoning (billed at output rate); cap mirrors reasoning-heavy days.
-MAX_DAILY_LLM_OUTPUT_PRICED_TOKENS: int = int(
-    os.getenv("MAX_DAILY_LLM_OUTPUT_PRICED_TOKENS", "150000")
-)
+LLM_TEMPERATURE = 0.0
+LLM_SEED = 42
+LLM_MAX_TOKENS = 8192
 
 # ── System Prompt ───────────────────────────────────────────────────────────
 SYSTEM_PROMPT = f"""You are an optimistic, truth-seeking trader. You look for opportunity, but
@@ -507,131 +452,77 @@ Keep responses compact. Call tools directly — no ceremony needed."""
 
 
 class ConfigError(ValueError):
-    """Raised when ``core.config`` is misconfigured at startup.
+    """Raised when ``core.config`` is misconfigured at startup."""
 
-    Distinct from generic ``ValueError`` so callers (``__main__.py``)
-    can present a clear actionable message instead of a stack trace.
-    """
+
+def get_database_dsn() -> str:
+    """Return validated Postgres DSN from settings (``DATABASE_URL`` or ``PG*``)."""
+    return _settings.resolve_database_dsn()
+
+
+def refresh_trading_identity_from_environ() -> None:
+    """Sync ``TRADING_MODE`` / ``IBKR_ACCOUNT_TYPE`` after CLI sets ``os.environ``."""
+    global TRADING_MODE, IBKR_ACCOUNT_TYPE, PAPER_AGGRESSIVE, MODE_DESCRIPTION
+
+    raw_mode = os.getenv("TRADING_MODE")
+    if raw_mode is not None and str(raw_mode).strip():
+        TRADING_MODE = str(raw_mode).strip().lower()  # type: ignore[assignment]
+    raw_acct = os.getenv("IBKR_ACCOUNT_TYPE")
+    if raw_acct is not None and str(raw_acct).strip():
+        IBKR_ACCOUNT_TYPE = str(raw_acct).strip().lower()  # type: ignore[assignment]
+    PAPER_AGGRESSIVE = TRADING_MODE == "aggressive_paper"
+    MODE_DESCRIPTION = MODE_TEXTS[TRADING_MODE]
+
+
+def _runtime_database_url() -> str | None:
+    raw = os.getenv("DATABASE_URL")
+    if raw is not None and str(raw).strip():
+        return str(raw).strip()
+    return DATABASE_URL
 
 
 def validate_config() -> list[str]:
-    """Validate config invariants. Returns a list of error strings.
+    """Validate config invariants; return human-readable error strings.
 
-    Empty list means config is valid. Caller is responsible for deciding
-    whether to ``sys.exit`` or raise. This is a pure function over the
-    *current* module-level constants — calling it twice without changing
-    the env returns the same result.
-
-    Invariants checked:
-      * ``TRADING_MODE`` is one of the supported literals.
-      * ``RISK_PER_TRADE`` is in (0, 0.5] (0% < risk <= 50%).
-      * ``MIN_RR_RATIO`` is positive.
-      * ``MAX_DAILY_LOSS_PCT`` is in (0, 100].
-      * ``INTRADAY_DRAWDOWN_PCT`` is in (0, 100].
-      * ``EOD_FLATTEN_MINUTES`` is positive.
-      * ``OPEN_GAP_GUARD_PCT`` is non-negative.
-      * ``OPEN_GUARD_DELAY_MINUTES`` is non-negative.
-      * ``MAX_DAILY_LLM_NONCACHED_PROMPT_TEXT_TOKENS`` (and related daily token caps) are non-negative.
-      * ``CYCLE_SLEEP_SECONDS`` is positive.
-      * ``LLM_TEMPERATURE`` is in [0, 2].
-      * ``LLM_MAX_TOKENS`` is positive.
-      * ``TOOL_PLAYBOOK_MAX_CHARS`` and ``AGENT_TOOL_FEEDBACK_MAX_CHARS`` are
-        positive (tool feedback truncation avoids ReAct prompt blow-ups).
-      * Live-mode safety: live trading must use risk <= 2% per trade.
+    Uses :class:`~core.settings.RuntimeConfigSnapshot` so tests can
+    ``monkeypatch`` module constants. Reads ``os.environ`` for
+    ``TRADING_MODE``, ``IBKR_ACCOUNT_TYPE``, and ``DATABASE_URL`` when set
+    (e.g. ``python __main__.py --account live``).
     """
     errors: list[str] = []
-
-    if TRADING_MODE not in ("aggressive_paper", "paper", "live"):
-        errors.append(
-            f"TRADING_MODE={TRADING_MODE!r} is not one of "
-            f"('aggressive_paper','paper','live')"
+    try:
+        RuntimeConfigSnapshot(
+            trading_mode=cast(TradingMode, effective_env("TRADING_MODE", TRADING_MODE)),
+            ibkr_account_type=cast(
+                IbkrAccountType,
+                effective_env("IBKR_ACCOUNT_TYPE", IBKR_ACCOUNT_TYPE),
+            ),
+            risk_per_trade=RISK_PER_TRADE,
+            min_rr_ratio=MIN_RR_RATIO,
+            max_daily_loss_pct=MAX_DAILY_LOSS_PCT,
+            intraday_drawdown_pct=INTRADAY_DRAWDOWN_PCT,
+            eod_flatten_minutes=EOD_FLATTEN_MINUTES,
+            open_gap_guard_pct=OPEN_GAP_GUARD_PCT,
+            open_guard_delay_minutes=OPEN_GUARD_DELAY_MINUTES,
+            max_daily_llm_cost=MAX_DAILY_LLM_COST,
+            max_daily_multi_agent_research_usd=MAX_DAILY_MULTI_AGENT_RESEARCH_USD,
+            cycle_sleep_seconds=CYCLE_SLEEP_SECONDS,
+            llm_temperature=LLM_TEMPERATURE,
+            llm_max_tokens=LLM_MAX_TOKENS,
+            tool_playbook_max_chars=TOOL_PLAYBOOK_MAX_CHARS,
+            agent_tool_feedback_max_chars=AGENT_TOOL_FEEDBACK_MAX_CHARS,
+            max_daily_llm_noncached_prompt_text_tokens=MAX_DAILY_LLM_NONCACHED_PROMPT_TEXT_TOKENS,
+            max_daily_llm_cached_prompt_text_tokens=MAX_DAILY_LLM_CACHED_PROMPT_TEXT_TOKENS,
+            max_daily_llm_prompt_image_tokens=MAX_DAILY_LLM_PROMPT_IMAGE_TOKENS,
+            max_daily_llm_completion_tokens=MAX_DAILY_LLM_COMPLETION_TOKENS,
+            max_daily_llm_reasoning_tokens=MAX_DAILY_LLM_REASONING_TOKENS,
+            max_daily_llm_output_priced_tokens=MAX_DAILY_LLM_OUTPUT_PRICED_TOKENS,
+            database_url=_runtime_database_url(),
         )
-
-    if not (0.0 < RISK_PER_TRADE <= 0.5):
-        errors.append(
-            f"RISK_PER_TRADE={RISK_PER_TRADE} must be in (0, 0.5] "
-            f"(i.e. >0% and ≤50%)"
-        )
-
-    if MIN_RR_RATIO <= 0:
-        errors.append(f"MIN_RR={MIN_RR_RATIO} must be positive")
-
-    if not (0.0 < MAX_DAILY_LOSS_PCT <= 100.0):
-        errors.append(
-            f"MAX_DAILY_LOSS_PCT={MAX_DAILY_LOSS_PCT} must be in (0, 100]"
-        )
-
-    if not (0.0 < INTRADAY_DRAWDOWN_PCT <= 100.0):
-        errors.append(
-            f"INTRADAY_DRAWDOWN_PCT={INTRADAY_DRAWDOWN_PCT} must be in (0, 100]"
-        )
-
-    if EOD_FLATTEN_MINUTES <= 0:
-        errors.append(
-            f"EOD_FLATTEN_MINUTES={EOD_FLATTEN_MINUTES} must be positive"
-        )
-
-    if OPEN_GAP_GUARD_PCT < 0:
-        errors.append(
-            f"OPEN_GAP_GUARD_PCT={OPEN_GAP_GUARD_PCT} must be non-negative"
-        )
-
-    if OPEN_GUARD_DELAY_MINUTES < 0:
-        errors.append(
-            f"OPEN_GUARD_DELAY_MINUTES={OPEN_GUARD_DELAY_MINUTES} must be non-negative"
-        )
-
-    if MAX_DAILY_LLM_COST <= 0:
-        errors.append(
-            f"MAX_DAILY_LLM_COST={MAX_DAILY_LLM_COST} must be positive"
-        )
-
-    if MAX_DAILY_MULTI_AGENT_RESEARCH_USD < 0:
-        errors.append(
-            f"MAX_DAILY_MULTI_AGENT_RESEARCH_USD={MAX_DAILY_MULTI_AGENT_RESEARCH_USD} "
-            f"must be non-negative (use MULTI_AGENT_RESEARCH_ENABLED=0 to disable)"
-        )
-
-    if CYCLE_SLEEP_SECONDS <= 0:
-        errors.append(
-            f"CYCLE_SLEEP_SECONDS={CYCLE_SLEEP_SECONDS} must be positive"
-        )
-
-    if not (0.0 <= LLM_TEMPERATURE <= 2.0):
-        errors.append(
-            f"LLM_TEMPERATURE={LLM_TEMPERATURE} must be in [0, 2]"
-        )
-
-    if LLM_MAX_TOKENS <= 0:
-        errors.append(f"LLM_MAX_TOKENS={LLM_MAX_TOKENS} must be positive")
-
-    if TOOL_PLAYBOOK_MAX_CHARS <= 0:
-        errors.append(
-            f"TOOL_PLAYBOOK_MAX_CHARS={TOOL_PLAYBOOK_MAX_CHARS} must be positive"
-        )
-    if AGENT_TOOL_FEEDBACK_MAX_CHARS < 500:
-        errors.append(
-            f"AGENT_TOOL_FEEDBACK_MAX_CHARS={AGENT_TOOL_FEEDBACK_MAX_CHARS} must be >= 500"
-        )
-
-    for name, val in (
-        ("MAX_DAILY_LLM_NONCACHED_PROMPT_TEXT_TOKENS", MAX_DAILY_LLM_NONCACHED_PROMPT_TEXT_TOKENS),
-        ("MAX_DAILY_LLM_CACHED_PROMPT_TEXT_TOKENS", MAX_DAILY_LLM_CACHED_PROMPT_TEXT_TOKENS),
-        ("MAX_DAILY_LLM_PROMPT_IMAGE_TOKENS", MAX_DAILY_LLM_PROMPT_IMAGE_TOKENS),
-        ("MAX_DAILY_LLM_COMPLETION_TOKENS", MAX_DAILY_LLM_COMPLETION_TOKENS),
-        ("MAX_DAILY_LLM_REASONING_TOKENS", MAX_DAILY_LLM_REASONING_TOKENS),
-        ("MAX_DAILY_LLM_OUTPUT_PRICED_TOKENS", MAX_DAILY_LLM_OUTPUT_PRICED_TOKENS),
-    ):
-        if val < 0:
-            errors.append(f"{name}={val} must be non-negative")
-
-    # Live-mode safety guard: prevent operator from running live with the
-    # aggressive_paper risk default by mistake.
-    if TRADING_MODE == "live" and RISK_PER_TRADE > 0.02:
-        errors.append(
-            f"TRADING_MODE=live but RISK_PER_TRADE={RISK_PER_TRADE} > 2%; "
-            f"live trading with >2% per-trade risk is not permitted"
-        )
+    except ValidationError as exc:
+        for msg in format_validation_errors(exc):
+            if msg not in errors:
+                errors.append(msg)
 
     return errors
 
@@ -640,6 +531,4 @@ def assert_config_valid() -> None:
     """Validate config; raise :class:`ConfigError` if invalid."""
     errors = validate_config()
     if errors:
-        raise ConfigError(
-            "Invalid configuration:\n  - " + "\n  - ".join(errors)
-        )
+        raise ConfigError("Invalid configuration:\n  - " + "\n  - ".join(errors))

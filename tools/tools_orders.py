@@ -7,10 +7,11 @@ its unique gateway call and cash estimation strategy.
 Reduction: 594 → ~270 lines with identical runtime behavior.
 """
 
-import logging
 from typing import Any, Callable, Optional
 
-logger = logging.getLogger(__name__)
+from core.log_context import get_logger
+
+logger = get_logger(__name__)
 
 
 # =============================================================================
@@ -63,8 +64,8 @@ async def _run_order(
     required: list[str],
     invoke: Callable,
     check_side: bool = True,
-    estimate_cash: Callable = None,
-    extra_validate: Callable = None,
+    estimate_cash: Callable[..., Any] | None = None,
+    extra_validate: Callable[..., Any] | None = None,
     refresh: bool = True,
 ) -> Any:
     """
@@ -85,7 +86,7 @@ async def _run_order(
     if missing:
         return {"error": f"Required: {', '.join(required)}"}
 
-    if extra_validate:
+    if extra_validate is not None:
         err = extra_validate()
         if err:
             return err
@@ -94,7 +95,7 @@ async def _run_order(
         pdt = executor._check_pdt("BUY")
         if pdt:
             return pdt
-        if estimate_cash:
+        if estimate_cash is not None:
             cost = estimate_cash()
             if cost is not None:
                 cash_err = executor._check_cash(cost)

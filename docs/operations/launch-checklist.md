@@ -2,25 +2,27 @@
 
 **Use before every live deployment and after any code change.**
 
-**Entry points:** [../entry-points.md](../entry-points.md) — research host `python -m research`, trader `python __main__.py --require-research-host`.
+**See also:** [../entry-points.md](../entry-points.md) · [deployment.md](deployment.md) · [postgres.md](postgres.md) · [../plain-english-glossary.md](../plain-english-glossary.md)
+
+**Commands:** research host `python -m research`; trader `python __main__.py --require-research-host`.
 
 ## 1. Pre-flight environment
 - [ ] `cp .env.template .env` — `GROK_API_KEY`, `IBKR_ACCOUNT_ID`, `DATABASE_URL`, `TRADING_MODE`
 - [ ] `python -c "from core.config import validate_config; print(validate_config() or 'OK')"`
-- [ ] Postgres: `python -c "from memory import init_db; init_db(); print('DB OK')"`
+- [ ] Postgres: `python scripts/verify_trader_db.py` (exit 0)
 - [ ] TWS/Gateway API enabled (7497 paper, 7496 live)
-- [ ] Research heartbeat fresh (or `--force-in-process` for dev only)
+- [ ] Research heartbeat fresh: `python scripts/health.py researcher` (exit 0–1; not 2). Dev-only fallback: `--force-in-process`
 - [ ] Docker available if using compose
 
 ## 2. Research host
 - [ ] `python -m research` or `docker compose -f infra/runtime/docker-compose.research.yml up -d`
-- [ ] Heartbeat: `python scripts/health.py researcher`
+- [ ] `python scripts/health.py researcher` (heartbeat, MDA, token cap)
 - [ ] Template evolution running; no LLM spend on research host
 
 ## 3. Trader paper soak (mandatory before live)
 - [ ] `TRADING_MODE=paper python __main__.py --test`
 - [ ] `pytest tests/test_aggressive_paper_smoke.py -q` or `python tools/trader_smoke.py`
-- [ ] `python scripts/smoke_tools.py --client-id 11` (safe tools)
+- [ ] `python scripts/smoke_tools.py --preflight --client-id 11` then safe sweep
 - [ ] 1–2 cycles clean: cash-only, no repeated safety trips
 
 ## 4. Safety (live only after ≥7 days paper)
@@ -45,4 +47,4 @@
 
 When green: `TRADING_MODE=live python __main__.py --require-research-host`
 
-See [entry-points.md](../entry-points.md), [deployment.md](deployment.md), [postgres.md](postgres.md), [../data-sources.md](../data-sources.md), [../engineering.md](../engineering.md).
+**Related:** [independent-mode.md](independent-mode.md) (WM recovery after restart) · [../data-sources.md](../data-sources.md) · [../engineering.md](../engineering.md)

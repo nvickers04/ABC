@@ -1,12 +1,15 @@
 """Research and market data tool handlers."""
 
 import datetime
-from datetime import date, timezone, datetime as dt_datetime
-import logging
 from dataclasses import asdict
+from datetime import date, timezone
+from datetime import datetime as dt_datetime
 from typing import Any
 
-logger = logging.getLogger(__name__)
+from core.log_context import get_logger
+from core.runtime.operating_context import get_operating_context
+
+logger = get_logger(__name__)
 
 
 # VIX-like symbols that need special handling
@@ -162,7 +165,7 @@ async def handle_candles(executor, params: dict) -> Any:
         valid_resolutions = {"D": "daily", "H": "hourly", "5": "5min", "15": "15min", "1": "1min", "W": "weekly", "M": "monthly"}
         if resolution not in valid_resolutions:
             return {"error": f"Invalid resolution '{resolution}'. Use: D (daily), H (hourly), 5 (5min), 15 (15min), 1 (1min), W (weekly), M (monthly)"}
-        
+
         candles = executor.data_provider.get_candles(symbol, resolution=resolution, days_back=days)
         if candles and len(candles) > 0:
             n = len(candles)
@@ -473,7 +476,7 @@ def _briefing_strategies(data: dict) -> dict:
 
 def _briefing_feedback(data: dict) -> dict:
     """Full trade feedback with stats."""
-    from research.simulator import compute_sample_confidence, format_confidence_line
+    from research.simulator import format_confidence_line
     feedback = data.get("feedback", [])
     if not feedback:
         return {"feedback": "No trade feedback in last 7 days"}
@@ -494,7 +497,7 @@ def _briefing_feedback(data: dict) -> dict:
         ("actual_pnl_ci", actual_pnls, "usd"),
         ("gap_ci", gaps, None),
     ]:
-        line = format_confidence_line(label, vals, kind=kind)
+        line = format_confidence_line(label, vals, kind=kind or "raw")
         if line:
             result[label] = line
 
@@ -518,7 +521,7 @@ def _briefing_environment(data: dict) -> dict:
 
 async def handle_briefing(executor, params: dict) -> Any:
     """Hierarchical research briefing tool.
-    
+
     detail=None or "summary" -> compact overview (~100 tokens)
     detail="signals"         -> full live signals
     detail="strategies"      -> template performance
@@ -532,7 +535,6 @@ async def handle_briefing(executor, params: dict) -> Any:
 
     # Add Independent Mode awareness
     try:
-        from core.runtime.operating_context import get_operating_context
         ctx = get_operating_context()
         if ctx.is_independent_mode:
             data["note"] = "Running in Independent Mode (researcher unavailable). Data may be stale."
@@ -788,9 +790,9 @@ async def handle_research_engine(executor, params: dict) -> dict:
     scope='scorer' | 'both' affects the scorer. scope='evolution' is ignored for
     control actions (evolution is owned by python -m research); status still reports policy.
     """
+    from core.config import TRADER_IN_PROCESS_SCORER_NEVER
     from signals import scorer as _sc
     from signals import template_evolution as _te
-    from core.config import TRADER_IN_PROCESS_SCORER_NEVER
 
     action = str(params.get("action", "status")).lower().strip()
     scope = str(params.get("scope", "both")).lower().strip()
@@ -842,7 +844,6 @@ async def handle_research_engine(executor, params: dict) -> dict:
 
 
 # ── Context Quality Tool (Independent Mode support) ──────────────────────────
-from core.runtime.operating_context import get_operating_context
 
 
 async def handle_context_quality(executor, params: dict) -> dict:
@@ -908,7 +909,8 @@ def _recent_feedback_for_symbol(sym: str, limit: int = 30) -> list[dict]:
 def _maybe_refresh_matrix(svc) -> None:
     """Re-populate matrix if older than five minutes (best-effort)."""
     try:
-        from datetime import datetime as _dt, timezone as _tz
+        from datetime import datetime as _dt
+        from datetime import timezone as _tz
         m = svc.get_matrix()
         age_min = (_dt.now(_tz.utc) - m.last_populated).total_seconds() / 60
         if age_min > 5:
@@ -969,7 +971,7 @@ async def handle_quality_status(executor, params: dict) -> dict:
 
     last_age = None
     if q.last_research_update:
-        last_age = (dt_datetime.now(_tz.utc) - q.last_research_update).total_seconds() / 60
+        last_age = (dt_datetime.now(timezone.utc) - q.last_research_update).total_seconds() / 60
 
     matrix_enrichment: dict[str, Any] = {}
     try:
@@ -977,7 +979,7 @@ async def handle_quality_status(executor, params: dict) -> dict:
         svc = get_quality_matrix_service()
         _maybe_refresh_matrix(svc)
         m = svc.get_matrix()
-        pol = m.recommended_policies()
+        m.recommended_policies()
         llm_cfg = m.get_llm_call_config()
         matrix_enrichment = {
             "matrix_overall_quality": m.overall_quality,
@@ -995,7 +997,7 @@ async def handle_quality_status(executor, params: dict) -> dict:
             "matrix_recent_tool_count": len(m.recent_tool_usage),
             "matrix_global_exec_quality": getattr(m, "global_execution_quality", None),
             "matrix_last_populated_minutes_ago": round(
-                (dt_datetime.now(_tz.utc) - m.last_populated).total_seconds() / 60, 1
+                (dt_datetime.now(timezone.utc) - m.last_populated).total_seconds() / 60, 1
             ),
         }
         # Prefer matrix values for the primary keys when available (source of truth)
@@ -1113,11 +1115,11 @@ async def handle_current_constraints(executor, params: dict) -> dict:
     is_ind = ctx.is_independent_mode
 
     if mult < 0.5:
-        policy = "conservative_minimal"
+        pass
     elif mult < 0.8:
-        policy = "elevated_caution"
+        pass
     else:
-        policy = "standard"
+        pass
 
     return {
         "risk_multiplier": round(mult, 3),

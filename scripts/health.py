@@ -1,133 +1,75 @@
 #!/usr/bin/env python3
 """Health checks for research host and trader operating mode.
 
+Runs Postgres, research heartbeat, researcher token cap, MDA quote probe,
+and role-specific checks. Colored output; exit codes:
+
+  0 — healthy
+  1 — degraded (warnings only)
+  2 — unhealthy (one or more failures)
+
+Usage (from repo root):
+
+  python scripts/health.py                 # researcher + trader sections
   python scripts/health.py researcher
   python scripts/health.py trader
-  python scripts/health.py all          # default
+  python scripts/health.py trader --ibkr-client-id 11
+  python scripts/health.py all --no-color
 """
 
 from __future__ import annotations
 
 import argparse
-import json
-import os
+import asyncio
 import sys
-from datetime import datetime, timezone
 from pathlib import Path
 
 _ROOT = Path(__file__).resolve().parent.parent
-if str(_ROOT) not in sys.path:
-    sys.path.insert(0, str(_ROOT))
+_SCRIPTS = Path(__file__).resolve().parent
+for _p in (_ROOT, _SCRIPTS):
+    if str(_p) not in sys.path:
+        sys.path.insert(0, str(_p))
+
+from health_common import (  # noqa: E402
+    Reporter,
+    check_ibkr_async,
+    check_required_tables,
+    load_dotenv_repo,
+    run_platform_checks,
+)
 
 
-def _check_researcher() -> int:
-    from core.config import RESEARCHER_DAILY_TOKEN_CAP
-    from core.runtime.heartbeat import heartbeat_age_s, is_research_host_alive
-    from memory import get_db, get_research_config
+def _check_researcher(*, use_color: bool | None) -> int:
+    rep = Reporter("ABC Research Host Health", use_color=use_color)
+    if run_platform_checks(
+        rep,
+        role="researcher",
+        include_mda=True,
+        include_scoring=True,
+        include_evolution=True,
+    ):
+        check_required_tables(rep)
+    rep.print_report()
+    return rep.exit_code()
 
-    print("=== ABC Researcher Health ===\n")
-    alive = is_research_host_alive()
-    age = heartbeat_age_s()
-    print(f"Research host heartbeat:    {alive}")
-    print(f"Heartbeat age:              {round(age, 1)} seconds")
 
-    today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
-    usage_key = f"researcher_daily_usage_{today}"
-    usage = float(get_research_config(usage_key, 0.0))
-    pct = (usage / RESEARCHER_DAILY_TOKEN_CAP) * 100 if RESEARCHER_DAILY_TOKEN_CAP > 0 else 0
-    print(f"Today's researcher usage:   {usage:,.0f} / {RESEARCHER_DAILY_TOKEN_CAP:,} ({pct:.1f}%)")
+def _check_trader(*, use_color: bool | None, ibkr_client_id: int | None) -> int:
+    rep = Reporter("ABC Trader Health", use_color=use_color)
+    if run_platform_checks(
+        rep,
+        role="trader",
+        include_mda=True,
+        include_trader_context=True,
+    ):
+        check_required_tables(rep)
 
-    conn = get_db()
-    try:
-        row = conn.execute(
-            """
-            SELECT MAX(ts) as last_ts, COUNT(*) as count
-            FROM signal_scores
-            WHERE DATE(ts, 'unixepoch') = DATE('now')
-            """
-        ).fetchone()
-        if row and row["last_ts"]:
-            last = datetime.fromtimestamp(row["last_ts"], tz=timezone.utc)
-            print(f"Last scoring round:         {last} ({row['count']} scores today)")
-        else:
-            print("Last scoring round:         No activity today")
-    except Exception as e:
-        print(f"Could not query signal_scores: {e}")
-
-    try:
-        last_evo = get_research_config("last_template_evolution_round", 0)
-        if last_evo > 0:
-            print(f"Last evolution round:       {datetime.fromtimestamp(last_evo, tz=timezone.utc)}")
-        else:
-            print("Last evolution round:       No record")
-    except Exception:
-        print("Last evolution round:       Unable to read")
-
-    if not alive or age > 600:
-        status = "DOWN or STALLED"
-        code = 1
-    elif pct >= 100:
-        status = "CAP EXCEEDED"
-        code = 1
-    elif pct > 85:
-        status = "HEALTHY (approaching cap)"
-        code = 0
+    if ibkr_client_id is not None:
+        asyncio.run(check_ibkr_async(rep, client_id=ibkr_client_id))
     else:
-        status = "HEALTHY"
-        code = 0
+        rep.skip("IBKR gateway", "add --ibkr-client-id N to test TWS/Gateway")
 
-    print(f"\nOverall: {status}\n")
-    return code
-
-
-def _check_trader() -> int:
-    from dotenv import load_dotenv
-
-    load_dotenv(_ROOT / ".env", override=True)
-
-    from core.runtime.heartbeat import heartbeat_age_s, is_research_host_alive
-    from core.runtime.local_memory_fallback import LOCAL_MEMORY_FILE
-    from core.runtime.operating_context import get_operating_context
-
-    print("=== ABC Trader Status ===\n")
-    ctx = get_operating_context()
-    try:
-        researcher_alive = is_research_host_alive()
-        hb_age = heartbeat_age_s()
-    except Exception:
-        researcher_alive = False
-        hb_age = float("inf")
-
-    mode = "INDEPENDENT" if (not researcher_alive or ctx.is_independent_mode) else "FULL"
-    print(f"Mode:                   {mode}")
-    print(f"Researcher available:   {ctx.quality.researcher_available}")
-    print(f"Memory source:          {ctx.quality.memory_source}")
-    print(f"Risk multiplier:        {ctx.risk_multiplier}")
-    print(f"WM completeness:        {ctx.quality.working_memory_completeness * 100:.0f}%")
-    print(f"Overall quality:        {ctx.quality.overall_quality}")
-    if hb_age < float("inf"):
-        print(f"Researcher heartbeat:   {round(hb_age, 1)}s ago")
-    else:
-        print("Researcher heartbeat:   unreachable")
-
-    if LOCAL_MEMORY_FILE.exists():
-        try:
-            size = LOCAL_MEMORY_FILE.stat().st_size
-            data = json.loads(LOCAL_MEMORY_FILE.read_text())
-            total = sum(len(v) for v in data.values())
-            print(f"Local memory file:      {size} bytes, ~{total} entries")
-        except Exception:
-            print(f"Local memory file:      exists ({LOCAL_MEMORY_FILE})")
-    else:
-        print("Local memory file:      not created")
-
-    print()
-    if mode == "INDEPENDENT":
-        print("→ Conservative Independent Mode (reduced new risk).")
-    else:
-        print("→ Full researcher access.")
-    print()
-    return 0
+    rep.print_report()
+    return rep.exit_code()
 
 
 def main() -> None:
@@ -139,14 +81,22 @@ def main() -> None:
         default="all",
         help="Which check to run (default: all)",
     )
+    parser.add_argument(
+        "--ibkr-client-id",
+        type=int,
+        default=None,
+        help="Trader only: connect to IBKR and verify gateway (optional)",
+    )
+    parser.add_argument("--no-color", action="store_true", help="Plain text output")
     args = parser.parse_args()
+
+    load_dotenv_repo(_ROOT)
+    use_color = False if args.no_color else None
     code = 0
     if args.target in ("researcher", "all"):
-        code = max(code, _check_researcher())
+        code = max(code, _check_researcher(use_color=use_color))
     if args.target in ("trader", "all"):
-        if args.target == "all":
-            print()
-        code = max(code, _check_trader())
+        code = max(code, _check_trader(use_color=use_color, ibkr_client_id=args.ibkr_client_id))
     raise SystemExit(code)
 
 

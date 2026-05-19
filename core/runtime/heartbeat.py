@@ -14,14 +14,31 @@ to single-process scoring (unless ``--require-research-host`` /
 
 from __future__ import annotations
 
-import logging
 import time
 from typing import Optional
 
-logger = logging.getLogger(__name__)
+from core.log_context import CTX_RESEARCH_HEARTBEAT, bind_log_context, get_logger
+
+logger = get_logger(__name__)
 
 HEARTBEAT_KEY: str = "research_host_heartbeat_ts"
 LEGACY_HEARTBEAT_KEY: str = "daemon_heartbeat_ts"
+
+# Numeric status codes in research_config (float values for config_repo).
+RESEARCH_HOST_STATUS_KEY: str = "research_host_status"
+RESEARCH_HOST_ROUND_KEY: str = "research_host_round"
+RESEARCH_HOST_USAGE_PCT_KEY: str = "research_host_usage_pct"
+
+
+class ResearchHostStatus:
+    """``research_config[research_host_status]`` values."""
+
+    STARTING = 1.0
+    RUNNING = 2.0
+    SCORING = 3.0
+    SHUTTING_DOWN = 4.0
+    CAP_STOPPED = 5.0
+    STOPPED = 6.0
 
 # Hard floor when no cadence is supplied — regular-hours rounds stay fresh;
 # a dead research host is detected within ~3 minutes.
@@ -34,11 +51,86 @@ def write_heartbeat(now: Optional[float] = None) -> float:
     try:
         from memory import set_research_config
 
-        set_research_config(HEARTBEAT_KEY, ts, reason="research_host round")
+        set_research_config(HEARTBEAT_KEY, ts, reason="research_host round", log=False)
     except Exception as e:
-        logger.debug("heartbeat write failed: %s", e)
+        logger.debug("heartbeat_write_failed", error=str(e))
         return 0.0
+    bind_log_context(**{CTX_RESEARCH_HEARTBEAT: 0.0})
+    logger.debug("heartbeat_written", ts=ts)
     return ts
+
+
+def read_research_host_status() -> float:
+    """Read ``research_host_status`` from research_config (0 if unset)."""
+    try:
+        from memory import get_research_config
+
+        return float(get_research_config(RESEARCH_HOST_STATUS_KEY, 0.0))
+    except Exception:
+        return 0.0
+
+
+def publish_research_host_heartbeat(
+    *,
+    now: Optional[float] = None,
+    status: float = ResearchHostStatus.RUNNING,
+    round_num: int = 0,
+    usage_pct: float = 0.0,
+) -> float:
+    """Write heartbeat timestamp plus trader-visible status metadata.
+
+    Args:
+        now: Optional unix timestamp (default: now).
+        status: :class:`ResearchHostStatus` code.
+        round_num: Last completed or in-progress scoring round.
+        usage_pct: Researcher daily cap usage percent (0–100+).
+
+    Returns:
+        Heartbeat timestamp written (0.0 on failure).
+    """
+    ts = write_heartbeat(now=now)
+    if ts <= 0.0:
+        return 0.0
+    try:
+        from memory import set_research_config
+
+        set_research_config(
+            RESEARCH_HOST_STATUS_KEY, float(status), reason="heartbeat", log=False
+        )
+        set_research_config(
+            RESEARCH_HOST_ROUND_KEY, float(max(0, round_num)), reason="heartbeat", log=False
+        )
+        set_research_config(
+            RESEARCH_HOST_USAGE_PCT_KEY, float(usage_pct), reason="heartbeat", log=False
+        )
+    except Exception as e:
+        logger.debug("research_host_status_publish_failed", error=str(e))
+    logger.info(
+        "research_host_heartbeat_published",
+        status=status,
+        round=round_num,
+        usage_pct=round(usage_pct, 1),
+    )
+    return ts
+
+
+def is_research_host_operational(
+    stale_after_s: Optional[float] = None,
+    *,
+    now: Optional[float] = None,
+) -> bool:
+    """True when heartbeat is fresh and host is not shutting down or cap-stopped."""
+    if not is_research_host_alive(stale_after_s=stale_after_s, now=now):
+        return False
+    st = read_research_host_status()
+    if st in (
+        ResearchHostStatus.SHUTTING_DOWN,
+        ResearchHostStatus.CAP_STOPPED,
+        ResearchHostStatus.STOPPED,
+        ResearchHostStatus.STARTING,
+    ):
+        return False
+    return True
 
 
 def read_heartbeat() -> float:

@@ -3,7 +3,7 @@
 The research and trader machines share one Postgres database for signals,
 working memory, trades, heartbeat, and `research_config`.
 
-**Deployment context:** [deployment.md](deployment.md) · **Start commands:** [../entry-points.md](../entry-points.md)
+**See also:** [deployment.md](deployment.md) · [../entry-points.md](../entry-points.md) · [../plain-english-glossary.md](../plain-english-glossary.md)
 
 ---
 
@@ -96,7 +96,7 @@ Get-Content "infra/postgres/admin/reassign_owned_to_abc_app.sql" -Raw | docker e
 
 4. Add `DATABASE_APP_ROLE=abc_app` to both `.env` files.
 
-5. On trader: `python scripts/verify_trader_db.py` should print OK and exit 0.
+5. On trader: `python scripts/verify_trader_db.py` should report **OVERALL: HEALTHY** and exit **0**.
 
 ## Rollback
 

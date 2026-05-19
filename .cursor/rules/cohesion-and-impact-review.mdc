@@ -7,7 +7,7 @@ alwaysApply: true
 
 For any non-trivial request (planning, coding, refactor, review):
 
-1. Read and follow `docs/engineering.md` (checklist, impact map, glossary) and `.cursor/rules/docs-and-file-moves.mdc` when moving or consolidating files.
+1. Read and follow `docs/engineering.md`, `docs/stabilization-pr-checklist.md`, `docs/change-impact-map.md`, `docs/plain-english-glossary.md`, and `.cursor/rules/docs-and-file-moves.mdc` when moving or consolidating files.
 2. Before proposing edits, list:
    - target subsystem
    - likely adjacent subsystems impacted

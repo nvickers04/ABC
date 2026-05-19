@@ -16,25 +16,32 @@ holds mode flags and syncs with the research host heartbeat.
 
 from __future__ import annotations
 
-import logging
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Any, Literal, Optional
 
-logger = logging.getLogger(__name__)
+from core.log_context import get_logger
+
+logger = get_logger(__name__)
 
 try:
     from core.quality.quality_matrix import (
-        QualityMatrix as _CoreQM,
-        ToolUsageRecord as _CoreToolRec,
         DecisionProvenanceSnapshot as _CoreProv,
+    )
+    from core.quality.quality_matrix import (
+        QualityMatrix as _CoreQM,
+    )
+    from core.quality.quality_matrix import (
+        ToolUsageRecord as _CoreToolRec,
+    )
+    from core.quality.quality_matrix import (
         get_quality_matrix_service,
     )
 except Exception:
-    _CoreQM = None
-    _CoreToolRec = None
-    _CoreProv = None
-    get_quality_matrix_service = None
+    _CoreQM = None  # type: ignore[assignment,misc]
+    _CoreToolRec = None  # type: ignore[assignment,misc]
+    _CoreProv = None  # type: ignore[assignment,misc]
+    get_quality_matrix_service = None  # type: ignore[assignment]
 
 if _CoreQM is not None:
     QualityMatrix = _CoreQM
@@ -282,9 +289,9 @@ class OperatingContext:
             True when the research host is considered available after sync.
         """
         try:
-            from core.runtime.heartbeat import is_research_host_alive
+            from core.runtime.heartbeat import is_research_host_operational
 
-            alive = bool(is_research_host_alive())
+            alive = bool(is_research_host_operational())
         except Exception:
             alive = False
 

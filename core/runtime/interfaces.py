@@ -16,7 +16,6 @@ from __future__ import annotations
 
 from typing import Any, Awaitable, Protocol, runtime_checkable
 
-
 # ── Broker / Account ─────────────────────────────────────────────
 
 AccountSummary = dict[str, Any]

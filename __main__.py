@@ -85,10 +85,16 @@ def _configure_scorer(args) -> None:
         return
 
     from core.config import TRADER_IN_PROCESS_SCORER_NEVER
-    from core.runtime.heartbeat import heartbeat_age_s, is_research_host_alive
+    from core.runtime.heartbeat import (
+        heartbeat_age_s,
+        is_research_host_alive,
+        is_research_host_operational,
+        read_research_host_status,
+    )
     from signals.scorer import run_research_threaded
 
-    research_host_alive = is_research_host_alive()
+    research_host_alive = is_research_host_operational()
+    heartbeat_fresh = is_research_host_alive()
     require_research_host = bool(
         args.require_research_host or TRADER_IN_PROCESS_SCORER_NEVER
     )
@@ -112,12 +118,14 @@ def _configure_scorer(args) -> None:
     if require_research_host and not research_host_alive:
         age = heartbeat_age_s()
         age_str = "never" if age == float("inf") else f"{age:.1f}s"
+        status = read_research_host_status()
         hint = ""
         if TRADER_IN_PROCESS_SCORER_NEVER and not args.require_research_host:
             hint = " (TRADER_IN_PROCESS_SCORER=never in .env)"
         msg = (
-            f"Research scorer unavailable: no fresh research host heartbeat "
-            f"(age={age_str}){hint}. Start ``python -m research`` on the research host, "
+            f"Research scorer unavailable: research host not operational "
+            f"(heartbeat_age={age_str}, status={status:.0f}){hint}. "
+            f"Start ``python -m research`` on the research host, "
             f"or pass --force-in-process for dev only."
         )
         if args.require_research_host and not TRADER_IN_PROCESS_SCORER_NEVER:
@@ -132,16 +140,26 @@ def _configure_scorer(args) -> None:
     if research_host_alive:
         age = heartbeat_age_s()
         print(
-            f"Scoring: remote (research host heartbeat {age:.0f}s ago) — "
+            f"Scoring: remote (research host operational, heartbeat {age:.0f}s ago) — "
             "no in-process scorer here.\n"
         )
-        logger.info("Research host alive (age=%.1fs); skipping in-process scorer", age)
+        logger.info(
+            "Research host operational (age=%.1fs status=%.0f); skipping in-process scorer",
+            age,
+            read_research_host_status(),
+        )
         return
 
-    print(
-        "Scoring: in-process (no fresh research host heartbeat). "
-        "Prefer running python -m research for production.\n"
-    )
+    if heartbeat_fresh and not research_host_alive:
+        print(
+            "Scoring: in-process (research host heartbeat fresh but not operational "
+            "(shutting down or cap stopped)).\n"
+        )
+    else:
+        print(
+            "Scoring: in-process (no fresh research host heartbeat). "
+            "Prefer running python -m research for production.\n"
+        )
     run_research_threaded(verbose=args.verbose)
 
 
@@ -165,6 +183,9 @@ def main() -> None:
         if not os.environ.get("TRADING_MODE"):
             os.environ["TRADING_MODE"] = "live"
 
+    from core.config import refresh_trading_identity_from_environ
+
+    refresh_trading_identity_from_environ()
     validate_startup()
 
     from core import config as _budget_cfg

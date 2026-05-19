@@ -1,3 +1,4 @@
+from core.log_context import get_logger
 """
 IBKR Options Mixin - Options Chains and Spreads
 
@@ -25,7 +26,7 @@ from ib_insync.contract import Stock
 
 from data.data_provider import get_data_provider
 
-logger = logging.getLogger(__name__)
+logger = get_logger(__name__)
 
 
 class IBKROptionsMixin:

@@ -1,3 +1,4 @@
+from core.log_context import get_logger
 """
 IBKR Core Connector - Connection Management and Base Class
 
@@ -14,10 +15,9 @@ The IBKRConnector class imports mixins from:
 - ibkr_queries.py: Account and position queries
 """
 
-import logging
 import asyncio
 import os
-import random
+import time
 from dataclasses import dataclass, field
 from enum import Enum
 from typing import Dict, List, Optional, Any, Callable
@@ -28,8 +28,12 @@ from concurrent.futures import ThreadPoolExecutor
 from ib_insync import IB, Order, Trade, Fill
 from ib_insync.contract import Stock, Option
 
+from execution.ibkr_connection import (
+    DisconnectCause,
+    classify_error_code,
+    reconnect_backoff_seconds,
+)
 from execution.ibkr_utils import is_live_trading
-
 from execution.ibkr_utils import resolve_ibkr_endpoint
 from execution.order_types import IBKROrderType
 from core.async_utils import safe_sleep as _safe_sleep
@@ -37,7 +41,7 @@ from core.async_utils import safe_sleep as _safe_sleep
 # Memory for autoresearch fill updates
 from memory import update_execution_snapshot_fill
 
-logger = logging.getLogger(__name__)
+logger = get_logger(__name__)
 
 
 # ============================================================
@@ -206,6 +210,14 @@ class IBKRConnector(IBKROrdersMixin, IBKROptionsMixin, IBKRQueriesMixin):
 
         # Background heartbeat task
         self._heartbeat_task: Optional[asyncio.Task] = None
+        self._reconnect_task: Optional[asyncio.Task] = None
+
+        # Connection lifecycle (TWS restart, reconnect, resubscribe)
+        self._disconnect_cause: str = DisconnectCause.UNKNOWN.value
+        self._reconnect_requested: bool = False
+        self._pending_resubscribe: set[str] = set()
+        self._last_heartbeat_ok: Optional[float] = None
+        self._heartbeat_failures: int = 0
 
         # Execution tracking - stores ALL fills with actual prices
         # Key: symbol, Value: list of execution records
@@ -331,6 +343,41 @@ class IBKRConnector(IBKROrdersMixin, IBKROptionsMixin, IBKRQueriesMixin):
 
     def _on_error(self, reqId: int, errorCode: int, errorString: str, contract: str) -> None:
         """Handle IBKR error/warning events. Suppress noisy codes to DEBUG."""
+        lifecycle = classify_error_code(errorCode)
+        if lifecycle == "tws_lost":
+            self._disconnect_cause = DisconnectCause.TWS_RESTART.value
+            self._connected = False
+            self._reconnect_requested = True
+            logger.warning(
+                "ibkr_tws_connectivity_lost",
+                error_code=errorCode,
+                req_id=reqId,
+                message=errorString,
+                client_id=self.client_id,
+                hint="TWS/Gateway restart or network blip — scheduling reconnect",
+            )
+            self._schedule_reconnect(DisconnectCause.TWS_RESTART.value)
+            return
+        if lifecycle == "tws_restored":
+            logger.info(
+                "ibkr_tws_connectivity_restored",
+                error_code=errorCode,
+                req_id=reqId,
+                message=errorString,
+                data_lost=errorCode == 1101,
+            )
+            self._reconnect_requested = True
+            self._schedule_reconnect(DisconnectCause.TWS_RESTART.value)
+            return
+        if lifecycle == "farm_ok":
+            logger.debug(
+                "ibkr_data_farm_ok",
+                error_code=errorCode,
+                req_id=reqId,
+                message=errorString,
+            )
+            return
+
         if errorCode in self._SUPPRESSED_ERROR_CODES:
             logger.debug(f"IBKR [{errorCode}] reqId={reqId}: {errorString}")
         elif errorCode == 202:  # Order cancelled — check attribution
@@ -345,10 +392,131 @@ class IBKRConnector(IBKROrdersMixin, IBKROptionsMixin, IBKRQueriesMixin):
             logger.info(f"IBKR [{errorCode}] reqId={reqId}: {errorString}")
 
     def _on_disconnect(self) -> None:
-        """Handle disconnection from TWS."""
-        logger.warning("Disconnected from IBKR TWS")
-        self._connected = False
+        """Handle disconnection from TWS/Gateway (API socket closed)."""
+        symbols = list(self._tickers.keys())
+        if symbols:
+            self._pending_resubscribe.update(s.upper() for s in symbols)
         self._tickers.clear()
+        self._connected = False
+        cause = self._disconnect_cause
+        if cause == DisconnectCause.UNKNOWN.value:
+            cause = DisconnectCause.TWS_RESTART.value
+            self._disconnect_cause = cause
+        logger.warning(
+            "ibkr_disconnected",
+            cause=cause,
+            client_id=self.client_id,
+            host=self.host,
+            port=self.port,
+            pending_resubscribe=len(self._pending_resubscribe),
+            symbols_sample=symbols[:10],
+        )
+        self._notify_quote_source_connection_lost(cause)
+
+    def _schedule_reconnect(self, reason: str) -> None:
+        """Kick off reconnect on the running loop (deduped)."""
+        self._reconnect_requested = True
+        if self._disconnect_cause == DisconnectCause.UNKNOWN.value:
+            self._disconnect_cause = reason
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            return
+        if self._reconnect_task and not self._reconnect_task.done():
+            return
+        self._reconnect_task = loop.create_task(self._reconnect_after_disconnect(reason))
+
+    async def _reconnect_after_disconnect(self, reason: str) -> None:
+        """Single-flight reconnect used after TWS restart or heartbeat failure."""
+        try:
+            if self.connected:
+                self._reconnect_requested = False
+                return
+            backoff = reconnect_backoff_seconds(self._heartbeat_failures)
+            if backoff > 0 and self._heartbeat_failures > 0:
+                logger.info(
+                    "ibkr_reconnect_backoff",
+                    seconds=round(backoff, 1),
+                    failures=self._heartbeat_failures,
+                    reason=reason,
+                )
+                await _safe_sleep(backoff)
+            logger.info(
+                "ibkr_reconnect_attempt",
+                reason=reason,
+                client_id=self.client_id,
+                failures=self._heartbeat_failures,
+            )
+            ok = await self.connect()
+            if ok:
+                logger.info("ibkr_reconnect_success", reason=reason, client_id=self.client_id)
+                await self._after_connect_restore()
+            else:
+                self._heartbeat_failures += 1
+                logger.error(
+                    "ibkr_reconnect_failed",
+                    reason=reason,
+                    failures=self._heartbeat_failures,
+                )
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            self._heartbeat_failures += 1
+            logger.error("ibkr_reconnect_error", reason=reason, error=str(e))
+        finally:
+            self._reconnect_task = None
+
+    def _notify_quote_source_connection_lost(self, cause: str) -> None:
+        try:
+            from data.ibkr_quote_source import get_ibkr_quote_source
+
+            qs = get_ibkr_quote_source()
+            if qs is not None:
+                qs.on_connection_lost(cause=cause)
+        except Exception as e:
+            logger.debug("quote_source_disconnect_notify_failed", error=str(e))
+
+    async def _after_connect_restore(self) -> None:
+        """Resubscribe market data after TWS/Gateway reconnect."""
+        self._disconnect_cause = DisconnectCause.UNKNOWN.value
+        self._reconnect_requested = False
+        self._heartbeat_failures = 0
+        self._last_heartbeat_ok = time.time()
+
+        symbols = sorted(self._pending_resubscribe)
+        if not symbols:
+            return
+
+        logger.info(
+            "ibkr_resubscribe_start",
+            symbol_count=len(symbols),
+            symbols_sample=symbols[:15],
+        )
+        try:
+            from data.ibkr_quote_source import get_ibkr_quote_source
+
+            qs = get_ibkr_quote_source()
+            if qs is not None:
+                restored = await qs.restore_streams_after_reconnect(symbols)
+                logger.info(
+                    "ibkr_quote_source_restored",
+                    requested=len(symbols),
+                    restored=restored,
+                    lines_in_use=qs.lines_in_use,
+                    line_budget=qs.line_budget,
+                )
+        except Exception as e:
+            logger.warning("ibkr_quote_source_restore_failed", error=str(e))
+
+        for sym in symbols:
+            if sym not in self._tickers:
+                try:
+                    await self.subscribe_market_data(sym)
+                except Exception as e:
+                    logger.debug("ibkr_legacy_ticker_restore_failed", symbol=sym, error=str(e))
+
+        self._pending_resubscribe.clear()
+        logger.info("ibkr_resubscribe_complete", symbol_count=len(symbols))
 
     def _on_execution(self, trade: Trade, fill: Fill) -> None:
         """
@@ -542,6 +710,17 @@ class IBKRConnector(IBKROrdersMixin, IBKROptionsMixin, IBKRQueriesMixin):
                             # Fetch account values
                             await self._update_account_values()
 
+                        self._last_heartbeat_ok = time.time()
+                        self._heartbeat_failures = 0
+                        logger.info(
+                            "ibkr_connected",
+                            account_id=self.account_id,
+                            client_id=self.client_id,
+                            host=self.host,
+                            port=self.port,
+                            mode=self.mode,
+                        )
+
                         # Start background heartbeat
                         self._start_heartbeat()
 
@@ -561,6 +740,10 @@ class IBKRConnector(IBKROrdersMixin, IBKROptionsMixin, IBKRQueriesMixin):
     async def disconnect(self):
         """Disconnect from IBKR."""
         if self.connected:
+            self._disconnect_cause = DisconnectCause.USER_DISCONNECT.value
+            self._reconnect_requested = False
+            if self._reconnect_task and not self._reconnect_task.done():
+                self._reconnect_task.cancel()
             # Stop heartbeat
             self._stop_heartbeat()
 
@@ -632,14 +815,18 @@ class IBKRConnector(IBKROrdersMixin, IBKROptionsMixin, IBKRQueriesMixin):
         if self.connected:
             return True
 
-        logger.info("Connection lost or not established, attempting reconnect...")
-        self._connected = False  # Reset state
+        logger.info(
+            "ibkr_ensure_connected",
+            cause=self._disconnect_cause,
+            client_id=self.client_id,
+        )
+        self._connected = False
         result = await self.connect()
         if result:
-            # Re-force live data after reconnect
             self.ib.reqMarketDataType(1)
-            logger.info("Re-forced LIVE market data type after reconnect")
+            logger.info("ibkr_market_data_type_live", reason="ensure_connected")
             await self._update_account_values()
+            await self._after_connect_restore()
         return result
 
     async def _wait_for_fill(self, trade, timeout: float = 5.0) -> Dict[str, Any]:
@@ -936,49 +1123,68 @@ class IBKRConnector(IBKROrdersMixin, IBKROptionsMixin, IBKRQueriesMixin):
 
     # ========== HEARTBEAT ==========
 
+    def _heartbeat_interval_s(self) -> float:
+        """Fast poll when unhealthy; slow when connected."""
+        fast = float(os.environ.get("IBKR_HEARTBEAT_FAST_INTERVAL_S", "15"))
+        slow = float(os.environ.get("IBKR_HEARTBEAT_INTERVAL_S", "60"))
+        if not self.connected or self._reconnect_requested:
+            return max(5.0, fast)
+        return max(10.0, slow)
+
     def _start_heartbeat(self):
         """Start background heartbeat to prevent idle disconnect."""
-        self._stop_heartbeat()  # Cancel any existing task
+        self._stop_heartbeat()
         self._heartbeat_task = asyncio.create_task(self._heartbeat_loop())
-        logger.debug("IBKR heartbeat started (60s interval)")
+        logger.info(
+            "ibkr_heartbeat_started",
+            healthy_interval_s=self._heartbeat_interval_s(),
+        )
 
     def _stop_heartbeat(self):
         """Cancel background heartbeat."""
         if self._heartbeat_task and not self._heartbeat_task.done():
             self._heartbeat_task.cancel()
             self._heartbeat_task = None
-            logger.debug("IBKR heartbeat stopped")
+            logger.debug("ibkr_heartbeat_stopped")
 
     async def _heartbeat_loop(self):
-        """Ping broker every 60s to keep connection alive. Auto-reconnect on failure."""
+        """Ping TWS on a cadence; reconnect on loss (incl. Gateway restart)."""
         try:
             while True:
-                await _safe_sleep(60)
+                await _safe_sleep(self._heartbeat_interval_s())
+
                 if not self.connected:
-                    logger.warning("Heartbeat: connection lost, attempting reconnect...")
-                    try:
-                        reconnected = await self.connect()
-                        if reconnected:
-                            logger.info("Heartbeat: reconnected successfully")
-                        else:
-                            logger.error("Heartbeat: reconnect failed, retrying in 60s")
-                    except Exception as e:
-                        logger.error(f"Heartbeat: reconnect error: {e}")
+                    self._disconnect_cause = self._disconnect_cause or DisconnectCause.HEARTBEAT_FAILED.value
+                    logger.warning(
+                        "ibkr_heartbeat_disconnected",
+                        cause=self._disconnect_cause,
+                        failures=self._heartbeat_failures,
+                    )
+                    self._schedule_reconnect(self._disconnect_cause)
                     continue
+
                 try:
                     await self.ib.reqCurrentTimeAsync()
-                    # Re-force live data type on every heartbeat to prevent drift
                     self.ib.reqMarketDataType(1)
-                    logger.debug("Heartbeat OK (live data enforced)")
+                    self._last_heartbeat_ok = time.time()
+                    self._heartbeat_failures = 0
+                    self._reconnect_requested = False
+                    logger.debug(
+                        "ibkr_heartbeat_ok",
+                        client_id=self.client_id,
+                        legacy_tickers=len(self._tickers),
+                    )
                 except Exception as e:
-                    logger.warning(f"Heartbeat failed: {e} — attempting reconnect")
+                    self._heartbeat_failures += 1
                     self._connected = False
-                    try:
-                        reconnected = await self.connect()
-                        if reconnected:
-                            logger.info("Heartbeat: reconnected after failure")
-                    except Exception as re:
-                        logger.error(f"Heartbeat: reconnect error: {re}")
+                    self._disconnect_cause = DisconnectCause.HEARTBEAT_FAILED.value
+                    logger.warning(
+                        "ibkr_heartbeat_failed",
+                        error=str(e),
+                        failures=self._heartbeat_failures,
+                        client_id=self.client_id,
+                    )
+                    self._schedule_reconnect(DisconnectCause.HEARTBEAT_FAILED.value)
         except asyncio.CancelledError:
             pass
 
@@ -1056,44 +1262,58 @@ def get_ibkr_connector() -> IBKRConnector:
 
 async def test_connection():
     """Test IBKR connection."""
+    from core.log_setup import configure_root_logging
+
+    configure_root_logging("ibkr_test.log", verbose=True)
+    log = get_logger("execution.ibkr_test")
     connector = get_ibkr_connector()
 
-    print("Testing IBKR Connection...")
-    print("=" * 50)
+    log.info("ibkr_test_start")
 
     connected = await connector.connect()
     if not connected:
-        print("Failed to connect")
-        print("Ensure TWS/Gateway is running and API connections enabled")
+        log.error(
+            "ibkr_test_connect_failed",
+            hint="Ensure TWS/Gateway is running and API connections enabled",
+        )
         return
 
-    print(f"Connected to account: {connector.account_id}")
+    log.info("ibkr_test_connected", account_id=connector.account_id)
 
-    # Account summary
     summary = await connector.get_account_summary()
-    if 'error' not in summary:
-        print(f"Net Liquidation: ${summary.get('netliquidation', 0):,.2f}")
-        print(f"Cash: ${summary.get('totalcashvalue', 0):,.2f}")
-        print(f"Available Funds: ${summary.get('availablefunds', 0):,.2f}")
+    if "error" not in summary:
+        log.info(
+            "ibkr_test_account",
+            net_liq=summary.get("netliquidation", 0),
+            cash=summary.get("totalcashvalue", 0),
+            available=summary.get("availablefunds", 0),
+        )
 
-    # Positions
     positions = await connector.get_positions()
-    print(f"Positions: {len(positions)}")
+    log.info("ibkr_test_positions", count=len(positions))
     for pos in positions[:5]:
-        print(f"   {pos['symbol']}: {pos['quantity']} @ ${pos['avg_cost']:.2f}")
+        log.info(
+            "ibkr_test_position",
+            symbol=pos.get("symbol"),
+            qty=pos.get("quantity"),
+            avg_cost=pos.get("avg_cost"),
+        )
 
-    # Test streaming
-    print("\nTesting real-time data for SPY (delayed)...")
-    ticker = await connector.subscribe_market_data('SPY', delayed=True)
+    log.info("ibkr_test_spy_delayed_quote")
+    ticker = await connector.subscribe_market_data("SPY", delayed=True)
     if ticker:
-        await _safe_sleep(3)  # Wait longer for delayed data
+        await _safe_sleep(3)
         price = connector.get_realtime_price(ticker)
-        print(f"   Last: ${price.get('last', 'N/A')}")
-        print(f"   Bid/Ask: ${price.get('bid', 'N/A')} / ${price.get('ask', 'N/A')}")
-        await connector.unsubscribe_market_data('SPY')
+        log.info(
+            "ibkr_test_spy_quote",
+            last=price.get("last"),
+            bid=price.get("bid"),
+            ask=price.get("ask"),
+        )
+        await connector.unsubscribe_market_data("SPY")
 
     await connector.disconnect()
-    print("\nTest complete")
+    log.info("ibkr_test_complete")
 
 
 if __name__ == "__main__":

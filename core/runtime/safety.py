@@ -22,13 +22,13 @@ from policy without disturbing this slice.
 
 from __future__ import annotations
 
-import logging
 from dataclasses import dataclass
 from typing import Optional
 
+from core.log_context import get_logger
 from core.runtime.interfaces import BrokerGatewayProtocol, CostTrackerProtocol
 
-logger = logging.getLogger(__name__)
+logger = get_logger(__name__)
 
 
 @dataclass

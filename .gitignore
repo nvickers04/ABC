@@ -163,10 +163,12 @@ id_ed25519*
 # mkdocs documentation
 /site
 
-# mypy
+# mypy / pylint / ruff
 .mypy_cache/
 .dmypy.json
 dmypy.json
+.pylint.d/
+typings/
 
 # Pyre type checker
 .pyre/
@@ -221,14 +223,17 @@ marimo/_static/
 marimo/_lsp/
 __marimo__/
 
-.testmondata
 # ABC Application specific exclusions
 # Result files and logs
 results/
 api_health_metrics.json
-# Temporary files
+# Temporary / editor artifacts
 *.tmp
 *.bak
+*.swp
+*~
+Thumbs.db
+Desktop.ini
 # Vault large files
 tools/vault/vault.exe
 tools/vault/vault.zip
@@ -246,6 +251,9 @@ memory/*.db-journal
 data/vector_db/
 data/local_working_memory.json
 .testmondata
+
+# Local Python tooling (repo uses .venv at root)
+.python-version
 
 # Tigerbeetle large files
 tigerbeetle-data/

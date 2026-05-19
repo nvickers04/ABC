@@ -63,3 +63,12 @@ def configure_root_logging(
     quiet = set(_DEFAULT_QUIET) | set(extra_quiet_loggers)
     for name in quiet:
         logging.getLogger(name).setLevel(logging.WARNING)
+
+    try:
+        from core.log_context import configure_structlog
+
+        configure_structlog(verbose=verbose)
+    except Exception:
+        logging.getLogger(__name__).debug(
+            "structlog setup skipped", exc_info=True
+        )

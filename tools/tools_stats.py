@@ -1,10 +1,11 @@
 """Observability and performance stats — broker P&L + LLM costs only."""
 
-import logging
 from datetime import date
 from typing import Any
 
-logger = logging.getLogger(__name__)
+from core.log_context import get_logger
+
+logger = get_logger(__name__)
 
 
 # ---------------------------------------------------------------------------

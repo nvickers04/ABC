@@ -1,0 +1,16 @@
+# Production override — research machine (two-host split).
+#
+# Use ONLY on the research host. Never run abc-trader on this machine.
+#
+#   docker compose `
+#     -f infra/runtime/docker-compose.research.yml `
+#     -f infra/runtime/examples/docker-compose.prod.research.yml `
+#     --env-file .env up -d --build
+
+services:
+  abc-research:
+    environment:
+      ABC_RESEARCH_HOST: "1"
+      IBKR_QUOTES_ENABLED: "0"
+      DOCKER_HEALTHCHECK_MDA: "0"
+    command: ["python", "-m", "research"]

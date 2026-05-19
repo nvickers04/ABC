@@ -3,6 +3,8 @@
 **Single source of truth** for how to start each process. Implementation paths are
 listed for navigation only — always use the commands below, not duplicate root scripts.
 
+**See also:** [plain-english-glossary.md](plain-english-glossary.md) · [README.md](README.md) · [operations/deployment.md](operations/deployment.md)
+
 Run **`python __main__.py --help`** or **`python -m research --help`** for full flag
 lists, defaults, and copy-paste examples. Shared definitions live in `core/entry_cli.py`.
 
@@ -31,14 +33,18 @@ Research host alternatives:
 # From repo root (same as python -m research)
 .\scripts\run_research.ps1 -Verbose
 
-# Docker
-docker compose -f infra/runtime/docker-compose.research.yml --env-file .env up -d --build
+# Docker (production — see infra/runtime/examples/ for dev override)
+docker compose -f infra/runtime/docker-compose.research.yml `
+  -f infra/runtime/examples/docker-compose.prod.research.yml `
+  --env-file .env up -d --build
 ```
 
 Trader Docker:
 
 ```powershell
-docker compose -f infra/runtime/docker-compose.trader.yml --env-file .env up -d --build
+docker compose -f infra/runtime/docker-compose.trader.yml `
+  -f infra/runtime/examples/docker-compose.prod.trader.yml `
+  --env-file .env up -d --build
 ```
 
 Full layout: [operations/deployment.md](operations/deployment.md).  
@@ -67,9 +73,15 @@ Pre-live gates: [operations/launch-checklist.md](operations/launch-checklist.md)
 
 | Variable | Effect |
 |----------|--------|
+| `TRADING_MODE` | `paper` (default), `aggressive_paper`, or `live` — must match `IBKR_ACCOUNT_TYPE` (validated at startup) |
+| `RISK_PER_TRADE` | Percent of cash per trade (e.g. `1.0` = 1%); live mode capped at 2% |
+| `DATABASE_URL` | Postgres DSN (`postgresql://…`); validated when set |
 | `TRADER_IN_PROCESS_SCORER=never` | Same hard gate as `--require-research-host` (also `0`, `false`, `off`, `no`) |
 | `XAI_API_KEY` / `GROK_API_KEY` | Required unless `--test` |
 | `IBKR_ACCOUNT_TYPE` | Overridden by `--account` when passed |
+
+Startup check: `python -c "from core.config import validate_config; print(validate_config() or 'OK')"`
+Settings implementation: `core/settings.py` (Pydantic), re-exported via `core/config.py`.
 
 ### Research host — `python -m research`
 
@@ -111,15 +123,19 @@ Typical local loop: terminal 1 → `python -m research --verbose`; terminal 2 �
 
 | Script | Purpose |
 |--------|---------|
-| `python scripts/health.py researcher` | Heartbeat, daily usage, last scoring round |
-| `python scripts/health.py trader` | FULL vs INDEPENDENT mode, WM source, risk multiplier |
-| `python scripts/health.py` | Both checks |
-| `python scripts/verify_trader_db.py` | Postgres reachability + migrations (trader host) |
-| `python scripts/smoke_tools.py --client-id <id>` | Paper-safe tool sweep |
+| `python scripts/health.py researcher` | Postgres, heartbeat, token cap, MDA, scoring/evolution (exit 0/1/2) |
+| `python scripts/health.py trader` | Same + operating mode; optional `--ibkr-client-id` for TWS probe |
+| `python scripts/health.py` | Both sections |
+| `python scripts/verify_trader_db.py` | Postgres ping, `init_db`, core tables, heartbeat, token cap |
+| `python scripts/smoke_tools.py --platform-only` | Platform checks only (no tools) |
+| `python scripts/smoke_tools.py --preflight --client-id <id>` | Platform + IBKR + open_orders summary |
+| `python scripts/smoke_tools.py --client-id <id>` | Platform checks + paper-safe tool sweep |
 | `python scripts/smoke_tools.py --client-id <id> --all` | Safe + broker-mutating tools |
 | `scripts/run_research.ps1` | Windows: same as `python -m research` (`-Verbose`, `-NoEvolution`) |
 | `scripts/backup_postgres.ps1` | DB backup (Windows) |
 | `scripts/watch_research.ps1` | List `python -m research` PIDs + tail log |
+
+**Exit codes** (health, verify_trader_db, smoke platform checks): **0** healthy · **1** warnings · **2** failures. Use `--no-color` for plain logs. See [plain-english-glossary.md](plain-english-glossary.md#health-scripts-exit-codes).
 
 ---
 
@@ -146,4 +162,4 @@ These paths were deleted; grep the repo if docs or scripts still mention them:
 - `python scripts/check_researcher.py` / `check_trader.py` → use `scripts/health.py`
 - `python scripts/smoke_trader_tools.py` (and `smoke_all_tools`, `smoke_order_tools`) → use `scripts/smoke_tools.py`
 
-See also [engineering.md](engineering.md) (file-move rules).
+**See also:** [plain-english-glossary.md](plain-english-glossary.md) · [codebase-layout.md](codebase-layout.md) · [engineering.md](engineering.md) · [operations/deployment.md](operations/deployment.md)

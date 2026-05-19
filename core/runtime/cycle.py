@@ -13,15 +13,15 @@ The function takes the agent as its state container (it reads/writes
 
 from __future__ import annotations
 
-import logging
-from datetime import datetime, timezone, timedelta
+from datetime import datetime, timedelta, timezone
 from typing import Any
 
 from core.config import OPEN_GAP_GUARD_PCT, OPEN_GUARD_DELAY_MINUTES
+from core.log_context import get_logger
 from data.data_provider import get_data_provider
 from data.market_hours import get_market_hours_provider
 
-logger = logging.getLogger(__name__)
+logger = get_logger(__name__)
 
 
 async def evaluate_gap_guard(agent: Any) -> str:
@@ -58,10 +58,16 @@ async def evaluate_gap_guard(agent: Any) -> str:
                 if mins_elapsed <= 5:
                     try:
                         dp = get_data_provider()
-                        spy_quote = await dp.get_quote("SPY")
+                        spy_quote = dp.get_quote("SPY")
                         if spy_quote:
-                            last = spy_quote.get("last", 0) or spy_quote.get("close", 0)
-                            prev_close = spy_quote.get("previous_close", 0) or spy_quote.get("close", 0)
+                            if isinstance(spy_quote, dict):
+                                last = spy_quote.get("last", 0) or spy_quote.get("close", 0)
+                                prev_close = spy_quote.get("previous_close", 0) or spy_quote.get("close", 0)
+                            else:
+                                last = getattr(spy_quote, "last", None) or 0
+                                prev_close = getattr(spy_quote, "previous_close", None) or getattr(
+                                    spy_quote, "close", None
+                                ) or last
                             if last > 0 and prev_close > 0:
                                 gap_pct = abs(last - prev_close) / prev_close * 100
                                 if gap_pct >= OPEN_GAP_GUARD_PCT:

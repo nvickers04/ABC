@@ -1,3 +1,7 @@
+networks:
+  default:
+    name: postgres_default
+
 services:
   postgres:
     image: postgres:16

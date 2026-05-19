@@ -1,13 +1,11 @@
-# Trader image: runs the full Grok ReAct agent (__main__.py) with IBKR + LLM.
-# Requires host TWS/Gateway (paper 7497 or live 7496) reachable via host-gateway.
-# Pairs with research host (python -m research) on same or separate machine sharing Postgres.
-# Usage: docker compose -f infra/runtime/docker-compose.trader.yml --env-file .env up -d --build
+# Trader image: Grok ReAct agent (__main__.py) with IBKR + LLM.
+# Requires host TWS/Gateway (paper 7497 / live 7496) via host.docker.internal.
 FROM python:3.11-slim-bookworm
 
 ENV PYTHONUNBUFFERED=1 \
     PYTHONDONTWRITEBYTECODE=1 \
-    # Default to require-daemon for production (override in .env or compose for dev)
-    TRADER_IN_PROCESS_SCORER=never
+    TRADER_IN_PROCESS_SCORER=never \
+    DOCKER_HEALTHCHECK_REQUIRE_RESEARCH=0
 
 WORKDIR /app
 
@@ -17,23 +15,8 @@ RUN pip install --no-cache-dir --upgrade pip \
 
 COPY . .
 
-# Healthcheck: simple Python check that config loads and (if possible) heartbeat/DB reachable.
-# In production the operator monitors logs + research host heartbeat (python -m research).
-HEALTHCHECK --interval=60s --timeout=10s --start-period=30s --retries=3 \
-    CMD python -c "
-import os, sys
-try:
-    from dotenv import load_dotenv; load_dotenv(override=False)
-    from core.config import validate_config, TRADING_MODE
-    errs = validate_config()
-    if errs: 
-        print('Config errors:', errs, file=sys.stderr)
-        sys.exit(1)
-    print(f'Trader health OK (mode={TRADING_MODE})')
-except Exception as e:
-    print('Healthcheck failed:', e, file=sys.stderr)
-    sys.exit(1)
-" || exit 1
+# Override in compose: prod uses --require-research-host; dev uses --verbose only.
+CMD ["python", "__main__.py", "--require-research-host", "--verbose"]
 
-# Default: require clean daemon handoff (production). Use --require-daemon explicitly too.
-CMD ["python", "__main__.py", "--require-daemon"]
+HEALTHCHECK --interval=60s --timeout=20s --start-period=60s --retries=3 \
+    CMD ["python", "scripts/docker_healthcheck.py", "trader"]

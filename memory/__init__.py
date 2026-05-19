@@ -52,7 +52,7 @@ def set_research_config(key: str, value: float, reason: str = "") -> None:
 # LATEST QUOTES (real-time stock NBBO mirror)
 # ═══════════════════════════════════════════════════════════════
 # Written by IBKRQuoteSource on every successful tick read.
-# Read by the future research daemon (so it doesn't need its own
+# Read by the research host (so it doesn't need its own
 # IBKR streaming subscription) and by anything that wants a
 # point-in-time look at what the trader most recently saw.
 

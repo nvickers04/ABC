@@ -86,7 +86,7 @@ PostgreSQL only allows the **table owner** (or superuser) to run `CREATE INDEX` 
 Get-Content "infra/postgres/admin/create_abc_app_role.sql" -Raw | docker exec -i abc-postgres psql -U postgres -d abc_shared -v ON_ERROR_STOP=1
 ```
 
-2. Pause research daemon and trader DB connections (avoid lock waits on `REASSIGN OWNED`).
+2. Pause the research host (`python -m research`) and trader DB connections (avoid lock waits on `REASSIGN OWNED`).
 
 3. Reassign ownership:
 

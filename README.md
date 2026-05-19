@@ -57,10 +57,17 @@ Details, dev single-machine modes, Docker, and scripts: **[docs/entry-points.md]
 ```bash
 git clone https://github.com/nvickers04/ABC.git
 cd ABC
+python -m venv .venv
+# Windows PowerShell:
+.\.venv\Scripts\Activate.ps1
+# macOS/Linux:
+# source .venv/bin/activate
 pip install -r requirements.txt
 cp .env.template .env
 # Edit .env: GROK_API_KEY, IBKR credentials, DATABASE_URL (Postgres)
 ```
+
+Use **one** virtual environment at `.venv` in the repo root. Do not commit `.venv/` (or accidental `.venv-1/` copies from the IDE). `scripts/run_research.ps1` prefers `.venv\Scripts\python.exe` when present.
 
 Start **TWS or IB Gateway** (paper port 7497) before the trader.
 

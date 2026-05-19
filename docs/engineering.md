@@ -16,6 +16,12 @@ Cursor enforces this in `.cursor/rules/docs-and-file-moves.mdc`.
 Canonical process commands: [entry-points.md](entry-points.md).  
 Module map and migration status: [codebase-layout.md](codebase-layout.md).
 
+### Python environment
+
+- Use **one** venv at repo root: `.venv` (`python -m venv .venv`, then `pip install -r requirements.txt`).
+- **Do not** commit `.venv/`, `.venv-1/`, or other IDE-created copies (all ignored via `.gitignore`).
+- `scripts/run_research.ps1` uses `.venv\Scripts\python.exe` when it exists.
+
 **Removed paths (do not recreate):** `research_daemon.py`, `research/daemon.py` (use `research/host.py`), `docs/data-sources/*`,
 `docs/PLAN_*.md`, `docs/*_HOST_SETUP.md`, split engineering checklists,
 `scripts/check_researcher.py`, `scripts/check_trader.py`, `scripts/smoke_*_tools.py`

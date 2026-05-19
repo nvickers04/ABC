@@ -387,7 +387,7 @@ class MarketDataClient:
                 pct = self._credits_remaining / self._credits_limit
                 if pct < 0.35 and not getattr(self, "_mda_warned_35", False):
                     logger.warning(
-                        "MDA credits moderate: %s / %s remaining (%.0f%%) — research daemon will "
+                        "MDA credits moderate: %s / %s remaining (%.0f%%) — research host will "
                         "pace harder and may skip sub-daily bundles",
                         f"{self._credits_remaining:,}",
                         f"{self._credits_limit:,}",

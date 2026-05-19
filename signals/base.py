@@ -77,7 +77,7 @@ class Signal(ABC):
 
     # If True, this signal needs a live IBKR connection to produce
     # meaningful output (e.g. NYSE auction-imbalance generic ticks).
-    # The research daemon (which has IBKR quotes disabled) skips these
+    # The research host (which has IBKR quotes disabled) skips these
     # signals entirely; they only run inside the trader process.
     requires_ibkr: bool = False
 

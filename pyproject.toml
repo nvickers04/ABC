@@ -6,7 +6,7 @@
 [project]
 name = "abc-grok-trader"
 version = "0.0.0"
-description = "Grok autonomous trader — research daemon + IBKR trader"
+description = "Grok autonomous trader — research host (python -m research) + IBKR trader"
 readme = "README.md"
 requires-python = ">=3.11"
 

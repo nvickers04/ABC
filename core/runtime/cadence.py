@@ -80,7 +80,7 @@ Why these tiers map to real signal value
   those move overnight.  30 min keeps them fresh enough for the next
   open.
 
-These thresholds are the source of truth for daemon cadence.
+These thresholds are the source of truth for research-host cadence.
 """
 
 from __future__ import annotations
@@ -149,7 +149,7 @@ def session_label(dt: Optional[datetime] = None) -> str:
 
 
 def cadence_seconds(dt: Optional[datetime] = None) -> int:
-    """Seconds the research daemon should sleep before the next round."""
+    """Seconds the research host should sleep before the next round."""
     label = session_label(dt)
     if label == "regular":
         return CADENCE_REGULAR_S
@@ -185,7 +185,7 @@ BASE_EVERY_N_OVERNIGHT: int = 1
 def base_universe_every_n_rounds(dt: Optional[datetime] = None) -> int:
     """How often to include the static base universe in a scoring round.
 
-    Returns 1 = every round, 3 = every third round, etc.  The daemon
+    Returns 1 = every round, 3 = every third round, etc.  The research host
     always scores the focus set (positions/attention) every round; this
     governs only the base.
     """

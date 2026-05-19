@@ -66,7 +66,7 @@ MAX_CREDITS_PER_ROUND = 200         # Circuit breaker
 OPTION_CHAIN_DTE_RANGE = (7, 60)    # Limit DTE to reduce response size
 OPTION_CHAIN_STRIKE_LIMIT = 20      # Max strikes per expiration (server-side filter)
 
-# ── Market Data App adaptive pacing (research daemon) ────────────
+# ── Market Data App adaptive pacing (research host) ──────────────
 # Uses X-Api-Ratelimit-* headers from responses (authoritative). Ratios
 # are credits_remaining / credits_limit. When unknown (before first HTTP),
 # the scorer runs normally until headers arrive.

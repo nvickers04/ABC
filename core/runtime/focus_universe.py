@@ -1,7 +1,7 @@
 """
 Focus universe — the symbols the trader is actively engaged with.
 
-Used by the research daemon to score "things the trader cares about
+Used by the research host to score "things the trader cares about
 right now" every round, while the static base universe (research/config.py
 RESEARCH_UNIVERSE) is sampled less frequently.
 
@@ -13,7 +13,7 @@ The trader registers attention triggers for:
     * symbols flagged from working_memory (auto-synced)
 
 So the active-trigger set is a clean proxy for "trader interest right
-now" without the daemon having to open an IBKR connection of its own.
+now" without the research host having to open an IBKR connection of its own.
 
 This module is pure read-only on the SQLite layer; no IBKR, no MDA.
 """

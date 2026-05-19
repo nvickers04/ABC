@@ -2,7 +2,7 @@
 -- Required so both research_user and trader_user can run memory.init_db() DDL
 -- after SET ROLE abc_app (see DATABASE_APP_ROLE in root .env.template).
 --
--- IMPORTANT: Stop research daemon and trader connections first, or this can
+-- IMPORTANT: Stop research host and trader connections first, or this can
 -- block waiting for ACCESS EXCLUSIVE locks on tables.
 --
 -- Prerequisites: create_abc_app_role.sql applied (or init 02 on new DBs).

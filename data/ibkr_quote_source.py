@@ -22,7 +22,7 @@ DESIGN
   or no tick has arrived yet, get_quote() returns None.  Callers must
   abstain.  We never silently fall back to delayed data.
 - latest_quotes table: every successful tick is written so the future
-  research daemon can read what the trader saw without holding its
+  research host can read what the trader saw without holding its
   own IBKR connection.
 """
 

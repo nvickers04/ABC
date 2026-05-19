@@ -142,7 +142,7 @@ async def run_research(*, verbose: bool = False, use_cadence: bool = False) -> N
       3. Tier 3: Template selection for top 8
       4. Compute forward returns, run combiner, persist results
 
-    When ``use_cadence`` is True (research-daemon mode) the loop sleeps
+    When ``use_cadence`` is True (research-host mode) the loop sleeps
     according to ``core.runtime.cadence.cadence_seconds()`` between
     rounds instead of ``ROUND_DELAY_SECS``.
     """
@@ -286,7 +286,7 @@ async def _scoring_round(dp, conn, round_num: int) -> int:
     credits_used = 0
 
     # ── Universe ────────────────────────────────────────────
-    # The daemon scores two tiers of symbols:
+    # The research host scores two tiers of symbols:
     #   * focus  — symbols the trader is actively engaged with (active
     #              attention triggers; usually held + watched names).
     #              Scored EVERY round so positions are freshest.
@@ -404,7 +404,7 @@ async def _scoring_round(dp, conn, round_num: int) -> int:
 
     # ── Tier 1: Score cheap signals (40 signals, full universe) ─
     # Skip signals that require an IBKR connection when this process
-    # has IBKR quotes disabled (e.g. the research daemon).  The trader
+    # has IBKR quotes disabled (e.g. the research host).  The trader
     # process runs them and writes their scores directly.
     _ibkr_on = bool(getattr(_core_config, "IBKR_QUOTES_ENABLED", False))
     tier1_signals = {

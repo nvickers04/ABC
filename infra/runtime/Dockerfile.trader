@@ -1,6 +1,6 @@
 # Trader image: runs the full Grok ReAct agent (__main__.py) with IBKR + LLM.
 # Requires host TWS/Gateway (paper 7497 or live 7496) reachable via host-gateway.
-# Pairs with research daemon on same or separate host sharing Postgres.
+# Pairs with research host (python -m research) on same or separate machine sharing Postgres.
 # Usage: docker compose -f infra/runtime/docker-compose.trader.yml --env-file .env up -d --build
 FROM python:3.11-slim-bookworm
 

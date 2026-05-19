@@ -1,5 +1,5 @@
 """
-Market Data App credit monitoring and adaptive pacing for the research daemon.
+Market Data App credit monitoring and adaptive pacing for the research host.
 
 MDA exposes daily credits via response headers (``X-Api-Ratelimit-*``). The
 singleton :class:`data.marketdata_client.MarketDataClient` tracks the latest

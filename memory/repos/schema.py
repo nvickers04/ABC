@@ -735,7 +735,7 @@ def init_db():
 
         -- Latest real-time stock quote per symbol (single row per symbol;
         -- written by the IBKRQuoteSource on every successful tick read).
-        -- Exists so the future research daemon can read what the trader
+        -- Exists so the research host can read what the trader
         -- saw without holding its own IBKR streaming subscription.
         CREATE TABLE IF NOT EXISTS latest_quotes (
             symbol TEXT PRIMARY KEY,

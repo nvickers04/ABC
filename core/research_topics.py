@@ -1,7 +1,6 @@
 """Topic categorization for the agent's research cache TTL policy.
 
-Extracted verbatim from :mod:`core.agent` (PR14). The originals in
-``core.agent`` now delegate here via thin shims for back-compat.
+Research cache TTL categorization for agent research queries.
 """
 
 from __future__ import annotations

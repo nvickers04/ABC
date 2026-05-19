@@ -216,9 +216,9 @@ class OperatingContext:
         Returns True when the researcher is considered available.
         """
         try:
-            from core.runtime.heartbeat import is_daemon_alive
+            from core.runtime.heartbeat import is_research_host_alive
 
-            alive = bool(is_daemon_alive())
+            alive = bool(is_research_host_alive())
         except Exception:
             alive = False
 

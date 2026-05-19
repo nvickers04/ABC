@@ -24,7 +24,7 @@ from pathlib import Path
 
 
 async def _run(*, verbose: bool, run_evolution: bool) -> None:
-    logger = logging.getLogger("research.daemon")
+    logger = logging.getLogger("research.host")
     from memory import init_db
 
     init_db()
@@ -63,7 +63,7 @@ def main() -> None:
         verbose=args.verbose,
         extra_quiet_loggers=("yfinance", "peewee"),
     )
-    logger = logging.getLogger("research.daemon")
+    logger = logging.getLogger("research.host")
 
     for stream in (sys.stdout, sys.stderr):
         try:

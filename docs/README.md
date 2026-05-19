@@ -19,3 +19,4 @@
 | [data-sources.md](data-sources.md) | Providers and process ownership |
 | [signal-formula-spec.md](signal-formula-spec.md) | Signal math contracts |
 | [engineering.md](engineering.md) | PR checklist, impact map, glossary, file-move rules |
+| [codebase-layout.md](codebase-layout.md) | Where code lives; canonical imports; migration backlog |

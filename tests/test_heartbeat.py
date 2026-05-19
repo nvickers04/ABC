@@ -11,9 +11,9 @@ import pytest
 # (dotenv + reset_state + graceful skip on Postgres connection/permission errors).
 
 def test_read_when_never_written_returns_zero():
-    from core.runtime.heartbeat import read_heartbeat, is_daemon_alive
+    from core.runtime.heartbeat import read_heartbeat, is_research_host_alive
     assert read_heartbeat() == 0.0
-    assert is_daemon_alive() is False
+    assert is_research_host_alive() is False
 
 
 def test_write_then_read_round_trips():
@@ -24,18 +24,18 @@ def test_write_then_read_round_trips():
     assert read_heartbeat() == pytest.approx(ts)
 
 
-def test_is_daemon_alive_fresh_heartbeat():
-    from core.runtime.heartbeat import write_heartbeat, is_daemon_alive
+def test_research_host_alive_fresh_heartbeat():
+    from core.runtime.heartbeat import write_heartbeat, is_research_host_alive
     now = time.time()
     write_heartbeat(now=now)
-    assert is_daemon_alive(stale_after_s=60.0) is True
+    assert is_research_host_alive(stale_after_s=60.0) is True
 
 
-def test_is_daemon_alive_stale_heartbeat():
-    from core.runtime.heartbeat import write_heartbeat, is_daemon_alive
+def test_research_host_alive_stale_heartbeat():
+    from core.runtime.heartbeat import write_heartbeat, is_research_host_alive
     now = time.time()
     write_heartbeat(now=now - 120.0)  # 2 min ago
-    assert is_daemon_alive(stale_after_s=60.0, now=now) is False
+    assert is_research_host_alive(stale_after_s=60.0, now=now) is False
 
 
 def test_heartbeat_age_s_infinite_when_unset():

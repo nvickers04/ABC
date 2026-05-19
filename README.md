@@ -40,7 +40,7 @@ Grok (ReAct Brain)  →  Tools (thin wrappers)  →  IBKR Execution
 └── pyproject.toml     # Pytest config; research host: python -m research
 ```
 
-**Documentation:** [docs/README.md](docs/README.md) · **[Entry points](docs/entry-points.md)** (what to run on each host)
+**Documentation:** [docs/README.md](docs/README.md) · [Entry points](docs/entry-points.md) · [Code layout](docs/codebase-layout.md)
 
 ## Entry points (summary)
 

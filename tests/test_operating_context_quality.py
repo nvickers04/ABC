@@ -67,7 +67,7 @@ def test_sync_researcher_from_heartbeat(monkeypatch):
 
     ctx = get_operating_context()
     monkeypatch.setattr(
-        "core.runtime.heartbeat.is_daemon_alive",
+        "core.runtime.heartbeat.is_research_host_alive",
         lambda: True,
     )
     assert ctx.sync_researcher_from_heartbeat() is True
@@ -76,7 +76,7 @@ def test_sync_researcher_from_heartbeat(monkeypatch):
     assert ctx.is_independent_mode is False
 
     monkeypatch.setattr(
-        "core.runtime.heartbeat.is_daemon_alive",
+        "core.runtime.heartbeat.is_research_host_alive",
         lambda: False,
     )
     assert ctx.sync_researcher_from_heartbeat() is False

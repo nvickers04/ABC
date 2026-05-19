@@ -116,7 +116,7 @@ Paper soak before live: see [launch-checklist.md](launch-checklist.md).
 |-------|---------|---------|
 | Researcher | `python scripts/health.py researcher` | Heartbeat fresh, usage under cap |
 | Trader mode | `python scripts/health.py trader` | Mode FULL or expected INDEPENDENT |
-| Heartbeat (quick) | `python -c "from core.runtime.heartbeat import is_daemon_alive, heartbeat_age_s; print(is_daemon_alive(), heartbeat_age_s())"` | `True`, age low |
+| Heartbeat (quick) | `python -c "from core.runtime.heartbeat import is_research_host_alive, heartbeat_age_s; print(is_research_host_alive(), heartbeat_age_s())"` | `True`, age low |
 | DB | `python scripts/verify_trader_db.py` | Exit 0 (trader host) |
 
 Research token usage query:

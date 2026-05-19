@@ -1,8 +1,6 @@
 """Best-effort JSON parsing helpers for LLM output.
 
-Extracted verbatim from :mod:`core.agent` (PR14). Pure functions with
-no agent state — safe to import from anywhere. The originals in
-``core.agent`` now delegate here via thin shims for back-compat.
+Pure functions with no agent state — import from this module directly.
 """
 
 from __future__ import annotations

@@ -22,11 +22,11 @@ if str(_ROOT) not in sys.path:
 
 def _check_researcher() -> int:
     from core.config import RESEARCHER_DAILY_TOKEN_CAP
-    from core.runtime.heartbeat import heartbeat_age_s, is_daemon_alive
+    from core.runtime.heartbeat import heartbeat_age_s, is_research_host_alive
     from memory import get_db, get_research_config
 
     print("=== ABC Researcher Health ===\n")
-    alive = is_daemon_alive()
+    alive = is_research_host_alive()
     age = heartbeat_age_s()
     print(f"Daemon heartbeat alive:     {alive}")
     print(f"Heartbeat age:              {round(age, 1)} seconds")
@@ -85,14 +85,14 @@ def _check_trader() -> int:
 
     load_dotenv(_ROOT / ".env", override=True)
 
-    from core.runtime.heartbeat import heartbeat_age_s, is_daemon_alive
+    from core.runtime.heartbeat import heartbeat_age_s, is_research_host_alive
     from core.runtime.local_memory_fallback import LOCAL_MEMORY_FILE
     from core.runtime.operating_context import get_operating_context
 
     print("=== ABC Trader Status ===\n")
     ctx = get_operating_context()
     try:
-        researcher_alive = is_daemon_alive()
+        researcher_alive = is_research_host_alive()
         hb_age = heartbeat_age_s()
     except Exception:
         researcher_alive = False

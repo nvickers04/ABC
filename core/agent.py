@@ -69,21 +69,8 @@ def _truncate_for_react_context(text: str, max_chars: int) -> str:
     return text[:room] + marker
 
 
-# ── Research Cache Entry ────────────────────────────────────────
-# Implementations live in core.research_topics and core.json_parse
-# (PR14 extraction). Re-exported here for back-compat with any
-# external callers and with internal uses below.
-
-from core.research_topics import (  # noqa: E402,F401
-    _TICKER_SYMBOLS,
-    _categorize_query,
-    _get_ticker_symbols,
-)
-from core.json_parse import (  # noqa: E402,F401
-    _close_truncated_json,
-    _parse_json_objects,
-    _try_repair_json,
-)
+from core.json_parse import _parse_json_objects
+from core.research_topics import _categorize_query
 
 
 # Note: _now_et is now defined in core.runtime.scheduler and re-imported above
@@ -313,7 +300,7 @@ class TradingAgent:
     async def _run_daily_review(self) -> None:
         """End-of-day review: aggregate performance, run execution analysis if data threshold met.
 
-        Thin shim — body lives in :mod:`core.runtime.review` (PR21).
+        Delegates to :mod:`core.runtime.review`.
         """
         from core.runtime.review import run_daily_review
         await run_daily_review(self)
@@ -621,18 +608,13 @@ If no changes warranted: []"""
     def _evaluate_risk_ramp(self, db, today: str) -> None:
         """Check if live trading performance warrants risk ramp-up.
 
-        Thin shim — body lives in :mod:`core.runtime.review` (PR28).
+        Delegates to :mod:`core.runtime.review`.
         """
         from core.runtime.review import evaluate_risk_ramp
         evaluate_risk_ramp(db, today)
 
     async def _build_state_context(self) -> str:
-        """Thin shim that delegates to :class:`StateContextBuilder`.
-
-        Kept on the agent so existing callers (notably
-        ``tools._state_builder = agent._build_state_context``) continue
-        to work without changes.
-        """
+        """Delegates to :class:`StateContextBuilder` (see ``tools._state_builder``)."""
         return await self._state_context_builder.build()
 
     async def run_cycle(self) -> int:
@@ -1169,15 +1151,4 @@ async def run_agent():
                 pass
 
 
-if __name__ == "__main__":
-    logging.basicConfig(
-        level=logging.INFO,
-        format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
-    )
-    for lib in ("httpx", "httpcore", "grpc", "xai_sdk",
-                "ib_insync.wrapper",
-                "ib_insync.ib", "ib_insync.client", "ib_insync.decoder",
-                "ib_insync.connection", "ib_insync.flexreport", "ib_insync.order",
-                "asyncio", "nest_asyncio"):        logging.getLogger(lib).setLevel(logging.WARNING)
-    print("Grok Trader started (paper mode recommended)")
-    asyncio.run(run_agent())
+# Trader entry point: python __main__.py (see docs/entry-points.md).

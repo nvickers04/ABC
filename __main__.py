@@ -157,10 +157,10 @@ def main():
         # --require-daemon / TRADER_IN_PROCESS_SCORER=never → hard-fail if no fresh heartbeat
         # --force-in-process → always run scorer in-process (dev/debug; wins over env gate)
         # default (auto) → fresh research host heartbeat → skip in-process scorer
-        from core.runtime.heartbeat import is_daemon_alive, heartbeat_age_s
+        from core.runtime.heartbeat import heartbeat_age_s, is_research_host_alive
         from core.config import TRADER_IN_PROCESS_SCORER_NEVER
 
-        daemon_alive = is_daemon_alive()
+        daemon_alive = is_research_host_alive()
         require_daemon = bool(args.require_daemon or TRADER_IN_PROCESS_SCORER_NEVER)
 
         if args.force_in_process:

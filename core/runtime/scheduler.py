@@ -44,12 +44,6 @@ def _now_et() -> datetime:
     return datetime.now(ZoneInfo("America/New_York"))
 
 
-# Back-compat alias: the public protocol now lives in core.runtime.interfaces.
-# Existing tests / stubs that imported `_WakeBusProtocol` from this module
-# continue to work; new code should use `WakeBusProtocol`.
-_WakeBusProtocol = WakeBusProtocol
-
-
 class _AgentProtocol(Protocol):
     """Subset of ``TradingAgent`` the scheduler reads / writes."""
 

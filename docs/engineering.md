@@ -13,7 +13,8 @@ When moving or consolidating docs, scripts, or entry points:
 - **No extra root shims** — prefer `python -m <package>` or `scripts/` launchers; implementation lives in the package (e.g. `research/daemon.py`).
 
 Cursor enforces this in `.cursor/rules/docs-and-file-moves.mdc`.  
-Canonical process commands: [entry-points.md](entry-points.md).
+Canonical process commands: [entry-points.md](entry-points.md).  
+Module map and migration status: [codebase-layout.md](codebase-layout.md).
 
 **Removed paths (do not recreate):** `research_daemon.py`, `docs/data-sources/*`,
 `docs/PLAN_*.md`, `docs/*_HOST_SETUP.md`, split engineering checklists,

@@ -1,6 +1,6 @@
 """End-of-day review extracted from ``core.agent.TradingAgent``.
 
-Pure refactor (PR21) — moves the body of ``_run_daily_review`` into a free
+Daily review and risk-ramp logic extracted from ``TradingAgent``.
 async function that takes the agent as its first argument. ``TradingAgent``
 keeps a thin method that delegates here so the rest of the codebase is
 unaffected.

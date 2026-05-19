@@ -4,7 +4,7 @@ Research host heartbeat helpers.
 Stores the research host's last scoring-round timestamp in ``research_config``
 under ``HEARTBEAT_KEY`` (``daemon_heartbeat_ts`` — key name is historical).
 
-The trader reads ``is_daemon_alive(stale_after_s)`` on startup and each cycle.
+The trader reads ``is_research_host_alive(stale_after_s)`` on startup and each cycle.
 When fresh, the trader skips its in-process scorer. When stale, it may fall back
 to single-process scoring (unless ``--require-daemon`` / ``TRADER_IN_PROCESS_SCORER=never``).
 """
@@ -48,9 +48,9 @@ def read_heartbeat() -> float:
         return 0.0
 
 
-def is_daemon_alive(stale_after_s: Optional[float] = None,
-                    *, now: Optional[float] = None) -> bool:
-    """True iff a heartbeat exists and is fresh enough for the current cadence tier.
+def is_research_host_alive(stale_after_s: Optional[float] = None,
+                         *, now: Optional[float] = None) -> bool:
+    """True iff the research host heartbeat exists and is fresh for the cadence tier.
 
     When ``stale_after_s`` is None (the common case) the threshold is
     derived from the current cadence: ``3 × cadence_seconds() + 60``,
@@ -80,3 +80,7 @@ def heartbeat_age_s(now: Optional[float] = None) -> float:
         return float("inf")
     cur = float(now) if now is not None else time.time()
     return max(0.0, cur - last)
+
+
+# Back-compat alias — prefer is_research_host_alive in new code.
+is_daemon_alive = is_research_host_alive

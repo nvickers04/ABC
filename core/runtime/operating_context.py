@@ -1,26 +1,28 @@
-"""
-Operating Context & Context Quality for the Trader.
+"""Trader operating mode: researcher availability, context quality, QualityMatrix bridge.
 
-This is the central place where the trader tracks:
-- Whether the researcher is available
-- What source its durable memory is coming from (Postgres vs local fallback)
-- The overall quality/reliability of the information it has available
+Tracks whether the research host is alive, which durable memory backend is active,
+and how conservative the trader should be. Feeds:
 
-The goal is to make the agent explicitly aware of the quality of its own context
-so it can reason about it (via tools) and so the system can enforce hard policies
-when quality is low (Independent Mode / researcher unavailable).
+* **Prompt text** — :meth:`ContextQuality.to_prompt_block`, matrix via
+  :attr:`OperatingContext.quality_matrix`
+* **Risk posture** — :attr:`OperatingContext.risk_multiplier` blends context-only
+  and :class:`~core.quality.quality_matrix.QualityMatrix` policy
+* **WM routing** — :attr:`OperatingContext.is_independent_mode` drives
+  :func:`~core.runtime.working_memory_access.get_active_working_memory`
 
-This is designed for day-trading resilience first.
+Hard tool gates and provenance recording live in :mod:`core.quality`; this module
+holds mode flags and syncs with the research host heartbeat.
 """
 
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
-from typing import Any, Dict, List, Literal, Optional
+from typing import Any, Literal, Optional
 
-# Canonical QualityMatrix lives in core/quality; this module holds mode flags
-# and legacy ContextQuality for backward compatibility.
+logger = logging.getLogger(__name__)
+
 try:
     from core.quality.quality_matrix import (
         QualityMatrix as _CoreQM,
@@ -28,88 +30,130 @@ try:
         DecisionProvenanceSnapshot as _CoreProv,
         get_quality_matrix_service,
     )
-except Exception:  # safe degrade if import order / circular during bootstrap
+except Exception:
     _CoreQM = None
     _CoreToolRec = None
     _CoreProv = None
     get_quality_matrix_service = None
 
-# Bind canonical name into this module's namespace so dataclass annotations
-# and default_factory work regardless of import success (fallback handled below).
 if _CoreQM is not None:
     QualityMatrix = _CoreQM
 else:
-    # Minimal fallback only for catastrophic import failure (keeps module loadable)
+
     @dataclass
     class QualityMatrix:  # type: ignore[no-redef]
+        """Minimal fallback when :mod:`core.quality` cannot be imported."""
+
         overall_quality: Literal["full", "limited", "minimal", "degraded"] = "minimal"
         risk_multiplier: float = 0.4
         suggested_temperature: float = 0.3
         suggested_max_tokens: int = 2048
         force_conservative_reasoning: bool = True
-        blocked_tool_categories: List[str] = field(default_factory=list)
-        recent_tool_usage: List[Any] = field(default_factory=list)
-        recent_provenance: List[Any] = field(default_factory=list)
+        blocked_tool_categories: list[str] = field(default_factory=list)
+        recent_tool_usage: list[Any] = field(default_factory=list)
+        recent_provenance: list[Any] = field(default_factory=list)
         global_execution_quality: float = 0.5
         last_populated: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
 
         def to_prompt_block(self, risk_multiplier: Optional[float] = None) -> str:
             rm = risk_multiplier or self.risk_multiplier
-            return f"═══ QUALITY MATRIX (FALLBACK) ═══\nOverall: {self.overall_quality.upper()} (risk ×{rm:.2f})"
+            return (
+                f"═══ QUALITY MATRIX (FALLBACK) ═══\n"
+                f"Overall: {self.overall_quality.upper()} (risk ×{rm:.2f})"
+            )
 
-        def recommended_policies(self, symbol: Optional[str] = None) -> Dict[str, Any]:
-            return {"risk_multiplier": self.risk_multiplier, "force_conservative_reasoning": self.force_conservative_reasoning}
+        def recommended_policies(self, symbol: Optional[str] = None) -> dict[str, Any]:
+            return {
+                "risk_multiplier": self.risk_multiplier,
+                "force_conservative_reasoning": self.force_conservative_reasoning,
+            }
 
-        def get_llm_call_config(self) -> Dict[str, Any]:
+        def get_llm_call_config(self) -> dict[str, Any]:
             return {"temperature": 0.15, "max_tokens": 3072, "reasoning_bias": "conservative", "source": "fallback"}
 
-        def should_allow_tool(self, action: str, params: Optional[dict] = None, *, is_independent_mode: bool = False) -> tuple[bool, Optional[str]]:
+        def should_allow_tool(
+            self,
+            action: str,
+            params: Optional[dict[str, Any]] = None,
+            *,
+            is_independent_mode: bool = False,
+        ) -> tuple[bool, Optional[str]]:
             return True, None
 
-        def get_scaled_quantity(self, requested: float | int, symbol: Optional[str] = None, intent: str = "entry") -> int:
+        def get_scaled_quantity(
+            self, requested: float | int, symbol: Optional[str] = None, intent: str = "entry"
+        ) -> int:
             return max(1, int(requested * 0.5))
 
         def can_initiate_new_risk(self, symbol: Optional[str] = None) -> bool:
             return False
 
-        # compat shims (match what was added to real class)
         def update_researcher(self, available: bool, ts: Optional[datetime] = None) -> None:
             if not available:
                 self.overall_quality = "minimal"
                 self.risk_multiplier = 0.4
 
-        def record_tool_usage(self, *a: Any, **k: Any) -> None: pass
-        def snapshot_decision(self, *a: Any, **k: Any) -> None: pass
-        def get_model_overrides(self) -> Dict[str, Any]:
+        def record_tool_usage(self, *a: Any, **k: Any) -> None:
+            pass
+
+        def snapshot_decision(self, *a: Any, **k: Any) -> None:
+            pass
+
+        def get_model_overrides(self) -> dict[str, Any]:
             return self.get_llm_call_config()
-        def get_blocked_tool_categories(self) -> List[str]:
+
+        def get_blocked_tool_categories(self) -> list[str]:
             return list(self.blocked_tool_categories)
-        def reset_for_new_session(self) -> None: pass
+
+        def reset_for_new_session(self) -> None:
+            pass
 
         def __getattr__(self, name: str) -> Any:
-            # Graceful degrade for any other attribute access during fallback
             if name in ("symbol_quality", "recent_tool_usage"):
                 return {}
             return None
 
-# Ensure ToolUsage* names exist for any local references (though primary now in core.quality)
-ToolUsageRecord = _CoreToolRec or object
-DecisionProvenanceSnapshot = _CoreProv or object
+
+ToolUsageRecord = _CoreToolRec if _CoreToolRec is not None else Any
+DecisionProvenanceSnapshot = _CoreProv if _CoreProv is not None else Any
+
+MemorySource = Literal["postgres", "local_fallback"]
+ContextOverallQuality = Literal["full", "limited", "minimal"]
 
 
 @dataclass
 class ContextQuality:
-    """Inspectable view of how good the trader's information currently is."""
+    """Inspectable view of trader information quality (researcher + WM).
+
+    Distinct from :class:`~core.quality.quality_matrix.QualityMatrix`, which owns
+    execution feedback and tool gates. This dataclass answers "is the research host
+    connected and is WM on Postgres?"
+
+    Attributes:
+        researcher_available: True when research host heartbeat is fresh.
+        memory_source: ``postgres`` or ``local_fallback``.
+        last_research_update: Last seen research update time (reserved).
+        working_memory_completeness: Fraction of expected WM sections populated.
+        hypotheses_available: Whether hypothesis data is considered present.
+        overall_quality: Coarse tier derived from researcher + WM source.
+    """
 
     researcher_available: bool = False
-    memory_source: Literal["postgres", "local_fallback"] = "postgres"
+    memory_source: MemorySource = "postgres"
     last_research_update: Optional[datetime] = None
-    working_memory_completeness: float = 0.0          # 0.0 = empty, 1.0 = full expected
+    working_memory_completeness: float = 0.0
     hypotheses_available: bool = False
-    overall_quality: Literal["full", "limited", "minimal"] = "minimal"
+    overall_quality: ContextOverallQuality = "minimal"
 
     def to_prompt_block(self, risk_multiplier: float = 1.0) -> str:
-        """Human-readable block for the LLM prompt."""
+        """Build the researcher/context section for the LLM prompt.
+
+        Args:
+            risk_multiplier: Display scale for conservative policy text.
+
+        Returns:
+            Multi-line status block.
+        """
         lines = ["═══ RESEARCHER & CONTEXT STATUS ═══"]
 
         if self.researcher_available:
@@ -128,38 +172,55 @@ class ContextQuality:
             lines.append("Hypotheses: NOT AVAILABLE (local or stale)")
 
         if self.overall_quality == "minimal":
-            lines.append(f"System Policy: CONSERVATIVE MODE (risk ×{risk_multiplier}) — New risk is reduced. Prioritize position management and high-conviction setups only.")
+            lines.append(
+                f"System Policy: CONSERVATIVE MODE (risk ×{risk_multiplier}) — "
+                "New risk is reduced. Prioritize position management and high-conviction setups only."
+            )
         elif self.overall_quality == "limited":
-            lines.append(f"System Policy: ELEVATED CAUTION (risk ×{risk_multiplier}) — Smaller size, higher bar for new entries.")
+            lines.append(
+                f"System Policy: ELEVATED CAUTION (risk ×{risk_multiplier}) — "
+                "Smaller size, higher bar for new entries."
+            )
 
         return "\n".join(lines)
 
 
 @dataclass
 class OperatingContext:
-    """Trader operating mode: researcher availability, memory source, quality summary."""
+    """Process-wide trader mode: researcher, memory source, quality matrix link.
+
+    Access via :func:`get_operating_context`. On init, rebinds :attr:`matrix` to the
+    live :class:`~core.quality.quality_matrix.QualityMatrixService` singleton when
+    available.
+
+    Attributes:
+        quality: Researcher/WM context flags.
+        matrix: Quality matrix instance (may be rebound to service-owned object).
+    """
 
     quality: ContextQuality = field(default_factory=ContextQuality)
     matrix: QualityMatrix = field(default_factory=QualityMatrix)
 
     def __post_init__(self) -> None:
-        """Rebind .matrix to the live QualityMatrixService singleton when available."""
+        """Rebind ``matrix`` to the live QualityMatrixService singleton when available."""
         try:
             if get_quality_matrix_service is not None:
                 svc = get_quality_matrix_service()
                 if svc is not None:
-                    # Rebind the instance attribute to the service-owned matrix object.
-                    # Safe because dataclass is not frozen.
                     object.__setattr__(self, "matrix", svc.get_matrix())
         except Exception:
-            # Keep the default_factory instance (or fallback) — non-fatal.
             pass
 
     @property
     def is_independent_mode(self) -> bool:
-        return not self.quality.researcher_available or self.quality.memory_source == "local_fallback"
+        """True when researcher is down or WM is on local JSON fallback."""
+        return (
+            not self.quality.researcher_available
+            or self.quality.memory_source == "local_fallback"
+        )
 
-    def set_researcher_unavailable(self):
+    def set_researcher_unavailable(self) -> None:
+        """Mark researcher offline; switch WM routing to local fallback when on Postgres."""
         self.quality.researcher_available = False
         if self.quality.memory_source == "postgres":
             self.quality.memory_source = "local_fallback"
@@ -170,7 +231,8 @@ class OperatingContext:
             pass
         self._refresh_canonical_matrix()
 
-    def set_researcher_available(self):
+    def set_researcher_available(self) -> None:
+        """Mark researcher online; restore Postgres WM source and log recovery."""
         had_local_fallback = self.quality.memory_source == "local_fallback"
         self.quality.researcher_available = True
         self.quality.memory_source = "postgres"
@@ -180,7 +242,6 @@ class OperatingContext:
         except Exception:
             pass
         self._refresh_canonical_matrix()
-        # Recovery log only (no merge). See docs/operations/independent-mode.md
         try:
             from core.runtime.working_memory_access import log_wm_recovery_on_reconnect
 
@@ -188,19 +249,23 @@ class OperatingContext:
         except Exception as exc:
             logger.debug("WM recovery summary skipped: %s", exc)
 
-    def _recalculate_overall_quality(self):
+    def _recalculate_overall_quality(self) -> None:
+        """Derive :attr:`~ContextQuality.overall_quality` from researcher + WM source."""
         if self.quality.researcher_available and self.quality.memory_source == "postgres":
             self.quality.overall_quality = "full"
-        elif self.quality.memory_source == "local_fallback" and self.quality.working_memory_completeness > 0.3:
+        elif (
+            self.quality.memory_source == "local_fallback"
+            and self.quality.working_memory_completeness > 0.3
+        ):
             self.quality.overall_quality = "limited"
         else:
             self.quality.overall_quality = "minimal"
 
     @property
     def legacy_risk_multiplier(self) -> float:
-        """Context-only risk scale (no QualityMatrix feedback).
+        """Context-only risk scale (does not read QualityMatrix output).
 
-        Used when populating QualityMatrix so policy does not read its own output.
+        Used when populating QualityMatrix to avoid feedback loops.
         """
         if self.quality.researcher_available:
             return 1.0
@@ -211,9 +276,10 @@ class OperatingContext:
         return 0.85
 
     def sync_researcher_from_heartbeat(self) -> bool:
-        """Reconcile researcher availability with the live research host heartbeat.
+        """Reconcile researcher flags with :func:`~core.runtime.heartbeat.is_research_host_alive`.
 
-        Returns True when the researcher is considered available.
+        Returns:
+            True when the research host is considered available after sync.
         """
         try:
             from core.runtime.heartbeat import is_research_host_alive
@@ -232,7 +298,11 @@ class OperatingContext:
         return False
 
     def cycle_guidance_footer(self) -> str:
-        """Tail instructions for the per-cycle user prompt."""
+        """Tail instructions appended to each cycle user prompt.
+
+        Returns:
+            Independent-mode guidance or standard connected-mode guidance.
+        """
         if self.is_independent_mode:
             return _INDEPENDENT_MODE_GUIDANCE
         return (
@@ -241,19 +311,18 @@ class OperatingContext:
         )
 
     def _refresh_canonical_matrix(self) -> None:
-        """Re-populate QualityMatrix from current context (non-fatal)."""
+        """Trigger a non-fatal QualityMatrix populate from current context."""
         try:
             if get_quality_matrix_service is not None:
                 svc = get_quality_matrix_service()
                 if svc is not None:
-                    svc.populate()  # will read ctx.quality + exec data and recompute policies
+                    svc.populate()
         except Exception:
-            # Never let matrix refresh break context updates
             pass
 
     @property
     def risk_multiplier(self) -> float:
-        """Conservative blend of QualityMatrix and legacy context risk."""
+        """Conservative blend of matrix and legacy context risk (min of both)."""
         core_rm = 1.0
         try:
             if get_quality_matrix_service is not None:
@@ -263,18 +332,11 @@ class OperatingContext:
         except Exception:
             core_rm = 1.0
 
-        legacy = self.legacy_risk_multiplier
-
-        # Conservative: never take the larger value
-        return min(core_rm, legacy)
+        return min(core_rm, self.legacy_risk_multiplier)
 
     @property
-    def quality_matrix(self) -> "Any":
-        """Canonical QualityMatrix from core/quality when available.
-        This is the source of truth for to_prompt_block(), get_llm_call_config(),
-        recommended_policies(), blocked_tool_categories, should_allow_tool(), etc.
-        Falls back to the local shim only on import/bootstrap failure.
-        """
+    def quality_matrix(self) -> QualityMatrix:
+        """Canonical matrix for gates, LLM config, and provenance (preferred)."""
         try:
             if get_quality_matrix_service is not None:
                 svc = get_quality_matrix_service()
@@ -284,32 +346,28 @@ class OperatingContext:
             pass
         return self.matrix
 
-    def record_tool_usage(self, *a, **k):
-        """Proxy to matrix; canonical recording is in ToolExecutor."""
-        self.matrix.record_tool_usage(*a, **k)
+    def record_tool_usage(self, *args: Any, **kwargs: Any) -> None:
+        """Proxy legacy calls; prefer :class:`~core.quality.quality_matrix.QualityMatrixService`."""
+        self.matrix.record_tool_usage(*args, **kwargs)
         try:
             if get_quality_matrix_service is not None:
                 svc = get_quality_matrix_service()
-                if svc is not None:
-                    # Best-effort: if args match ToolUsageRecord, pass through; else ignore
-                    # Most callers now record directly to service, this is belt-and-suspenders.
-                    if a and hasattr(a[0], "tool_name"):
-                        svc.record_tool_usage(a[0])
+                if svc is not None and args and hasattr(args[0], "tool_name"):
+                    svc.record_tool_usage(args[0])
         except Exception:
             pass
 
-    def snapshot_decision(self, *a, **k):
-        self.matrix.snapshot_decision(*a, **k)
-        # Canonical provenance is recorded via DecisionProvenanceSnapshot in agent loop directly to service.
+    def snapshot_decision(self, *args: Any, **kwargs: Any) -> None:
+        """Proxy legacy calls; provenance snapshots go to QualityMatrixService."""
+        self.matrix.snapshot_decision(*args, **kwargs)
 
-    def get_model_overrides(self) -> Dict[str, Any]:
+    def get_model_overrides(self) -> dict[str, Any]:
         """LLM sampling overrides from canonical matrix when available."""
         try:
             if get_quality_matrix_service is not None:
                 svc = get_quality_matrix_service()
                 if svc is not None:
                     cfg = svc.get_matrix().get_llm_call_config()
-                    # Adapt to the older "overrides" shape some legacy paths expect
                     return {
                         "temperature": cfg.get("temperature", 0.3),
                         "max_tokens": cfg.get("max_tokens", 8192),
@@ -320,7 +378,7 @@ class OperatingContext:
             pass
         return self.matrix.get_model_overrides()
 
-    def get_blocked_tool_categories(self) -> List[str]:
+    def get_blocked_tool_categories(self) -> list[str]:
         """Blocked tool categories from canonical matrix when available."""
         try:
             if get_quality_matrix_service is not None:
@@ -332,11 +390,11 @@ class OperatingContext:
         return self.matrix.get_blocked_tool_categories()
 
 
-# Global-ish instance for the running trader process
 _current_context: Optional[OperatingContext] = None
 
 
 def get_operating_context() -> OperatingContext:
+    """Return the process-wide :class:`OperatingContext` singleton."""
     global _current_context
     if _current_context is None:
         _current_context = OperatingContext()
@@ -344,7 +402,7 @@ def get_operating_context() -> OperatingContext:
 
 
 def reset_operating_context_for_tests() -> None:
-    """Drop the process singleton so tests do not leak mode across cases."""
+    """Clear the singleton so tests do not leak mode across cases."""
     global _current_context
     _current_context = None
 

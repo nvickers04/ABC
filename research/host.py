@@ -1,10 +1,10 @@
 """
 Research host process — scorer + template evolution (no Grok, no IBKR orders).
 
-Run on the research machine:
+Run on the research machine (see ``python -m research --help``):
 
     python -m research
-    python -m research --verbose
+    python -m research -v
     python -m research --no-evolution
 
 Heartbeat is written each scoring round into ``research_config`` so the trader
@@ -13,7 +13,6 @@ can skip its in-process scorer when the research host is healthy.
 
 from __future__ import annotations
 
-import argparse
 import asyncio
 import logging
 import os
@@ -47,14 +46,9 @@ async def _run(*, verbose: bool, run_evolution: bool) -> None:
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="ABC research host (no LLM)")
-    parser.add_argument("--verbose", action="store_true", help="DEBUG logging")
-    parser.add_argument(
-        "--no-evolution",
-        action="store_true",
-        help="Don't spawn the template-evolution thread",
-    )
-    args = parser.parse_args()
+    from core.entry_cli import parse_research_args
+
+    args = parse_research_args()
 
     from core.log_setup import configure_root_logging
 

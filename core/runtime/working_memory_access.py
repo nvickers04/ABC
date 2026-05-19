@@ -1,32 +1,104 @@
-"""
-Resolve the active Working Memory store for the current operating context.
+"""Working memory store routing (Postgres vs local JSON fallback).
 
-Postgres-backed WorkingMemory is the default when the researcher path is healthy.
-Local JSON fallback is used in Independent Mode or when Postgres WM is unreachable.
+All trader WM reads/writes should go through :func:`get_active_working_memory` so
+Independent Mode and Postgres outages route consistently.
 
-All agent and tool write/read paths should use get_active_working_memory() so
-routing stays consistent.
+Routing rules:
 
-Recovery policy (researcher reconnect): see docs/operations/independent-mode.md
+* **Postgres** — default when :class:`~core.runtime.operating_context.OperatingContext`
+  reports researcher available and ``memory.working_memory`` is reachable.
+* **Local JSON** — ``data/local_working_memory.json`` via
+  :class:`~core.runtime.local_memory_fallback.LocalWorkingMemoryStore` when in
+  Independent Mode or Postgres fails (then context flips to unavailable).
+
+Recovery on researcher reconnect: Option A (no merge) — see
+``docs/operations/independent-mode.md``.
 """
 
 from __future__ import annotations
 
 import logging
 import time
-from typing import Any
+from typing import Any, Protocol, TypedDict, runtime_checkable
 
 from core.runtime.operating_context import get_operating_context
-from core.runtime.local_memory_fallback import get_local_working_memory
 
 logger = logging.getLogger(__name__)
 
 
-def get_active_working_memory(*, prefer_local: bool = False) -> Any:
-    """Return the WM store appropriate for the current trader context.
+@runtime_checkable
+class WorkingMemoryStore(Protocol):
+    """Minimal WM surface used by tools and the agent loop.
 
-    ``prefer_local`` forces the JSON fallback (used in tests).
+    Implemented by :class:`memory.working_memory.WorkingMemory` (Postgres) and
+    :class:`~core.runtime.local_memory_fallback.LocalWorkingMemoryStore` (JSON).
     """
+
+    def add(
+        self,
+        section: str,
+        entry: str,
+        *,
+        expires_in_minutes: int | float | None = None,
+        metadata: dict[str, Any] | None = None,
+        now_ts: float | None = None,
+    ) -> int:
+        """Append an entry; return new entry id."""
+        ...
+
+    def clear(self, section: str, entry_id: int | None = None) -> int:
+        """Remove one entry or clear a section; return count removed."""
+        ...
+
+    def get_all(self, section: str) -> list[dict[str, Any]]:
+        """Return all entries in a section (including expired unless curated)."""
+        ...
+
+    def curate(self) -> int:
+        """Drop expired entries; return count removed."""
+        ...
+
+    def render(self, *, now_ts: float | None = None) -> str:
+        """Render WM text for prompts."""
+        ...
+
+    def snapshot(self) -> dict[str, Any]:
+        """Return JSON-serializable state (sections + metadata)."""
+        ...
+
+
+class WmSectionCounts(TypedDict, total=False):
+    """Live entry counts for one WM backend."""
+
+    total: int
+    by_section: dict[str, int]
+    error: str
+
+
+class WmStoreSummary(TypedDict, total=False):
+    """Result of :func:`summarize_wm_stores`."""
+
+    policy: str
+    local: WmSectionCounts
+    postgres: WmSectionCounts
+    had_local_fallback: bool
+
+
+def get_active_working_memory(*, prefer_local: bool = False) -> WorkingMemoryStore:
+    """Return the WM store for the current trader operating context.
+
+    Args:
+        prefer_local: When True, force the JSON fallback (tests).
+
+    Returns:
+        A :class:`WorkingMemoryStore` — Postgres-backed or local JSON.
+
+    Side effects:
+        On Postgres failure, marks researcher unavailable via
+        :meth:`~core.runtime.operating_context.OperatingContext.set_researcher_unavailable`.
+    """
+    from core.runtime.local_memory_fallback import get_local_working_memory
+
     ctx = get_operating_context()
     if prefer_local or ctx.is_independent_mode:
         return get_local_working_memory()
@@ -41,8 +113,20 @@ def get_active_working_memory(*, prefer_local: bool = False) -> Any:
         return get_local_working_memory()
 
 
-def count_live_wm_entries(wm: Any, *, now_ts: float | None = None) -> dict[str, Any]:
-    """Count non-expired entries per section for any WM store with snapshot() or get_all()."""
+def count_live_wm_entries(
+    wm: WorkingMemoryStore,
+    *,
+    now_ts: float | None = None,
+) -> WmSectionCounts:
+    """Count non-expired entries per section for any compatible WM store.
+
+    Args:
+        wm: Store implementing :class:`WorkingMemoryStore`.
+        now_ts: Optional epoch seconds; defaults to ``time.time()``.
+
+    Returns:
+        Dict with ``total`` and ``by_section`` keys.
+    """
     from memory.working_memory import SECTIONS
 
     now = float(now_ts if now_ts is not None else time.time())
@@ -50,7 +134,7 @@ def count_live_wm_entries(wm: Any, *, now_ts: float | None = None) -> dict[str, 
     total = 0
 
     for section in SECTIONS:
-        entries: list[Any] = []
+        entries: list[dict[str, Any]] = []
         if hasattr(wm, "snapshot"):
             try:
                 snap = wm.snapshot()
@@ -80,13 +164,20 @@ def count_live_wm_entries(wm: Any, *, now_ts: float | None = None) -> dict[str, 
     return {"total": total, "by_section": by_section}
 
 
-def summarize_wm_stores() -> dict[str, Any]:
-    """Snapshot live entry counts for local JSON and Postgres WM (read-only)."""
-    summary: dict[str, Any] = {
+def summarize_wm_stores() -> WmStoreSummary:
+    """Compare live entry counts in local JSON vs Postgres WM (read-only).
+
+    Returns:
+        Summary dict with ``policy``, ``local``, and ``postgres`` counts.
+        Postgres section may include ``error`` when unreachable.
+    """
+    summary: WmStoreSummary = {
         "policy": "postgres_wins_no_merge",
         "local": {"total": 0, "by_section": {}},
         "postgres": {"total": 0, "by_section": {}},
     }
+
+    from core.runtime.local_memory_fallback import get_local_working_memory
 
     try:
         local_wm = get_local_working_memory()
@@ -104,12 +195,17 @@ def summarize_wm_stores() -> dict[str, Any]:
     return summary
 
 
-def log_wm_recovery_on_reconnect(*, had_local_fallback: bool) -> dict[str, Any]:
-    """Log WM state when the researcher becomes available again (Option A: no merge).
+def log_wm_recovery_on_reconnect(*, had_local_fallback: bool) -> WmStoreSummary:
+    """Log WM state when the research host becomes available again.
 
-    Called from OperatingContext.set_researcher_available(). Local entries written
-    during Independent Mode remain in data/local_working_memory.json; Postgres is
-    authoritative for new writes. See docs/operations/independent-mode.md.
+    Called from :meth:`~core.runtime.operating_context.OperatingContext.set_researcher_available`.
+    Local entries written during Independent Mode are **not** auto-merged into Postgres.
+
+    Args:
+        had_local_fallback: True when the trader had been on local JSON WM.
+
+    Returns:
+        The same structure as :func:`summarize_wm_stores`, plus ``had_local_fallback``.
     """
     summary = summarize_wm_stores()
     local_n = int(summary["local"].get("total", 0))

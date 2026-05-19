@@ -1,13 +1,10 @@
-"""
-Simple local persistent fallback for Working Memory.
+"""Local JSON fallback for working memory (Independent Mode).
 
-Used when the main Postgres DB is unreachable (Independent Mode).
+When Postgres is unreachable, :func:`~core.runtime.working_memory_access.get_active_working_memory`
+returns :class:`LocalWorkingMemoryStore`, which persists the five WM sections to
+``data/local_working_memory.json`` so theses and lessons survive trader restarts.
 
-Stores the five working memory sections in a local JSON file so the trader
-keeps its theses, watching_for, lessons, etc. across restarts even when
-the research machine is down.
-
-API mirrors memory.working_memory.WorkMemory public surface used by tools/agent.
+The public API mirrors :mod:`memory.working_memory` methods used by tools and the agent.
 """
 
 from __future__ import annotations
@@ -19,9 +16,9 @@ from pathlib import Path
 from typing import Any
 
 from memory.working_memory import (
-    SECTIONS,
-    SECTION_CAPS,
     DEFAULT_SECTION_SCORES,
+    SECTION_CAPS,
+    SECTIONS,
     _resolve_expiry_ts,
     _validate_section,
 )
@@ -31,20 +28,33 @@ LOCAL_MEMORY_FILE.parent.mkdir(parents=True, exist_ok=True)
 
 
 class LocalWorkingMemoryStore:
-    """
-    Lightweight JSON-backed store for the five working memory sections.
-    Thread-safe. Survives trader restarts when Postgres is unavailable.
+    """Thread-safe JSON-backed store for the five working memory sections.
+
+    Implements :class:`~core.runtime.working_memory_access.WorkingMemoryStore`.
+    Entries are capped per section using the same limits as Postgres WM.
+
+    Attributes:
+        filepath: On-disk JSON path (default ``data/local_working_memory.json``).
     """
 
-    def __init__(self, filepath: Path = LOCAL_MEMORY_FILE):
+    def __init__(self, filepath: Path = LOCAL_MEMORY_FILE) -> None:
+        """Load existing JSON state or start empty with default section scores.
+
+        Args:
+            filepath: Persistence path; parent directories are created at module import.
+        """
         self.filepath = filepath
         self._lock = threading.RLock()
-        self._entries: dict[str, list[dict]] = {s: [] for s in SECTIONS}
-        self._section_scores: dict[str, dict] = {}
+        self._entries: dict[str, list[dict[str, Any]]] = {s: [] for s in SECTIONS}
+        self._section_scores: dict[str, dict[str, Any]] = {}
         self._load()
 
-    def ensure_section_scores(self) -> dict[str, dict]:
-        """Guarantee _section_scores exist with defaults (local fallback)."""
+    def ensure_section_scores(self) -> dict[str, dict[str, Any]]:
+        """Ensure section score metadata exists with defaults.
+
+        Returns:
+            Mutable ``_section_scores`` dict keyed by section name.
+        """
         if not self._section_scores or not isinstance(self._section_scores, dict):
             self._section_scores = {k: v.copy() for k, v in DEFAULT_SECTION_SCORES.items()}
             now = time.time()
@@ -53,6 +63,7 @@ class LocalWorkingMemoryStore:
         return self._section_scores
 
     def _load(self) -> None:
+        """Load sections and scores from disk; corrupt files are ignored."""
         if self.filepath.exists():
             try:
                 with open(self.filepath, "r", encoding="utf-8") as f:
@@ -65,8 +76,9 @@ class LocalWorkingMemoryStore:
         self.ensure_section_scores()
 
     def _save(self) -> None:
+        """Persist current entries and section scores to disk (best-effort)."""
         try:
-            payload = {s: self._entries.get(s, []) for s in SECTIONS}
+            payload: dict[str, Any] = {s: self._entries.get(s, []) for s in SECTIONS}
             payload["_section_scores"] = self._section_scores or {}
             with open(self.filepath, "w", encoding="utf-8") as f:
                 json.dump(payload, f, indent=2, default=str)
@@ -74,6 +86,7 @@ class LocalWorkingMemoryStore:
             pass
 
     def _enforce_cap(self, section: str) -> None:
+        """Drop oldest-expiring entries when a section exceeds its cap."""
         cap = SECTION_CAPS.get(section, 20)
         bucket = self._entries[section]
         while len(bucket) > cap:
@@ -89,7 +102,21 @@ class LocalWorkingMemoryStore:
         metadata: dict[str, Any] | None = None,
         now_ts: float | None = None,
     ) -> int:
-        """Append an entry; evict oldest-expires-first when at cap."""
+        """Append an entry; evict oldest-expires-first when at cap.
+
+        Args:
+            section: One of the canonical WM section names.
+            entry: Non-empty text body.
+            expires_in_minutes: Optional TTL override.
+            metadata: Optional JSON-serializable metadata.
+            now_ts: Optional epoch seconds for deterministic tests.
+
+        Returns:
+            New entry id (millisecond timestamp).
+
+        Raises:
+            ValueError: If ``entry`` is empty after strip.
+        """
         _validate_section(section)
         text = (entry or "").strip()
         if not text:
@@ -99,7 +126,7 @@ class LocalWorkingMemoryStore:
         expires = _resolve_expiry_ts(section, expires_in_minutes, ts)
         entry_id = int(ts * 1000)
 
-        record = {
+        record: dict[str, Any] = {
             "id": entry_id,
             "entry_text": text,
             "created_ts": ts,
@@ -114,7 +141,15 @@ class LocalWorkingMemoryStore:
         return entry_id
 
     def clear(self, section: str, entry_id: int | None = None) -> int:
-        """Remove one entry by id, or clear the whole section."""
+        """Remove one entry by id, or clear the whole section.
+
+        Args:
+            section: WM section name.
+            entry_id: When set, remove only that id; otherwise clear the section.
+
+        Returns:
+            Count of entries removed.
+        """
         _validate_section(section)
         with self._lock:
             bucket = self._entries[section]
@@ -128,12 +163,24 @@ class LocalWorkingMemoryStore:
             self._save()
             return removed
 
-    def get_all(self, section: str) -> list[dict]:
+    def get_all(self, section: str) -> list[dict[str, Any]]:
+        """Return a copy of all entries in a section (including expired).
+
+        Args:
+            section: WM section name.
+
+        Returns:
+            List of entry dicts.
+        """
         with self._lock:
             return list(self._entries.get(section, []))
 
     def curate(self) -> int:
-        """Remove expired entries. Returns count removed."""
+        """Remove expired entries from all sections.
+
+        Returns:
+            Total count removed across sections.
+        """
         now = time.time()
         removed = 0
         with self._lock:
@@ -147,7 +194,14 @@ class LocalWorkingMemoryStore:
         return removed
 
     def render(self, *, now_ts: float | None = None) -> str:
-        """Render compatible with WorkingMemory.render() (abbreviated in local mode)."""
+        """Render WM text for prompts (abbreviated vs Postgres renderer).
+
+        Args:
+            now_ts: Optional epoch seconds; defaults to ``time.time()``.
+
+        Returns:
+            Markdown-style block or a placeholder when empty.
+        """
         now = float(now_ts if now_ts is not None else time.time())
         lines = ["═══ WORKING MEMORY (local fallback) ═══"]
         any_content = False
@@ -169,7 +223,11 @@ class LocalWorkingMemoryStore:
         return "\n".join(lines)
 
     def snapshot(self) -> dict[str, Any]:
-        """JSON-friendly snapshot including _section_scores."""
+        """Return JSON-serializable state including section scores.
+
+        Returns:
+            Dict keyed by section names plus ``_section_scores``.
+        """
         with self._lock:
             out: dict[str, Any] = {
                 s: list(self._entries.get(s, [])) for s in SECTIONS
@@ -184,7 +242,14 @@ _local_store: LocalWorkingMemoryStore | None = None
 
 
 def get_local_working_memory(filepath: Path | None = None) -> LocalWorkingMemoryStore:
-    """Return the local WM singleton, optionally bound to a specific file (tests)."""
+    """Return the process-wide local WM singleton.
+
+    Args:
+        filepath: When set, replace the singleton with a store bound to that path (tests).
+
+    Returns:
+        Shared :class:`LocalWorkingMemoryStore` instance.
+    """
     global _local_store
     if filepath is not None:
         _local_store = LocalWorkingMemoryStore(filepath=filepath)
@@ -195,7 +260,11 @@ def get_local_working_memory(filepath: Path | None = None) -> LocalWorkingMemory
 
 
 def reset_local_working_memory_for_tests(filepath: Path | None = None) -> None:
-    """Reset singleton; pass filepath to bind the next store to an isolated file."""
+    """Clear the singleton; optionally bind the next store to an isolated file.
+
+    Args:
+        filepath: If provided, immediately create a store at this path.
+    """
     global _local_store
     _local_store = None
     if filepath is not None:

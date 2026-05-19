@@ -3,6 +3,9 @@
 **Single source of truth** for how to start each process. Implementation paths are
 listed for navigation only — always use the commands below, not duplicate root scripts.
 
+Run **`python __main__.py --help`** or **`python -m research --help`** for full flag
+lists, defaults, and copy-paste examples. Shared definitions live in `core/entry_cli.py`.
+
 ---
 
 ## Production (split host)
@@ -26,7 +29,7 @@ Research host alternatives:
 
 ```powershell
 # From repo root (same as python -m research)
-.\scripts\run_research.ps1
+.\scripts\run_research.ps1 -Verbose
 
 # Docker
 docker compose -f infra/runtime/docker-compose.research.yml --env-file .env up -d --build
@@ -43,6 +46,40 @@ Pre-live gates: [operations/launch-checklist.md](operations/launch-checklist.md)
 
 ---
 
+## CLI reference
+
+### Trader — `python __main__.py`
+
+| Flag | Short | Purpose |
+|------|-------|---------|
+| `--test` | | Test Grok API only; no IBKR, no agent |
+| `--verbose` | `-v` | DEBUG logging → `logs/agent.log` |
+| `--account MODE` | | `paper` (default) or `live` |
+| `--require-research-host` | | Exit if research host heartbeat is stale (production) |
+| `--require-daemon` | | Legacy alias for `--require-research-host` |
+| `--force-in-process` | | Always run scorer in this process (dev; may double-write) |
+| `--no-research` | | Never auto-start scorer |
+
+**Mutually exclusive:** `--require-research-host` (or legacy `--require-daemon`) and
+`--force-in-process` cannot be combined.
+
+**Environment (trader):**
+
+| Variable | Effect |
+|----------|--------|
+| `TRADER_IN_PROCESS_SCORER=never` | Same hard gate as `--require-research-host` (also `0`, `false`, `off`, `no`) |
+| `XAI_API_KEY` / `GROK_API_KEY` | Required unless `--test` |
+| `IBKR_ACCOUNT_TYPE` | Overridden by `--account` when passed |
+
+### Research host — `python -m research`
+
+| Flag | Short | Purpose |
+|------|-------|---------|
+| `--verbose` | `-v` | DEBUG logging → `logs/research.log` |
+| `--no-evolution` | | Skip template-evolution background thread |
+
+---
+
 ## Development (single machine)
 
 | Goal | Command |
@@ -52,8 +89,11 @@ Pre-live gates: [operations/launch-checklist.md](operations/launch-checklist.md)
 | Trader, never start local scorer | `TRADER_IN_PROCESS_SCORER=never python __main__.py --require-research-host` (research must be running) |
 | Force in-process scorer on trader (no research host) | `python __main__.py --force-in-process` |
 | Test Grok connection | `python __main__.py --test` |
+| Trader without auto-scorer | `python __main__.py --no-research` |
+| Research without template evolution | `python -m research --no-evolution` |
 
-Typical local loop: terminal 1 → `python -m research`; terminal 2 → `python __main__.py --verbose`.
+Typical local loop: terminal 1 → `python -m research --verbose`; terminal 2 →
+`python __main__.py --verbose`.
 
 ### Heartbeat (research host liveness)
 
@@ -63,7 +103,7 @@ Typical local loop: terminal 1 → `python -m research`; terminal 2 → `python 
 | Legacy key (still read) | `daemon_heartbeat_ts` |
 | Written by | `signals/scorer.py` each round via `core.runtime.heartbeat.write_heartbeat` |
 | Checked by | Trader boot + each cycle (`is_research_host_alive`) |
-| CLI flag | `--require-research-host` (legacy alias `--require-daemon`) — refuse trader start if heartbeat stale (`TRADER_IN_PROCESS_SCORER=never` is the same policy via env) |
+| CLI flag | `--require-research-host` (legacy `--require-daemon`) — refuse trader start if heartbeat stale |
 
 ---
 
@@ -77,7 +117,7 @@ Typical local loop: terminal 1 → `python -m research`; terminal 2 → `python 
 | `python scripts/verify_trader_db.py` | Postgres reachability + migrations (trader host) |
 | `python scripts/smoke_tools.py --client-id <id>` | Paper-safe tool sweep |
 | `python scripts/smoke_tools.py --client-id <id> --all` | Safe + broker-mutating tools |
-| `scripts/run_research.ps1` | Windows: same as `python -m research` |
+| `scripts/run_research.ps1` | Windows: same as `python -m research` (`-Verbose`, `-NoEvolution`) |
 | `scripts/backup_postgres.ps1` | DB backup (Windows) |
 | `scripts/watch_research.ps1` | List `python -m research` PIDs + tail log |
 
@@ -89,7 +129,8 @@ Typical local loop: terminal 1 → `python -m research`; terminal 2 → `python 
 |--------------|----------------|
 | `python -m research` | `research/__main__.py` → `research/host.py` |
 | `python __main__.py` | `__main__.py` → `core/agent.py` (`TradingAgent`) |
-| Research log file | `logs/research.log` (was `research_daemon.log` before consolidation) |
+| CLI definitions | `core/entry_cli.py` |
+| Research log file | `logs/research.log` |
 | Trader log file | `logs/agent.log` |
 
 There is **no** `research_daemon.py` at the repository root.

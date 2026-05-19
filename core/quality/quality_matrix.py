@@ -1,21 +1,17 @@
-"""
-QualityMatrix — host-side context and execution quality policy.
+"""Host-side context quality, tool gates, and decision provenance.
 
-Dataclasses + service implementing the hybrid design:
-- Reuses existing evaluation engines (trade_feedback, execution_snapshots,
-  calibrated_slippage, graduated_params, daily review outputs).
-- First-class ToolUsageRecord and DecisionProvenanceSnapshot for provenance
-  (decision-scoped; explicitly avoids noisy per-trade / per-tool outcome
-  attribution as diagnosed in session analysis).
-- Orchestration-heavy: provides to_prompt_block() + recommended_policies().
-  Population from daily review, execution analysis, and cycle hooks.
-- research_config knobs for enablement, retention, scoring weights.
-- Singleton service pattern consistent with get_operating_context().
+QualityMatrix is the authoritative policy layer for:
 
-Persistence: tool_usage_log + decision_provenance tables (additive, IF NOT EXISTS).
-No new heavy dependencies. Dataclass style matches codebase (OperatingContext etc).
+* **Risk gates** — ``should_allow_tool``, ``get_scaled_quantity``, ``can_initiate_new_risk``
+* **LLM sampling** — ``get_llm_call_config`` overrides temperature and token limits
+* **Provenance** — ``ToolUsageRecord`` and ``DecisionProvenanceSnapshot`` persisted via
+  :class:`QualityMatrixService`
 
-Open decisions flagged at bottom of file.
+Population reuses existing DB aggregates (``trade_feedback``, execution analysis) and
+:mod:`core.runtime.operating_context`. The LLM sees policy via ``to_prompt_block()`` and
+quality tools; the host enforces hard gates in :mod:`tools.tools_executor` before side effects.
+
+See ``docs/operations/independent-mode.md`` for Independent Mode and WM routing.
 """
 
 from __future__ import annotations
@@ -23,12 +19,23 @@ from __future__ import annotations
 import json
 import logging
 from dataclasses import dataclass, field
-from datetime import datetime, timezone, timedelta
+from datetime import datetime, timezone
 from typing import Any, ClassVar, Literal, Optional
 
 from memory import get_db, get_research_config, set_research_config
 
 logger = logging.getLogger(__name__)
+
+# ── Type aliases ───────────────────────────────────────────────────────────
+
+OverallQuality = Literal["full", "limited", "minimal", "degraded"]
+ContextQualityLevel = Literal["full", "limited", "minimal"]
+ProvenanceContextQuality = Literal["full", "limited", "minimal"]
+ToolGateResult = tuple[bool, Optional[str]]
+"""``(allowed, rejection_reason)`` from :meth:`QualityMatrix.should_allow_tool`."""
+
+DecisionType = Literal["cycle_decision", "entry_idea", "sizing", "review", "done"]
+ToolSource = Literal["executor", "researcher", "internal"]
 
 
 # ── Dataclasses ────────────────────────────────────────────────────────────
@@ -36,11 +43,20 @@ logger = logging.getLogger(__name__)
 
 @dataclass
 class ToolUsageRecord:
-    """First-class record of a single tool invocation (tool-usage emphasis).
+    """One tool invocation for provenance and audit trails.
 
-    Freshness / outcome back-fill deliberately omitted from this record to
-    avoid the symbol-specificity + multi-tool entanglement problem. Instead,
-    provenance snapshots capture the active set at decision time.
+    Recorded at execution time by :class:`QualityMatrixService.record_tool_usage`.
+    Deliberately omits per-trade P&L attribution; decision snapshots capture the
+    tool set active at a decision boundary instead.
+
+    Attributes:
+        tool_name: Canonical tool/action name (e.g. ``plan_order``, ``research``).
+        called_at: UTC timestamp of the call.
+        symbol: Optional symbol context.
+        success: Whether the tool reported success.
+        latency_ms: Wall-clock latency in milliseconds.
+        source: Call path — ``executor``, ``researcher``, or ``internal``.
+        context: Lightweight metadata (intent snippet, query id, etc.).
     """
 
     tool_name: str
@@ -48,43 +64,63 @@ class ToolUsageRecord:
     symbol: Optional[str] = None
     success: bool = True
     latency_ms: float = 0.0
-    source: str = "executor"  # executor | researcher | internal
-    # Optional lightweight context at call time (e.g. intent, query snippet)
+    source: ToolSource = "executor"
     context: dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass
 class DecisionProvenanceSnapshot:
-    """Decision-time provenance capture.
+    """Quality state and tools active at a decision boundary.
 
-    Records the exact quality state + active/recent tools at the moment of a
-    key decision (cycle done, entry idea, sizing, review trigger, etc.).
-    Forward-looking only. Outcomes (if any) are attached at high level, never
-    retroactively mutate historical ToolUsageRecords with P&L.
+    Written at cycle ``done``, entry ideas, sizing, or review triggers. Forward-looking
+    only — outcomes are stored at high level in ``outcome`` without mutating past
+    :class:`ToolUsageRecord` rows.
+
+    Attributes:
+        ts: Snapshot timestamp (UTC).
+        cycle_id: Trader cycle identifier when known.
+        decision_type: Kind of decision (``cycle_decision``, ``entry_idea``, etc.).
+        symbol: Primary symbol, if any.
+        tools_used: Tools considered active for this decision.
+        quality_state: JSON-serializable copy of matrix/context fields at decision time.
+        context_quality: Coarse context tier at decision time.
+        outcome: Optional high-level outcome label (e.g. ``trade_placed``, ``wait``).
+        notes: Free-form operator or host notes.
     """
 
     ts: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
     cycle_id: int = 0
-    decision_type: str = "cycle_decision"  # cycle_decision | entry_idea | sizing | review | done
+    decision_type: DecisionType = "cycle_decision"
     symbol: Optional[str] = None
     tools_used: list[ToolUsageRecord] = field(default_factory=list)
     quality_state: dict[str, Any] = field(default_factory=dict)
-    context_quality: Literal["full", "limited", "minimal"] = "full"
-    outcome: Optional[str] = None  # e.g. "trade_placed", "passed", "wait"
+    context_quality: ProvenanceContextQuality = "full"
+    outcome: Optional[str] = None
     notes: str = ""
 
 
 @dataclass
 class SymbolQuality:
-    """Aggregate, symbol-scoped quality metrics.
+    """Aggregated execution quality for one symbol (not a per-trade ledger).
 
-    Populated from trade_feedback + execution analysis (conservative reuse).
-    Not a per-trade ledger.
+    Derived from ``trade_feedback`` and execution analysis hooks. Used by
+    :meth:`QualityMatrix.recommended_policies` and per-symbol risk scaling.
+
+    Attributes:
+        symbol: Ticker symbol.
+        execution_quality: Score in ``[0.05, 0.95]`` — higher is better execution.
+        avg_execution_gap: Mean simulated-vs-actual gap from feedback.
+        trade_count_7d: Trade count proxy over the lookback window.
+        recent_feedback_count: Feedback rows in the lookback window.
+        tool_usage_count: Reserved for future tool-density signals.
+        last_tool_success_rate: Reserved; defaults to ``1.0``.
+        last_updated: UTC time of last aggregate refresh.
+        notes: Optional human-readable note.
     """
 
     symbol: str
-    execution_quality: float = 0.5  # 0.0 (bad) .. 1.0 (excellent)
-    avg_execution_gap: float = 0.0  # from trade_feedback
+    execution_quality: float = 0.5
+    avg_execution_gap: float = 0.0
     trade_count_7d: int = 0
     recent_feedback_count: int = 0
     tool_usage_count: int = 0
@@ -95,14 +131,27 @@ class SymbolQuality:
 
 @dataclass
 class QualityMatrix:
-    """Top-level quality orchestration object.
+    """In-process quality policy state for one trader run.
 
-    Lives in memory for the process; persisted via provenance + usage logs.
-    Provides the two key methods required by charter: to_prompt_block() and
-    recommended_policies().
+    Exposes prompt text (:meth:`to_prompt_block`), structured policy
+    (:meth:`recommended_policies`), and **hard gates** that the LLM cannot bypass.
+    Persisted slices are loaded/stored by :class:`QualityMatrixService`.
+
+    Attributes:
+        overall_quality: Coarse system posture.
+        risk_multiplier: Host risk scale in ``(0, 1]`` applied to sizing.
+        symbol_quality: Per-symbol aggregates keyed by ticker.
+        recent_tool_usage: In-memory ring of recent tool calls.
+        recent_provenance: In-memory ring of decision snapshots.
+        suggested_temperature: LLM temperature cap suggestion.
+        suggested_max_tokens: LLM max-token cap suggestion.
+        force_conservative_reasoning: When True, tightens sampling and blocks entries.
+        blocked_tool_categories: Category names rejected by :meth:`should_allow_tool`.
+        global_execution_quality: Portfolio-wide execution score.
+        last_populated: UTC time of last full populate.
     """
 
-    overall_quality: Literal["full", "limited", "minimal", "degraded"] = "full"
+    overall_quality: OverallQuality = "full"
     risk_multiplier: float = 1.0
     symbol_quality: dict[str, SymbolQuality] = field(default_factory=dict)
     recent_tool_usage: list[ToolUsageRecord] = field(default_factory=list)
@@ -111,16 +160,21 @@ class QualityMatrix:
     suggested_temperature: float = 0.3
     suggested_max_tokens: int = 2048
     force_conservative_reasoning: bool = False
-    blocked_tool_categories: list[str] = field(default_factory=list)  # e.g. ["research", "complex_options"]
+    blocked_tool_categories: list[str] = field(default_factory=list)
 
     global_execution_quality: float = 0.5
 
     last_populated: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
 
     def to_prompt_block(self, risk_multiplier: float | None = None) -> str:
-        """Compact, human-readable block suitable for LLM prompt injection.
+        """Build a compact prompt block for the LLM system/user context.
 
-        Mirrors the style of ContextQuality.to_prompt_block for consistency.
+        Args:
+            risk_multiplier: Optional override for display; defaults to
+                :attr:`risk_multiplier`.
+
+        Returns:
+            Multi-line human-readable summary of posture, symbols, and recent provenance.
         """
         rm = risk_multiplier if risk_multiplier is not None else self.risk_multiplier
         lines = ["═══ QUALITY MATRIX ═══"]
@@ -132,9 +186,11 @@ class QualityMatrix:
         if self.blocked_tool_categories:
             lines.append(f"Restricted categories: {', '.join(self.blocked_tool_categories)}")
 
-        lines.append(f"Suggested model config: temp={self.suggested_temperature:.2f}, max_tokens={self.suggested_max_tokens}")
+        lines.append(
+            f"Suggested model config: temp={self.suggested_temperature:.2f}, "
+            f"max_tokens={self.suggested_max_tokens}"
+        )
 
-        # Symbol highlights (top 3 by data volume or worst quality)
         if self.symbol_quality:
             sorted_syms = sorted(
                 self.symbol_quality.values(),
@@ -144,26 +200,41 @@ class QualityMatrix:
             sym_lines = []
             for sq in sorted_syms:
                 sym_lines.append(
-                    f"  {sq.symbol}: exec_q={sq.execution_quality:.2f} gap={sq.avg_execution_gap:+.3f} n={sq.trade_count_7d + sq.recent_feedback_count}"
+                    f"  {sq.symbol}: exec_q={sq.execution_quality:.2f} "
+                    f"gap={sq.avg_execution_gap:+.3f} "
+                    f"n={sq.trade_count_7d + sq.recent_feedback_count}"
                 )
             if sym_lines:
                 lines.append("Symbol quality (recent):")
                 lines.extend(sym_lines)
 
-        # Recent provenance summary (last 2)
         if self.recent_provenance:
             lines.append("Recent decisions (provenance):")
             for p in self.recent_provenance[-2:]:
                 tools = ",".join(t.tool_name for t in p.tools_used[-3:]) or "none"
-                lines.append(f"  C{p.cycle_id} {p.decision_type}({p.symbol or ''}) tools=[{tools}] q={p.context_quality}")
+                lines.append(
+                    f"  C{p.cycle_id} {p.decision_type}({p.symbol or ''}) "
+                    f"tools=[{tools}] q={p.context_quality}"
+                )
 
-        lines.append(f"Last updated: {(datetime.now(timezone.utc) - self.last_populated).total_seconds() / 60:.0f}m ago")
+        lines.append(
+            f"Last updated: "
+            f"{(datetime.now(timezone.utc) - self.last_populated).total_seconds() / 60:.0f}m ago"
+        )
         return "\n".join(lines)
 
     def recommended_policies(self, symbol: str | None = None) -> dict[str, Any]:
-        """Structured policy recommendations for orchestration / risk / filtering.
+        """Return structured policy knobs for orchestration and risk code.
 
-        Safe to call from anywhere; never mutates state.
+        Does not mutate state. Symbol-specific caps apply when ``symbol`` is set
+        and execution quality is poor.
+
+        Args:
+            symbol: Optional ticker for per-symbol execution quality.
+
+        Returns:
+            Dict with keys such as ``risk_multiplier``, ``force_conservative_reasoning``,
+            ``suggested_temperature``, ``blocked_tool_categories``, ``symbol_execution_quality``.
         """
         sq = self.symbol_quality.get(symbol) if symbol else None
 
@@ -173,18 +244,14 @@ class QualityMatrix:
 
         return {
             "risk_multiplier": round(base_risk, 3),
-            "force_conservative_reasoning": self.force_conservative_reasoning or (sq is not None and sq.execution_quality < 0.4),
+            "force_conservative_reasoning": self.force_conservative_reasoning
+            or (sq is not None and sq.execution_quality < 0.4),
             "suggested_temperature": self.suggested_temperature,
             "suggested_max_tokens": self.suggested_max_tokens,
             "blocked_tool_categories": list(self.blocked_tool_categories),
             "symbol_execution_quality": sq.execution_quality if sq else None,
             "notes": (sq.notes if sq else "") or f"overall={self.overall_quality}",
         }
-
-    # ── Host enforcement (hard gates; LLM cannot bypass) ─────────────────────
-    # Host code (not the LLM) makes
-    # irreversible decisions. The LLM sees the state via to_prompt_block() +
-    # quality_* tools (soft), but cannot bypass the gates below (hard).
 
     _ENTRY_ACTIONS: ClassVar[set[str]] = {
         "plan_order", "buy", "sell", "market_order", "limit_order",
@@ -193,7 +260,15 @@ class QualityMatrix:
     }
 
     def _categorize_tool(self, action: str) -> Optional[str]:
-        """Internal category mapper used by both prompt rendering and hard gates."""
+        """Map a tool action name to a policy category for gating.
+
+        Args:
+            action: Tool or action string from the executor.
+
+        Returns:
+            Category name (e.g. ``research``, ``complex_options``), or ``None`` if
+            uncategorized.
+        """
         a = (action or "").lower()
         if a in ("research", "web_search", "x_search", "deep_research", "research_engine"):
             return "research"
@@ -206,12 +281,13 @@ class QualityMatrix:
         return None
 
     def get_llm_call_config(self) -> dict[str, Any]:
-        """Hard host-controlled sampling parameters for the xAI chat.create() call.
+        """Return host-controlled LLM sampling parameters.
 
-        This is the primary 'model call configuration' lever. Lower temp + tokens
-        when quality is poor forces the model toward conservative, short, high-signal
-        reasoning instead of creative exploration. The values here override any
-        defaults in the agent loop unconditionally.
+        Values override agent defaults unconditionally when quality is degraded.
+
+        Returns:
+            Dict with ``temperature``, ``max_tokens``, ``top_p``, ``reasoning_bias``,
+            ``source``, and ``quality`` keys.
         """
         temp = float(self.suggested_temperature)
         mt = int(self.suggested_max_tokens)
@@ -230,20 +306,32 @@ class QualityMatrix:
             "temperature": round(temp, 3),
             "max_tokens": int(mt),
             "top_p": 0.78 if self.force_conservative_reasoning else 0.93,
-            "reasoning_bias": "conservative" if self.force_conservative_reasoning or self.overall_quality != "full" else "balanced",
+            "reasoning_bias": (
+                "conservative"
+                if self.force_conservative_reasoning or self.overall_quality != "full"
+                else "balanced"
+            ),
             "source": "QualityMatrix",
             "quality": self.overall_quality,
         }
 
-    def should_allow_tool(self, action: str, params: Optional[dict] = None, *, is_independent_mode: bool = False) -> tuple[bool, Optional[str]]:
-        """Authoritative hard gate for the ToolExecutor.
+    def should_allow_tool(
+        self,
+        action: str,
+        params: Optional[dict[str, Any]] = None,
+        *,
+        is_independent_mode: bool = False,
+    ) -> ToolGateResult:
+        """Hard gate: whether a tool may run (called before dispatch).
 
-        Returns (allowed: bool, rejection_reason: str | None).
-        Called *before* any dispatch or side-effect. The returned error is
-        surfaced to the LLM as a ToolResult so it can adapt, but the action
-        is never executed.
+        Args:
+            action: Tool/action name.
+            params: Tool parameters; ``intent`` may classify entry vs exit.
+            is_independent_mode: When True, applies stricter entry blocks.
 
-        Host is authoritative; the LLM only sees the rejection reason.
+        Returns:
+            ``(True, None)`` if allowed; ``(False, reason)`` if rejected. The reason
+            is surfaced to the LLM as a tool error.
         """
         params = params or {}
         cat = self._categorize_tool(action)
@@ -255,7 +343,6 @@ class QualityMatrix:
                 "Host-level block — matrix is authoritative."
             )
 
-        # Strong new-risk prohibition when quality is critically low or in strict independent posture
         if action in QualityMatrix._ENTRY_ACTIONS:
             intent = (params.get("intent") or "entry").lower()
             is_entry = intent in ("entry", "new", "") or action in ("buy", "enter_option")
@@ -275,10 +362,21 @@ class QualityMatrix:
 
         return True, None
 
-    def get_scaled_quantity(self, requested: float | int, symbol: Optional[str] = None, intent: str = "entry") -> int:
-        """Hard scaling applied by executor on every order path.
+    def get_scaled_quantity(
+        self,
+        requested: float | int,
+        symbol: Optional[str] = None,
+        intent: str = "entry",
+    ) -> int:
+        """Scale an order quantity by policy (host authoritative).
 
-        Agent proposes; host guarantees the cap. Returns the final safe quantity.
+        Args:
+            requested: Agent-proposed quantity.
+            symbol: Optional symbol for per-symbol policy.
+            intent: ``entry`` vs exit/management; entries are capped more aggressively.
+
+        Returns:
+            Final integer quantity (at least 1).
         """
         pol = self.recommended_policies(symbol)
         mult = float(pol.get("risk_multiplier", self.risk_multiplier))
@@ -289,38 +387,63 @@ class QualityMatrix:
         if self.force_conservative_reasoning and intent == "entry":
             mult = min(mult, 0.6)
 
-        scaled = max(1, int(float(requested) * mult))
-        return scaled
+        return max(1, int(float(requested) * mult))
 
     def can_initiate_new_risk(self, symbol: Optional[str] = None) -> bool:
-        """Quick predicate for host paths that want a single yes/no before even scaling."""
+        """Return whether new risk entries are permitted at current posture.
+
+        Args:
+            symbol: Optional symbol for per-symbol checks.
+
+        Returns:
+            True when risk multiplier and overall quality allow new entries.
+        """
         pol = self.recommended_policies(symbol)
         rm = pol["risk_multiplier"]
         return rm > 0.40 and self.overall_quality not in ("minimal", "degraded")
 
-    # ── Lightweight hooks on OperatingContext (population stays on QualityMatrixService) ──
-
     def update_researcher(self, available: bool, ts: Optional[datetime] = None) -> None:
-        """Light hint from OperatingContext.set_researcher_*.
-        Does not replace the authoritative orchestration-driven populate()."""
+        """Apply a lightweight researcher availability hint.
+
+        Full population remains on :class:`QualityMatrixService.populate`.
+
+        Args:
+            available: Whether the research host heartbeat is considered fresh.
+            ts: Optional timestamp of the hint (unused in v1).
+        """
+        del ts
         if not available:
             if self.overall_quality == "full":
                 self.overall_quality = "limited"
                 self.force_conservative_reasoning = True
             self.risk_multiplier = min(self.risk_multiplier, 0.65)
 
-    def record_tool_usage(self, tool_name: str, symbol: Optional[str] = None,
-                          freshness: float = 1.0, source: str = "live", **meta: Any) -> None:
-        """No-op — ToolUsageRecord is recorded via QualityMatrixService in the executor."""
-        # Intentionally minimal — real provenance captured in executor/agent via service.
-        pass
+    def record_tool_usage(
+        self,
+        tool_name: str,
+        symbol: Optional[str] = None,
+        freshness: float = 1.0,
+        source: str = "live",
+        **meta: Any,
+    ) -> None:
+        """Legacy no-op on matrix; use :class:`QualityMatrixService` for recording."""
+        del tool_name, symbol, freshness, source, meta
 
-    def snapshot_decision(self, action: str, symbols: Optional[list[str]] = None, tools_used: Optional[list[str]] = None) -> None:
-        """No-op — provenance is recorded via QualityMatrixService.record_decision_snapshot."""
-        pass
+    def snapshot_decision(
+        self,
+        action: str,
+        symbols: Optional[list[str]] = None,
+        tools_used: Optional[list[str]] = None,
+    ) -> None:
+        """Legacy no-op on matrix; use :class:`QualityMatrixService` for recording."""
+        del action, symbols, tools_used
 
     def get_model_overrides(self) -> dict[str, Any]:
-        """Legacy compat alias. New code should prefer get_llm_call_config() for the strong host-controlled values."""
+        """Legacy alias for :meth:`get_llm_call_config` shape used by older paths.
+
+        Returns:
+            Dict with ``temperature``, ``max_tokens``, and ``reasoning_bias``.
+        """
         cfg = self.get_llm_call_config()
         return {
             "temperature": cfg.get("temperature", self.suggested_temperature),
@@ -329,24 +452,29 @@ class QualityMatrix:
         }
 
     def get_blocked_tool_categories(self) -> list[str]:
-        """Legacy compat. Returns the blocked list used by should_allow_tool."""
+        """Return tool categories blocked by :meth:`should_allow_tool`.
+
+        Returns:
+            Copy of :attr:`blocked_tool_categories`.
+        """
         return list(self.blocked_tool_categories or [])
 
     def reset_for_new_session(self) -> None:
-        """Light day-boundary trim (keeps recent history for provenance)."""
+        """Trim in-memory provenance rings at session boundaries."""
         if len(self.recent_tool_usage) > 5:
             self.recent_tool_usage = self.recent_tool_usage[-5:]
         if len(self.recent_provenance) > 3:
             self.recent_provenance = self.recent_provenance[-3:]
 
 
-# ── Service ─────────────────────────────────────────────────────────────────
-
-
 class QualityMatrixService:
-    """Orchestration-facing service. Singleton via get_quality_matrix_service()."""
+    """Singleton orchestrator for populate, persist, and record operations.
 
-    _instance: Optional["QualityMatrixService"] = None
+    Access via :func:`get_quality_matrix_service`. Toggles and retention limits
+    are read from ``research_config`` keys ``quality_matrix_*``.
+    """
+
+    _instance: Optional[QualityMatrixService] = None
 
     def __init__(self) -> None:
         self.matrix = QualityMatrix()
@@ -356,23 +484,30 @@ class QualityMatrixService:
         self._logger = logging.getLogger(__name__ + ".service")
 
     @classmethod
-    def get(cls) -> "QualityMatrixService":
+    def get(cls) -> QualityMatrixService:
+        """Return the process-wide singleton, creating it on first use."""
         if cls._instance is None:
             cls._instance = cls()
         return cls._instance
 
     def _refresh_knobs(self) -> None:
+        """Reload enablement and retention limits from ``research_config``."""
         try:
             self._enabled = bool(get_research_config("quality_matrix_enabled", 1.0) >= 0.5)
             self._max_recent_tools = int(get_research_config("quality_matrix_max_tools", 50.0))
-            self._max_recent_provenance = int(get_research_config("quality_matrix_max_provenance", 30.0))
+            self._max_recent_provenance = int(
+                get_research_config("quality_matrix_max_provenance", 30.0)
+            )
         except Exception:
             pass
 
-    # ── Population (hybrid reuse) ─────────────────────────────────────────
-
     def maybe_populate(self, db: Any = None, *, max_age_seconds: float = 60.0) -> None:
-        """Re-populate only when the in-memory matrix is stale (default 60s)."""
+        """Populate only when the in-memory matrix is older than ``max_age_seconds``.
+
+        Args:
+            db: Optional DB handle; defaults to :func:`memory.get_db`.
+            max_age_seconds: Minimum seconds since :attr:`QualityMatrix.last_populated`.
+        """
         if not self._enabled:
             return
         try:
@@ -386,10 +521,10 @@ class QualityMatrixService:
         self.populate(db)
 
     def populate(self, db: Any = None) -> None:
-        """Full (re)population from all available sources.
+        """Recompute matrix state from DB aggregates and operating context.
 
-        Called from daily review, after execution analysis, and on demand.
-        Conservative: derives from trade_feedback aggregates + operating context.
+        Args:
+            db: Optional database connection; uses :func:`memory.get_db` when omitted.
         """
         if not self._enabled:
             return
@@ -398,15 +533,13 @@ class QualityMatrixService:
             db = get_db()
 
         try:
-            # 1. Researcher / operating context baseline (reuse existing)
             from core.runtime.operating_context import get_operating_context
+
             ctx = get_operating_context()
             base_quality = ctx.quality.overall_quality
             researcher_ok = bool(ctx.quality.researcher_available)
-            # Context-only baseline — must not read matrix.risk_multiplier (feedback loop).
             base_rm = float(ctx.legacy_risk_multiplier)
 
-            # 2. Aggregate execution quality from trade_feedback (reuse daily review data)
             rows = db.execute(
                 """SELECT symbol,
                           COUNT(*) as n,
@@ -427,14 +560,13 @@ class QualityMatrixService:
                 sym = r["symbol"]
                 n = int(r["n"] or 0)
                 avg_gap = float(r["avg_gap"] or 0.0)
-                # Map gap to quality: 0 gap → 0.9, 2% gap → 0.1 (conservative scaling)
                 exec_q = max(0.05, min(0.95, 0.75 - abs(avg_gap) * 25.0))
                 sq = SymbolQuality(
                     symbol=sym,
                     execution_quality=round(exec_q, 3),
                     avg_execution_gap=round(avg_gap, 4),
                     recent_feedback_count=n,
-                    trade_count_7d=n,  # proxy; could join trades if needed
+                    trade_count_7d=n,
                     last_updated=now,
                 )
                 new_symq[sym] = sq
@@ -443,16 +575,13 @@ class QualityMatrixService:
 
             self.matrix.symbol_quality = new_symq
 
-            # Global exec quality (weighted) — now a declared field
             global_exec = 0.5
             if total_n > 0:
                 global_exec = max(0.1, min(0.9, 0.7 - (total_gap / total_n) * 20))
             self.matrix.global_execution_quality = round(global_exec, 3)
 
-            # 3. Load recent provenance / tool usage from persistent log (tool purist)
             self._load_recent_from_db(db)
 
-            # 4. Derive overall + guidance (orchestration heavy)
             has_bad_exec = global_exec < 0.35 or any(
                 s.execution_quality < 0.3 for s in new_symq.values()
             )
@@ -477,7 +606,6 @@ class QualityMatrixService:
 
             self.matrix.last_populated = now
 
-            # Persist a lightweight snapshot marker (non-fatal if DB/config unavailable).
             try:
                 set_research_config(
                     "quality_matrix_last_populated",
@@ -501,15 +629,18 @@ class QualityMatrixService:
             self._logger.warning("QualityMatrix populate failed (non-fatal): %s", exc)
 
     def _load_recent_from_db(self, db: Any) -> None:
-        """Load recent ToolUsage + Provenance for the in-memory matrix (tool provenance)."""
+        """Hydrate in-memory tool usage and provenance rings from Postgres.
+
+        Args:
+            db: Database connection with ``tool_usage_log`` and ``decision_provenance``.
+        """
         try:
-            # Tool usage
             rows = db.execute(
                 "SELECT * FROM tool_usage_log ORDER BY ts DESC LIMIT ?",
                 (self._max_recent_tools,),
             ).fetchall()
             self.matrix.recent_tool_usage = []
-            for r in reversed(rows):  # oldest first for list order
+            for r in reversed(rows):
                 rec = ToolUsageRecord(
                     tool_name=r["tool_name"],
                     called_at=datetime.fromisoformat(r["ts"]) if r["ts"] else datetime.now(timezone.utc),
@@ -520,7 +651,6 @@ class QualityMatrixService:
                 )
                 self.matrix.recent_tool_usage.append(rec)
 
-            # Provenance
             prow = db.execute(
                 "SELECT * FROM decision_provenance ORDER BY ts DESC LIMIT ?",
                 (self._max_recent_provenance,),
@@ -530,10 +660,14 @@ class QualityMatrixService:
                 tools_json = r["tools_json"] or "[]"
                 try:
                     tools_list = json.loads(tools_json)
-                    tools = [ToolUsageRecord(**t) if isinstance(t, dict) else ToolUsageRecord(tool_name=str(t)) for t in tools_list]
+                    tools = [
+                        ToolUsageRecord(**t) if isinstance(t, dict)
+                        else ToolUsageRecord(tool_name=str(t))
+                        for t in tools_list
+                    ]
                 except Exception:
                     tools = []
-                qstate = {}
+                qstate: dict[str, Any] = {}
                 try:
                     qstate = json.loads(r["quality_state_json"] or "{}")
                 except Exception:
@@ -551,52 +685,63 @@ class QualityMatrixService:
                 )
                 self.matrix.recent_provenance.append(snap)
         except Exception as e:
-            # Tables may not exist on first run before schema applied; degrade gracefully
             if "no such table" not in str(e).lower():
                 self._logger.debug("Provenance load skipped: %s", e)
 
-    def update_from_daily_review(self, gap_rows: list[dict], db: Any = None, today: str = "") -> None:
-        """Lightweight incremental update hook called from run_daily_review.
+    def update_from_daily_review(
+        self,
+        gap_rows: list[dict[str, Any]],
+        db: Any = None,
+        today: str = "",
+    ) -> None:
+        """Hook after daily review; triggers a full populate in v1.
 
-        Reuses the exact gap aggregation already computed by the review engine.
+        Args:
+            gap_rows: Gap aggregates from review (reserved for incremental v2).
+            db: Optional DB handle.
+            today: Review date string (unused in v1).
         """
+        del gap_rows, today
         if not self._enabled:
             return
         if db is None:
             db = get_db()
-        # Trigger a light refresh + re-derive
-        self.populate(db)  # full for v1 is cheap enough; future: incremental
+        self.populate(db)
 
     def update_from_execution_analysis(
         self,
-        snapshots: list[dict],
+        snapshots: list[dict[str, Any]],
         calibrated_count: int,
-        graduated_active: list[dict],
+        graduated_active: list[dict[str, Any]],
         db: Any = None,
     ) -> None:
-        """Hook called after the heavy lifting in _run_execution_analysis.
+        """Hook after execution analysis completes.
 
-        Feeds calibrated_slippage / graduated_params success into symbol/global exec quality.
+        Args:
+            snapshots: Filled execution snapshots (reserved for incremental use).
+            calibrated_count: Number of calibration rows written.
+            graduated_active: Active graduated params (reserved).
+            db: Optional DB handle.
         """
+        del snapshots, calibrated_count, graduated_active
         if not self._enabled:
             return
         if db is None:
             db = get_db()
-        # For v1 we simply re-populate (reuses the feedback + new analysis side-effects)
         self.populate(db)
-        # Future: could boost execution_quality for symbols that benefited from graduated params.
-
-    # ── Recording (tool purist + decision provenance) ─────────────────────
 
     def record_tool_usage(self, record: ToolUsageRecord) -> None:
-        """Record a tool call. Called from agent/tool executor path."""
+        """Append a tool usage record to memory and ``tool_usage_log``.
+
+        Args:
+            record: Completed tool invocation metadata.
+        """
         if not self._enabled:
             return
         self.matrix.recent_tool_usage.append(record)
         if len(self.matrix.recent_tool_usage) > self._max_recent_tools:
             self.matrix.recent_tool_usage = self.matrix.recent_tool_usage[-self._max_recent_tools:]
 
-        # Persist
         try:
             db = get_db()
             db.execute(
@@ -605,7 +750,7 @@ class QualityMatrixService:
                    VALUES (?, ?, ?, ?, ?, ?, ?)""",
                 (
                     record.called_at.isoformat(),
-                    0,  # cycle_id filled by caller when known
+                    0,
                     record.tool_name,
                     record.symbol,
                     1 if record.success else 0,
@@ -618,12 +763,18 @@ class QualityMatrixService:
             logger.debug("tool_usage_log insert skipped: %s", e)
 
     def record_decision_snapshot(self, snap: DecisionProvenanceSnapshot) -> None:
-        """Record a decision provenance snapshot (at done / key choice points)."""
+        """Append a decision provenance snapshot to memory and ``decision_provenance``.
+
+        Args:
+            snap: Decision-boundary provenance payload.
+        """
         if not self._enabled:
             return
         self.matrix.recent_provenance.append(snap)
         if len(self.matrix.recent_provenance) > self._max_recent_provenance:
-            self.matrix.recent_provenance = self.matrix.recent_provenance[-self._max_recent_provenance:]
+            self.matrix.recent_provenance = self.matrix.recent_provenance[
+                -self._max_recent_provenance:
+            ]
 
         try:
             db = get_db()
@@ -661,14 +812,15 @@ class QualityMatrixService:
             logger.debug("decision_provenance insert skipped: %s", e)
 
     def get_matrix(self) -> QualityMatrix:
+        """Return the live in-process matrix (mutated by populate/record)."""
         return self.matrix
 
 
 def get_quality_matrix_service() -> QualityMatrixService:
-    """Public entry point (mirrors get_operating_context pattern)."""
+    """Return the process-wide :class:`QualityMatrixService` singleton."""
     return QualityMatrixService.get()
 
 
 def reset_quality_matrix_service_for_tests() -> None:
-    """Drop the process singleton so tests start from a clean matrix."""
+    """Clear the singleton so tests start from a fresh matrix."""
     QualityMatrixService._instance = None

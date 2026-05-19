@@ -9,7 +9,7 @@ Where logic lives and what is still migrating. **Entry commands:** [entry-points
 | Process | Module | Notes |
 |---------|--------|--------|
 | Research host | `research/host.py` via `python -m research` | Scoring + template evolution; no Grok |
-| Trader | `__main__.py` → `core/agent.py` | Grok ReAct + IBKR; use `__main__.py` only (not `python core/agent.py`) |
+| Trader | `__main__.py` → `core/agent.py` | Grok ReAct + IBKR; CLI flags in `core/entry_cli.py` |
 | Heartbeat | `core/runtime/heartbeat.py` | DB key `research_host_heartbeat_ts` (reads legacy `daemon_heartbeat_ts` too) |
 
 ---

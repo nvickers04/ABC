@@ -3,6 +3,9 @@
 from __future__ import annotations
 
 import json
+import re
+from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any, Literal, TypeVar
 
 from pydantic import BaseModel
@@ -34,11 +37,13 @@ _PROFILE_NOTES: dict[str, str] = {
 M = TypeVar("M", bound=BaseModel)
 
 
-def normalize_profit_profile(profile: str) -> ProfitProfile:
-    """Return a validated profile name."""
+def normalize_profit_profile(profile: str) -> ProfitProfile | str:
+    """Return a validated built-in or evolved profile name."""
     key = str(profile or "balanced").strip().lower()
+    if key in load_evolved_profile_registry():
+        return key
     if key not in VALID_PROFILES:
-        allowed = ", ".join(sorted(VALID_PROFILES))
+        allowed = ", ".join(sorted(VALID_PROFILES | set(load_evolved_profile_registry())))
         raise ValueError(f"profit profile must be one of: {allowed} (got {profile!r})")
     return key  # type: ignore[return-value]
 
@@ -122,6 +127,13 @@ MEMORY_PROFILE_PATCHES: dict[ProfitProfile, dict[str, Any]] = {
         "cycle_intuition_top_n": 2,
         "wm_render_cycle_max_entries": 2,
         "multi_agent_research_ttl_seconds": 1800,
+        "research_ttl_ticker_seconds": 1200,
+        "scorer_tier1_universe_size": 20,
+        "scorer_deep_scan_top_n": 8,
+        "scorer_trade_rec_top_n": 4,
+        "combiner_ir_gate_min": 0.06,
+        "combiner_category_weight_cap": 0.35,
+        "template_evolution_cooldown_market_hours": 2400,
         "legacy_risk_multiplier_degraded": 0.35,
         "legacy_risk_multiplier_limited": 0.55,
     },
@@ -132,6 +144,13 @@ MEMORY_PROFILE_PATCHES: dict[ProfitProfile, dict[str, Any]] = {
         "cycle_intuition_top_n": 4,
         "wm_render_cycle_max_entries": 4,
         "multi_agent_research_ttl_seconds": 7200,
+        "research_ttl_ticker_seconds": 2400,
+        "scorer_tier1_universe_size": 30,
+        "scorer_deep_scan_top_n": 12,
+        "scorer_trade_rec_top_n": 6,
+        "combiner_ir_gate_min": 0.04,
+        "combiner_category_weight_cap": 0.45,
+        "template_evolution_cooldown_market_hours": 1200,
         "legacy_risk_multiplier_degraded": 0.55,
         "legacy_risk_multiplier_limited": 0.75,
     },
@@ -221,8 +240,10 @@ def _default_tool_weight(name: str, current: float) -> float:
     return float(current)
 
 
-def profile_note(profile: ProfitProfile) -> str:
-    return _PROFILE_NOTES[profile]
+def profile_note(profile: ProfitProfile | str) -> str:
+    if is_evolved_profile(str(profile)):
+        return load_evolved_profile_registry()[str(profile)].note
+    return _PROFILE_NOTES[profile]  # type: ignore[index]
 
 
 def profile_change_lines(
@@ -256,6 +277,97 @@ def profile_change_lines(
     return lines
 
 
+# ── Evolved profiles (genetic search / JSON registry) ─────────────────────────
+
+
+@dataclass
+class EvolvedProfileEntry:
+    """Named profile stored under ``data/evolved_profiles.json``."""
+
+    base_profile: ProfitProfile
+    patches: dict[str, dict[str, Any]]
+    note: str = ""
+    genes: dict[str, float] = field(default_factory=dict)
+    metrics: dict[str, Any] = field(default_factory=dict)
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "base_profile": self.base_profile,
+            "patches": self.patches,
+            "note": self.note,
+            "genes": self.genes,
+            "metrics": self.metrics,
+        }
+
+    @classmethod
+    def from_dict(cls, raw: dict[str, Any]) -> EvolvedProfileEntry:
+        return cls(
+            base_profile=str(raw["base_profile"]).strip().lower(),  # type: ignore[arg-type]
+            patches=dict(raw.get("patches") or {}),
+            note=str(raw.get("note") or ""),
+            genes={str(k): float(v) for k, v in (raw.get("genes") or {}).items()},
+            metrics=dict(raw.get("metrics") or {}),
+        )
+
+
+def evolved_profiles_path() -> Path:
+    return Path(__file__).resolve().parents[1] / "data" / "evolved_profiles.json"
+
+
+def load_evolved_profile_registry() -> dict[str, EvolvedProfileEntry]:
+    path = evolved_profiles_path()
+    if not path.is_file():
+        return {}
+    try:
+        raw = json.loads(path.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, OSError):
+        return {}
+    profiles = raw.get("profiles") if isinstance(raw, dict) else raw
+    if not isinstance(profiles, dict):
+        return {}
+    out: dict[str, EvolvedProfileEntry] = {}
+    for name, body in profiles.items():
+        if isinstance(body, dict):
+            out[str(name).strip().lower()] = EvolvedProfileEntry.from_dict(body)
+    return out
+
+
+def save_evolved_profile(name: str, entry: EvolvedProfileEntry) -> Path:
+    """Persist evolved profile to ``data/evolved_profiles.json``."""
+    key = str(name).strip().lower()
+    if not key or not re.match(r"^[a-z][a-z0-9_]{2,48}$", key):
+        raise ValueError("profile name must be lowercase alphanumeric/underscore, 3–49 chars")
+    if key in VALID_PROFILES:
+        raise ValueError(f"cannot overwrite built-in profile {key!r}")
+    reg = load_evolved_profile_registry()
+    reg[key] = entry
+    path = evolved_profiles_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    payload = {
+        "version": 1,
+        "profiles": {k: v.to_dict() for k, v in reg.items()},
+    }
+    path.write_text(json.dumps(payload, indent=2, default=str), encoding="utf-8")
+    return path
+
+
+def is_evolved_profile(name: str) -> bool:
+    return str(name).strip().lower() in load_evolved_profile_registry()
+
+
+def list_all_profit_profiles() -> list[str]:
+    return sorted(VALID_PROFILES | set(load_evolved_profile_registry()))
+
+
+def format_evolved_profile_python_block(name: str, entry: EvolvedProfileEntry) -> str:
+    """Snippet suitable for pasting into ``profit_profiles.py`` documentation."""
+    return (
+        f"# Evolved profile {name!r} (loaded from data/evolved_profiles.json at runtime)\n"
+        f"# base={entry.base_profile!r}  note={entry.note!r}\n"
+        f"EVOLVED_{name.upper()}_PATCHES = {json.dumps(entry.patches, indent=4)}\n"
+    )
+
+
 __all__ = [
     "PROFIT_PROFILE_ENV",
     "LOOP_PROFILE_PATCHES",
@@ -269,7 +381,14 @@ __all__ = [
     "apply_prompt_profile",
     "apply_risk_profile",
     "apply_tool_profile",
+    "EvolvedProfileEntry",
+    "evolved_profiles_path",
+    "format_evolved_profile_python_block",
+    "is_evolved_profile",
+    "list_all_profit_profiles",
+    "load_evolved_profile_registry",
     "normalize_profit_profile",
     "profile_change_lines",
     "profile_note",
+    "save_evolved_profile",
 ]

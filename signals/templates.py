@@ -13,7 +13,6 @@ import time
 from dataclasses import dataclass, field
 from typing import Any
 
-from research.config import COMPOSITE_TRADE_THRESHOLD
 
 logger = logging.getLogger(__name__)
 
@@ -243,7 +242,9 @@ def select_template(
 
     Returns trade dict or None if no template matches.
     """
-    if abs(composite_score) < COMPOSITE_TRADE_THRESHOLD:
+    from core.central_profit_config import get_research_settings
+
+    if abs(composite_score) < get_research_settings().composite_trade_threshold:
         return None
 
     direction = "long" if composite_score > 0 else "short"

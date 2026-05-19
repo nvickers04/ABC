@@ -59,13 +59,21 @@ async def handle_calculate_size(executor, params: dict) -> Any:
     if net_liq <= 0:
         return {"error": "Cannot size: net liquidation is $0 or unknown"}
 
-    # Quote
+    # Quote (replay sim returns dict; live MDA returns Quote)
     quote = executor.data_provider.get_quote(symbol)
-    if not quote or not quote.last or quote.last <= 0:
+    if isinstance(quote, dict):
+        price = float(quote.get("last") or quote.get("close") or 0)
+        ask = float(quote.get("ask") or price)
+        bid = float(quote.get("bid") or price)
+    elif quote and getattr(quote, "last", None):
+        price = float(quote.last)
+        ask = float(quote.ask or price)
+        bid = float(quote.bid or price)
+    else:
+        price = 0.0
+        ask = bid = 0.0
+    if price <= 0:
         return {"error": f"Cannot size: no quote for {symbol}"}
-    price = quote.last
-    ask = quote.ask or price
-    bid = quote.bid or price
 
     # ATR for auto stop distance
     atr_result = executor.data_provider.get_atr(symbol)

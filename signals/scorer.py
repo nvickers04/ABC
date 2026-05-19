@@ -25,13 +25,9 @@ from core.runtime.mda_budget import (
     should_skip_subdaily_candle_fetches,
 )
 from research.config import (
-    DEEP_SCAN_TOP_N,
     OPTION_CHAIN_DTE_RANGE,
     OPTION_CHAIN_STRIKE_LIMIT,
     RESEARCH_UNIVERSE,
-    ROUND_DELAY_SECS,
-    TIER1_UNIVERSE_SIZE,
-    TRADE_REC_TOP_N,
 )
 from core import config as _core_config
 from signals.base import SIGNAL_REGISTRY
@@ -317,7 +313,9 @@ async def run_research(*, verbose: bool = False, use_cadence: bool = False) -> N
                     )
                 await safe_sleep(_sleep_s)
             else:
-                await safe_sleep(ROUND_DELAY_SECS)
+                from core.central_profit_config import get_research_settings
+
+                await safe_sleep(get_research_settings().round_delay_secs)
         except asyncio.CancelledError:
             logger.info("Scoring loop cancelled")
             break
@@ -329,6 +327,9 @@ async def run_research(*, verbose: bool = False, use_cadence: bool = False) -> N
 
 async def _scoring_round(dp, conn, round_num: int) -> int:
     """Execute one full Tier 1 → Tier 2 → Tier 3 scoring round."""
+    from core.central_profit_config import get_research_settings
+
+    rs = get_research_settings()
     credits_used = 0
 
     # ── Universe ────────────────────────────────────────────
@@ -508,7 +509,7 @@ async def _scoring_round(dp, conn, round_num: int) -> int:
 
     # ── Tier 2: Deep scan top N by |partial_composite| ─────
     ranked = sorted(partial_composites.items(), key=lambda x: abs(x[1]), reverse=True)
-    tier2_symbols = [sym for sym, _ in ranked[:DEEP_SCAN_TOP_N]]
+    tier2_symbols = [sym for sym, _ in ranked[: rs.deep_scan_top_n]]
 
     tier2_signals = {
         name: sig for name, sig in SIGNAL_REGISTRY.items()
@@ -596,7 +597,7 @@ async def _scoring_round(dp, conn, round_num: int) -> int:
     # ── Tier 3: Template selection for top N ───────────────
     top_symbols = sorted(
         full_composites.items(), key=lambda x: abs(x[1]), reverse=True,
-    )[:TRADE_REC_TOP_N]
+    )[: rs.trade_rec_top_n]
 
     def _build_rec(sym: str, comp_score: float):
         quote = quotes.get(sym)

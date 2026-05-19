@@ -45,6 +45,8 @@ Before changing code, check **[change-impact-map.md](change-impact-map.md)** for
 
 ## Glossary
 
-Domain and engineering terms live in **[plain-english-glossary.md](plain-english-glossary.md)** (research host, **QualityMatrix**, **WM routing**, heartbeat, Independent Mode, MDA, token cap, safety rails, etc.). Link there in PRs instead of redefining terms.
+Domain and engineering terms live in **[plain-english-glossary.md](plain-english-glossary.md)** (research host, **QualityMatrix**, **WM routing**, **master ProfitConfig**, `--simulate`, heartbeat, Independent Mode, MDA, token cap, safety rails, etc.). Link there in PRs instead of redefining terms.
+
+Profitability / simulation changes: also read **[simulation-and-optimization.md](simulation-and-optimization.md)** and run `tests/test_simulation.py`, `tests/test_optimizer.py`, `tests/test_central_profit_config.py` as appropriate.
 
 If a term is unclear, add or update the glossary entry before implementing.

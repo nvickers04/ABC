@@ -43,8 +43,11 @@ def test_summary_prints(capsys):
 
 def test_singleton_after_reload():
     os.environ.pop(PROFIT_PROFILE_ENV, None)
-    reload_profit_config()
+    inst = reload_profit_config()
+    assert get_profit_config() is inst
     assert get_profit_config() is get_profit_config()
+    inst.reload(dotenv=False)
+    assert get_profit_config() is inst
 
 
 def test_normalize_profile_rejects_unknown():

@@ -409,6 +409,118 @@ def check_trader_operating_context(rep: Reporter) -> None:
         rep.fail("Trader operating mode", "context read failed", detail=str(e))
 
 
+def check_profit_api(rep: Reporter, *, base_url: str | None = None) -> None:
+    """GET /profit_summary — 24h stats and active ProfitConfig (optional sidecar)."""
+    import httpx
+
+    root = (base_url or os.getenv("PROFIT_API_URL", "http://127.0.0.1:8787")).rstrip("/")
+    url = f"{root}/profit_summary"
+    try:
+        with httpx.Client(timeout=5.0) as client:
+            resp = client.get(url)
+        if resp.status_code != 200:
+            rep.fail("Profit API", f"HTTP {resp.status_code}", detail=url)
+            return
+        data = resp.json()
+        stats = data.get("stats_24h") or {}
+        active = data.get("active_config") or {}
+        profile = active.get("profit_profile", "?")
+        mode = active.get("trading_mode", "?")
+        cycles = int(stats.get("cycles") or 0)
+        pnl = float(stats.get("total_cycle_pnl_usd") or 0)
+        llm = float(stats.get("llm_cost_usd") or 0)
+        detail = (
+            f"profile={profile} mode={mode} cycles_24h={cycles} "
+            f"pnl_24h=${pnl:+.2f} llm=${llm:.4f}"
+        )
+        if cycles == 0:
+            rep.warn("Profit API", "reachable but no cycles in window", detail=detail)
+        else:
+            rep.ok("Profit API", url, detail=detail)
+    except httpx.ConnectError:
+        rep.skip(
+            "Profit API",
+            "not running",
+            detail=f"start: python -m api  then {url}",
+        )
+    except httpx.TimeoutException:
+        rep.fail("Profit API", "timeout", detail=url)
+    except Exception as e:
+        rep.fail("Profit API", "request failed", detail=str(e))
+
+
+def apply_health_report_to_reporter(rep: Reporter, report: dict[str, Any]) -> None:
+    """Map :func:`core.observability.health_report.build_health_report` into checks."""
+    status = report.get("overall_status", "healthy")
+    if status == "healthy":
+        rep.ok("Observability", f"overall={status}")
+    elif status == "degraded":
+        rep.warn("Observability", f"overall={status}")
+    else:
+        rep.fail("Observability", f"overall={status}")
+
+    profile = report.get("active_profile", "?")
+    levers = (report.get("profit_config") or {}).get("key_levers") or {}
+    rep.ok(
+        "ProfitConfig",
+        f"profile={profile} mode={levers.get('trading_mode')}",
+        detail=(
+            f"loss_cap={levers.get('max_daily_loss_pct')}% "
+            f"dd_cap={levers.get('intraday_drawdown_pct')}% "
+            f"llm_cap=${levers.get('max_daily_llm_cost')}"
+        ),
+    )
+
+    hb = report.get("research_heartbeat") or {}
+    if hb.get("operational"):
+        rep.ok("Research heartbeat (report)", "operational", detail=f"age_s={hb.get('age_s')}")
+    elif hb.get("last_ts"):
+        rep.warn("Research heartbeat (report)", "not operational", detail=str(hb))
+    else:
+        rep.fail("Research heartbeat (report)", "missing", detail=str(hb))
+
+    daily = report.get("daily_summary") or {}
+    rep.ok(
+        "Daily cycle summary",
+        f"{daily.get('cycles', 0)} cycles today",
+        detail=f"pnl=${daily.get('total_cycle_pnl_usd', 0):+.2f} llm=${daily.get('llm_cost_usd', 0):.4f}",
+    )
+
+    sim = report.get("simulation") or {}
+    if sim.get("latest_export_csv"):
+        rep.ok(
+            "Simulation export",
+            sim["latest_export_csv"].get("path", "?"),
+            detail=sim["latest_export_csv"].get("mtime_utc", ""),
+        )
+
+    skip_info = {
+        "profit_cycles_missing_today",
+        "profit_cycles_missing_window",
+        "simulation_mode_active",
+    }
+    for alert in report.get("alerts") or []:
+        code = alert.get("code", "alert")
+        sev = alert.get("severity", "info")
+        msg = alert.get("message", "")
+        detail = alert.get("detail", "")
+        if sev == "critical":
+            rep.fail(f"Alert:{code}", msg, detail=detail)
+        elif sev == "warn":
+            rep.warn(f"Alert:{code}", msg, detail=detail)
+        elif code not in skip_info:
+            rep.ok(f"Alert:{code}", msg, detail=detail)
+
+
+def check_observability_report(rep: Reporter, *, role: str = "trader") -> dict[str, Any]:
+    """Build central health report and add Reporter checks."""
+    from core.observability.health_report import build_health_report
+
+    report = build_health_report(role=role)
+    apply_health_report_to_reporter(rep, report)
+    return report
+
+
 def run_platform_checks(
     rep: Reporter,
     *,
@@ -417,6 +529,9 @@ def run_platform_checks(
     include_scoring: bool = False,
     include_evolution: bool = False,
     include_trader_context: bool = False,
+    include_profit_api: bool = True,
+    profit_api_url: str | None = None,
+    include_observability: bool = True,
 ) -> bool:
     """Postgres + heartbeat + token. Returns True if Postgres config present."""
     if not check_database_url_config(rep):
@@ -433,6 +548,13 @@ def run_platform_checks(
         check_template_evolution(rep)
     if include_trader_context:
         check_trader_operating_context(rep)
+    if include_profit_api:
+        check_profit_api(rep, base_url=profit_api_url)
+    if include_observability:
+        try:
+            check_observability_report(rep, role=role)
+        except Exception as e:
+            rep.warn("Observability report", "build failed", detail=str(e))
     return True
 
 

@@ -11,6 +11,7 @@
 #
 # Logs: docker logs -f abc-research-host
 # Health: docker inspect --format='{{.State.Health.Status}}' abc-research-host
+# Status API: set ABC_HEALTH_ROLE=researcher in docker-compose.status.yml
 
 networks:
   postgres_default:

@@ -22,6 +22,7 @@
 
 | Doc | Purpose |
 |-----|---------|
+| [simulation-and-optimization.md](simulation-and-optimization.md) | Master **ProfitConfig**, **`--simulate`**, `optimize_profiles.py`, dashboard, profiles |
 | [codebase-layout.md](codebase-layout.md) | Where code lives; canonical imports; migration backlog |
 | [data-sources.md](data-sources.md) | MDA, IBKR, yfinance, Grok — process ownership |
 | [signal-formula-spec.md](signal-formula-spec.md) | Signal math contracts |

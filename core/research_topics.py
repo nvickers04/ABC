@@ -1,11 +1,18 @@
 """Topic categorization for the agent's research cache TTL policy.
 
-Research cache TTL categorization for agent research queries.
+TTLs come from master ProfitConfig (:func:`core.central_profit_config.get_research_settings`)
+via :class:`core.memory_config.MemoryConfig` — same values as the trader's research() cache.
 """
 
 from __future__ import annotations
 
 _TICKER_SYMBOLS: set[str] = set()
+
+
+def invalidate_research_topic_caches() -> None:
+    """Clear lazy universe cache after ProfitConfig profile reload."""
+    global _TICKER_SYMBOLS
+    _TICKER_SYMBOLS = set()
 
 
 def _get_ticker_symbols() -> set[str]:
@@ -28,9 +35,9 @@ def _categorize_query(query: str) -> tuple[str, int]:
       sector - industry, sector rotation         -> TTL=4h
       ticker - specific symbol mentions          -> TTL=30min
     """
-    from core.memory_config import get_memory_config
+    from core.central_profit_config import get_research_settings
 
-    mem = get_memory_config()
+    mem = get_research_settings()
     q = query.upper()
     tickers = _get_ticker_symbols()
     for sym in tickers:
@@ -46,4 +53,5 @@ __all__ = [
     "_TICKER_SYMBOLS",
     "_get_ticker_symbols",
     "_categorize_query",
+    "invalidate_research_topic_caches",
 ]

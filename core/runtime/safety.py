@@ -22,13 +22,15 @@ from policy without disturbing this slice.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
-from typing import Optional
+from dataclasses import dataclass, field
+from typing import Any, Optional
 
 from core.log_context import get_logger
 from core.runtime.interfaces import BrokerGatewayProtocol, CostTrackerProtocol
 
 logger = get_logger(__name__)
+
+_DEFAULT_WARN_RATIO = 0.85
 
 
 @dataclass
@@ -46,6 +48,51 @@ class SafetyVerdict:
     daily_loss_pct: Optional[float] = None
     drawdown_pct: Optional[float] = None
     llm_cost_breached: bool = False
+
+
+@dataclass
+class SafetyObserveSnapshot:
+    """Non-triggering safety readout for health/status APIs."""
+
+    thresholds: dict[str, float] = field(default_factory=dict)
+    metrics: dict[str, Any] = field(default_factory=dict)
+    near_limit: dict[str, bool] = field(default_factory=dict)
+    breached: dict[str, bool] = field(default_factory=dict)
+    warnings: list[str] = field(default_factory=list)
+    verdict: SafetyVerdict = field(default_factory=SafetyVerdict)
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "thresholds": dict(self.thresholds),
+            "metrics": dict(self.metrics),
+            "near_limit": dict(self.near_limit),
+            "breached": dict(self.breached),
+            "warnings": list(self.warnings),
+            "verdict": {
+                "triggered": self.verdict.triggered,
+                "reason": self.verdict.reason,
+                "daily_loss_pct": self.verdict.daily_loss_pct,
+                "drawdown_pct": self.verdict.drawdown_pct,
+                "llm_cost_breached": self.verdict.llm_cost_breached,
+            },
+        }
+
+
+def safety_controller_from_profit_config(
+    gateway: BrokerGatewayProtocol,
+    cost_tracker: CostTrackerProtocol,
+) -> SafetyController:
+    """Build :class:`SafetyController` from master :func:`~core.central_profit_config.get_profit_config`."""
+    from core.central_profit_config import get_profit_config
+
+    risk = get_profit_config().risk
+    return SafetyController(
+        gateway,
+        cost_tracker,
+        max_daily_loss_pct=float(risk.max_daily_loss_pct),
+        intraday_drawdown_pct=float(risk.intraday_drawdown_pct),
+        max_daily_llm_cost=float(risk.max_daily_llm_cost),
+    )
 
 
 class SafetyController:
@@ -180,3 +227,74 @@ class SafetyController:
                 f"LLM cost ceiling ${self.max_daily_llm_cost} reached"
             )
         return verdict
+
+    def observe(self, *, warn_ratio: float = _DEFAULT_WARN_RATIO) -> SafetyObserveSnapshot:
+        """Evaluate limits and return metrics + near-limit warnings (no side effects)."""
+        verdict = self.evaluate()
+        snap = SafetyObserveSnapshot(
+            thresholds={
+                "max_daily_loss_pct": self.max_daily_loss_pct,
+                "intraday_drawdown_pct": self.intraday_drawdown_pct,
+                "max_daily_llm_cost_usd": self.max_daily_llm_cost,
+            },
+            verdict=verdict,
+        )
+        snap.metrics["daily_loss_pct"] = verdict.daily_loss_pct
+        snap.metrics["drawdown_pct"] = verdict.drawdown_pct
+
+        try:
+            summary = self.cost_tracker.get_budget_summary()
+            spent = float(summary.today_llm_cost)
+            snap.metrics["today_llm_cost_usd"] = spent
+            if self.max_daily_llm_cost > 0:
+                ratio = spent / self.max_daily_llm_cost
+                snap.metrics["llm_cost_ratio"] = round(ratio, 4)
+                snap.breached["llm_cost"] = ratio >= 1.0
+                snap.near_limit["llm_cost"] = ratio >= warn_ratio and ratio < 1.0
+                if snap.near_limit["llm_cost"]:
+                    snap.warnings.append(
+                        f"LLM cost at {ratio * 100:.0f}% of ${self.max_daily_llm_cost:.2f} daily cap"
+                    )
+        except Exception as exc:
+            snap.metrics["llm_cost_error"] = str(exc)
+
+        if verdict.daily_loss_pct is not None:
+            snap.breached["daily_loss"] = True
+            snap.warnings.append(f"Daily loss limit breached: {verdict.daily_loss_pct:.2f}%")
+        elif (
+            verdict.daily_loss_pct is None
+            and self.start_of_day_cash
+            and self.max_daily_loss_pct > 0
+        ):
+            current = self.gateway.net_liquidation if self.gateway else 0
+            if current <= 0:
+                current = self.gateway.cash_value if self.gateway else 0
+            if current > 0 and self.start_of_day_cash > 0:
+                loss_pct = (self.start_of_day_cash - current) / self.start_of_day_cash * 100
+                snap.metrics["daily_loss_pct_est"] = round(loss_pct, 4)
+                if loss_pct >= self.max_daily_loss_pct * warn_ratio and loss_pct < self.max_daily_loss_pct:
+                    snap.near_limit["daily_loss"] = True
+                    snap.warnings.append(
+                        f"Daily loss at {loss_pct:.2f}% (limit {self.max_daily_loss_pct}%)"
+                    )
+
+        if verdict.drawdown_pct is not None:
+            snap.breached["drawdown"] = True
+            snap.warnings.append(f"Intraday drawdown breached: {verdict.drawdown_pct:.2f}%")
+        elif self.session_high_water and self.intraday_drawdown_pct > 0:
+            current = self.gateway.net_liquidation if self.gateway else 0
+            if current <= 0:
+                current = self.gateway.cash_value if self.gateway else 0
+            if current > 0 and self.session_high_water > 0:
+                dd = (self.session_high_water - current) / self.session_high_water * 100
+                snap.metrics["drawdown_pct_est"] = round(dd, 4)
+                if dd >= self.intraday_drawdown_pct * warn_ratio and dd < self.intraday_drawdown_pct:
+                    snap.near_limit["drawdown"] = True
+                    snap.warnings.append(
+                        f"Drawdown at {dd:.2f}% (limit {self.intraday_drawdown_pct}%)"
+                    )
+
+        if verdict.triggered and verdict.reason and verdict.reason not in snap.warnings:
+            snap.warnings.insert(0, verdict.reason)
+
+        return snap

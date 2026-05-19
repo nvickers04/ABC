@@ -250,6 +250,10 @@ memory/*.db-shm
 memory/*.db-journal
 data/vector_db/
 data/local_working_memory.json
+data/sim_exports/
+data/quality_matrix_learned.json
+data/live_profile_suggestion.json
+data/e2e_validation_opt.json
 .testmondata
 
 # Local Python tooling (repo uses .venv at root)

@@ -36,25 +36,49 @@ RESEARCH_UNIVERSE = [
 FORCE_EXIT_MINUTE = 955         # 15:55 ET — force exit 5 min before close (minute of day)
 SLIPPAGE_BPS = 2                # 2 basis points per trade (slippage + commission)
 
-# ── Pacing / economy ───────────────────────────────────────────
-ROUND_DELAY_SECS = 30             # pause between rounds to reduce LLM cost burn
+# ── Pacing / economy (profile-aware via ProfitConfig — see __getattr__) ───
+ROUND_DELAY_SECS = 30
 
-# ── Signal combination engine ──────────────────────────────────
-MIN_SHARED_PERIODS_FOR_COMBINATION = 10   # min shared periods before combiner can compute weights
-SIGNAL_WEIGHT_LOOKBACK_DAYS = 10          # d in Step 8: recent periods for expected return
-COMPOSITE_TRADE_THRESHOLD = 0.25          # minimum |composite| to generate a trade
-CV_BOOTSTRAP_SAMPLES = 1000              # bootstrap iterations for CV estimation
-TEMPLATE_EVOLUTION_TRAIN_PCT = 0.70       # walk-forward train fraction
-TEMPLATE_EVOLUTION_MIN_TRADES = 30        # min trades per template for stable metrics
+# ── Signal combination / templates (profile-aware via __getattr__) ─────────
+MIN_SHARED_PERIODS_FOR_COMBINATION = 10
+SIGNAL_WEIGHT_LOOKBACK_DAYS = 10
+COMPOSITE_TRADE_THRESHOLD = 0.25
+CV_BOOTSTRAP_SAMPLES = 1000
+TEMPLATE_EVOLUTION_TRAIN_PCT = 0.70
+TEMPLATE_EVOLUTION_MIN_TRADES = 30
 
-# Tiered scoring: wide cheap scan → narrow expensive scan → trade recs
-TIER1_UNIVERSE_SIZE = 25         # Wide scan: bulk/cached signals only (no option chains)
-DEEP_SCAN_TOP_N = 10             # Tier 2: top N from Tier 1 get full 50 signals + option chains
-TRADE_REC_TOP_N = 5              # Tier 3: top N from Tier 2 get template selection
+# Tiered scoring (profile-aware via __getattr__)
+TIER1_UNIVERSE_SIZE = 25
+DEEP_SCAN_TOP_N = 10
+TRADE_REC_TOP_N = 5
 
-# Template evolution scheduling
-EVOLUTION_COOLDOWN_MARKET_HOURS = 1800   # 30 min between evolution rounds during market
-EVOLUTION_COOLDOWN_OFF_HOURS = 300       # 5 min between rounds outside market hours
+# Template evolution scheduling (profile-aware via __getattr__)
+EVOLUTION_COOLDOWN_MARKET_HOURS = 1800
+EVOLUTION_COOLDOWN_OFF_HOURS = 300
+
+_PROFILE_AWARE_ATTRS: dict[str, str] = {
+    "ROUND_DELAY_SECS": "round_delay_secs",
+    "MIN_SHARED_PERIODS_FOR_COMBINATION": "min_shared_periods_for_combination",
+    "SIGNAL_WEIGHT_LOOKBACK_DAYS": "signal_weight_lookback_days",
+    "COMPOSITE_TRADE_THRESHOLD": "composite_trade_threshold",
+    "TEMPLATE_EVOLUTION_TRAIN_PCT": "template_evolution_train_pct",
+    "TEMPLATE_EVOLUTION_MIN_TRADES": "template_evolution_min_trades",
+    "TIER1_UNIVERSE_SIZE": "tier1_universe_size",
+    "DEEP_SCAN_TOP_N": "deep_scan_top_n",
+    "TRADE_REC_TOP_N": "trade_rec_top_n",
+    "EVOLUTION_COOLDOWN_MARKET_HOURS": "evolution_cooldown_market_hours",
+    "EVOLUTION_COOLDOWN_OFF_HOURS": "evolution_cooldown_off_hours",
+}
+
+
+def __getattr__(name: str):
+    """Resolve tuning constants from master ProfitConfig when accessed on the module."""
+    field = _PROFILE_AWARE_ATTRS.get(name)
+    if field is not None:
+        from core.central_profit_config import get_research_settings
+
+        return getattr(get_research_settings(), field)
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
 # (Forward-return horizon and resolution are now per-signal attributes
 # on the Signal subclass: `return_resolution`, `return_horizon`,

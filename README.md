@@ -26,6 +26,8 @@ Grok (ReAct Brain)  →  Tools (thin wrappers)  →  IBKR Execution
 ```
 ├── core/              # Agent loop, config, runtime, quality policy
 │   ├── agent.py       # ReAct cycle
+│   ├── central_profit_config.py  # Master ProfitConfig singleton + simulation
+│   ├── profit_profiles.py        # conservative / balanced / aggressive presets
 │   ├── quality/       # QualityMatrix (risk, tool gates, provenance)
 │   └── runtime/       # Safety, scheduler, operating context, WM routing
 ├── tools/             # Thin tool wrappers (account, orders, research, …)
@@ -35,12 +37,12 @@ Grok (ReAct Brain)  →  Tools (thin wrappers)  →  IBKR Execution
 ├── research/          # Universe config, simulator; research host in research/host.py
 ├── signals/           # Scorers, combiner, templates (used by research host)
 ├── docs/              # Ops and engineering (see docs/README.md)
-├── scripts/           # run_research.ps1, health.py, smoke_tools.py, verify_trader_db.py
+├── scripts/           # dashboard.py, optimize_profiles.py, health.py, …
 ├── __main__.py        # Trader: python __main__.py  (Grok + IBKR)
 └── pyproject.toml     # Pytest config; research host: python -m research
 ```
 
-**Documentation:** [docs/README.md](docs/README.md) · [Entry points](docs/entry-points.md) · [Code layout](docs/codebase-layout.md)
+**Documentation:** [docs/README.md](docs/README.md) · [Entry points](docs/entry-points.md) · [Code layout](docs/codebase-layout.md) · [Simulation & optimization](docs/simulation-and-optimization.md)
 
 ## Entry points (summary)
 
@@ -97,6 +99,20 @@ python __main__.py                 # trader (in-process scorer if no research he
 python __main__.py --account live  # live — use launch checklist first
 ```
 
+### Profitability: master ProfitConfig, simulation, and optimization
+
+All risk, loop, memory, prompt, and tool **centralized levers** compose into one **[master `ProfitConfig`](core/central_profit_config.py)** singleton (`get_profit_config()`; call `.reload()` after env/CLI changes). Select a **ProfitConfig profile** with **`PROFIT_PROFILE`** or **`--profit-profile`**: `conservative`, `balanced`, `aggressive`, or evolved names in `data/evolved_profiles.json`.
+
+| Task | Command |
+|------|---------|
+| Inspect levers | `python __main__.py --config-summary --profit-profile balanced` |
+| Historical backtest | `python __main__.py --simulate conservative,balanced,aggressive --sim-start 2024-06-03 --sim-end 2024-06-28` |
+| Optimize profiles | `python scripts/optimize_profiles.py --days 30` · add `--quick` · `--parallel 2` optional |
+| Live cycle dashboard | `python scripts/dashboard.py --days 7` |
+| Suggest profile from logs | `python __main__.py --live-optimize --live-optimize-days 7` |
+
+Full guide (terminology, flags, composite scoring, P&L impact): **[docs/simulation-and-optimization.md](docs/simulation-and-optimization.md)** · glossary: **[docs/plain-english-glossary.md](docs/plain-english-glossary.md)**.
+
 ## Environment Variables
 
 | Variable | Description |
@@ -108,6 +124,9 @@ python __main__.py --account live  # live — use launch checklist first
 | `IBKR_CLIENT_ID` | Client ID (default: 1) |
 | `RISK_PER_TRADE` | % of cash balance per trade (override mode default) |
 | `CASH_ONLY` | `true` (default) — enforce cash-only, no shorts |
+| `PROFIT_PROFILE` | ProfitConfig profile: `conservative`, `balanced`, `aggressive`, or evolved name (`data/evolved_profiles.json`) |
+| `ABC_SIM_DEFAULT_COMPOSITE_SCORE` | Sim/backtest trade threshold default when env unset (default `0.72`) |
+| `ABC_MAX_BACKTEST_CALENDAR_DAYS` | Max inclusive calendar span for `--simulate` / optimizer (default `400`) |
 
 ## Trading Modes
 

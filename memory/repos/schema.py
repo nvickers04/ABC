@@ -563,6 +563,23 @@ def init_db():
         CREATE INDEX IF NOT EXISTS idx_provenance_ts ON decision_provenance(ts);
         CREATE INDEX IF NOT EXISTS idx_provenance_cycle ON decision_provenance(cycle_id);
         CREATE INDEX IF NOT EXISTS idx_provenance_type ON decision_provenance(decision_type);
+
+        -- QualityMatrix RL trade outcomes (optional learn_from_history)
+        CREATE TABLE IF NOT EXISTS quality_matrix_trade_outcomes (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            ts TEXT NOT NULL,
+            session_date TEXT,
+            symbol TEXT,
+            profit_profile TEXT,
+            won INTEGER NOT NULL DEFAULT 0,
+            realized_rr REAL,
+            pnl_usd REAL,
+            source TEXT,
+            payload TEXT
+        );
+        CREATE INDEX IF NOT EXISTS idx_qm_trade_outcomes_ts ON quality_matrix_trade_outcomes(ts);
+        CREATE INDEX IF NOT EXISTS idx_qm_trade_outcomes_profile
+            ON quality_matrix_trade_outcomes(profit_profile, ts);
     """)
 
     # ── Signal combination engine tables ─────────────────────────

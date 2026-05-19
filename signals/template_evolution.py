@@ -22,12 +22,6 @@ import numpy as np
 
 from data.market_hours import get_market_hours_provider
 from memory import get_db
-from research.config import (
-    EVOLUTION_COOLDOWN_MARKET_HOURS,
-    EVOLUTION_COOLDOWN_OFF_HOURS,
-    TEMPLATE_EVOLUTION_MIN_TRADES,
-    TEMPLATE_EVOLUTION_TRAIN_PCT,
-)
 from research.simulator import simulate
 from signals.templates import (
     TEMPLATE_DEFS,
@@ -51,11 +45,10 @@ _MUTATION_DELTA = {
     "atr_pct_max": 0.2,
 }
 
-# Evolution tuning (polish for better search without changing core architecture)
-EVOLUTION_MUTATIONS_PER_TEMPLATE = 10          # More attempts = better chance of finding improvements
-EVOLUTION_EXPLORATION_RATE = 0.18              # Probability of accepting a slightly worse mutation
-EVOLUTION_WORSE_ACCEPT_TOLERANCE = 0.07        # Accept mutations up to ~7% worse for exploration
-EVOLUTION_DIRECTED_MUTATION_PROB = 0.35        # Chance to do a "smart" directed mutation (widen/narrow/shift)
+def _evolution_settings():
+    from core.central_profit_config import get_research_settings
+
+    return get_research_settings()
 
 
 def _normalize_boundary_pairs(params: dict[str, float]) -> dict[str, float]:
@@ -197,10 +190,11 @@ async def run_template_evolution() -> None:
         try:
             # Determine cooldown based on market hours
             is_open = mhp.is_market_open(include_extended=False)
+            ev = _evolution_settings()
             cooldown = (
-                EVOLUTION_COOLDOWN_MARKET_HOURS
+                ev.evolution_cooldown_market_hours
                 if is_open
-                else EVOLUTION_COOLDOWN_OFF_HOURS
+                else ev.evolution_cooldown_off_hours
             )
 
             await _evolution_round(conn)
@@ -230,16 +224,18 @@ async def _evolution_round(conn) -> None:
     t0 = time.time()
 
     # Load historical data
+    ev = _evolution_settings()
     composites = _load_historical_composites(conn)
-    if len(composites) < TEMPLATE_EVOLUTION_MIN_TRADES:
+    if len(composites) < ev.template_evolution_min_trades:
         logger.debug(
             "Not enough composite+forward-return rows (%d < %d) — skipping evolution",
-            len(composites), TEMPLATE_EVOLUTION_MIN_TRADES,
+            len(composites),
+            ev.template_evolution_min_trades,
         )
         return
 
     # Walk-forward split
-    split_idx = int(len(composites) * TEMPLATE_EVOLUTION_TRAIN_PCT)
+    split_idx = int(len(composites) * ev.template_evolution_train_pct)
     train_data = composites[:split_idx]
     oos_data = composites[split_idx:]
 
@@ -264,7 +260,7 @@ async def _evolution_round(conn) -> None:
         best_mutation = None
         best_fitness = current_oos_metrics.get("search_fitness", 0.0)
 
-        for _ in range(EVOLUTION_MUTATIONS_PER_TEMPLATE):
+        for _ in range(ev.evolution_mutations_per_template):
             mutated = _mutate_boundaries(tname, current_b, tdef)
 
             # Quick reject on training data
@@ -279,10 +275,10 @@ async def _evolution_round(conn) -> None:
             accept = False
             if mutation_fitness > best_fitness:
                 accept = True
-            elif random.random() < EVOLUTION_EXPLORATION_RATE:
+            elif random.random() < ev.evolution_exploration_rate:
                 # Exploration: occasionally accept a slightly worse mutation
                 relative = mutation_fitness / max(best_fitness, 1e-6)
-                if relative > (1.0 - EVOLUTION_WORSE_ACCEPT_TOLERANCE):
+                if relative > (1.0 - ev.evolution_worse_accept_tolerance):
                     accept = True
                     logger.debug(
                         "Template %s accepted exploratory worse mutation "
@@ -313,7 +309,8 @@ async def _evolution_round(conn) -> None:
         "Evolution round complete: %d/%d templates improved in %.1fs "
         "(mutations=%d, exploration_rate=%.2f)",
         improved, len(TEMPLATE_DEFS), elapsed,
-        EVOLUTION_MUTATIONS_PER_TEMPLATE, EVOLUTION_EXPLORATION_RATE,
+        ev.evolution_mutations_per_template,
+        ev.evolution_exploration_rate,
     )
 
 
@@ -335,7 +332,7 @@ def _mutate_boundaries(
     params = [k for k in current if not k.startswith("_")]
 
     # Decide mutation style
-    if random.random() < EVOLUTION_DIRECTED_MUTATION_PROB and len(params) >= 2:
+    if random.random() < _evolution_settings().evolution_directed_mutation_prob and len(params) >= 2:
         style = random.choice(["widen", "narrow", "shift"])
         if style == "widen":
             # Make the allowed range larger

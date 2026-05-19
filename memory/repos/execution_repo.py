@@ -199,6 +199,23 @@ def record_trade(
         except Exception as match_err:
             logger.debug(f"Trade-signal matching failed: {match_err}")
 
+        try:
+            from core.quality.quality_learning import learning_enabled, record_trade_outcome_and_maybe_refit
+
+            if learning_enabled():
+                record_trade_outcome_and_maybe_refit(
+                    {
+                        "symbol": symbol,
+                        "won": pnl > 0,
+                        "pnl_usd": pnl,
+                        "profit_profile": None,
+                        "source": "live",
+                        "side": side,
+                    }
+                )
+        except Exception:
+            pass
+
         return trade_id
     except Exception as e:
         logger.warning(f"Failed to record trade: {e}")

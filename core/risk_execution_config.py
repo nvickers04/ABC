@@ -1,7 +1,9 @@
 """Single source for trading risk, IBKR execution, MDA pacing, and split-host heartbeat rules.
 
-Import via :func:`get_risk_execution_config` from :mod:`core.config`, safety, MDA budget,
-heartbeat, and execution helpers — do not duplicate these constants elsewhere.
+Composed into the master :class:`~core.central_profit_config.ProfitConfig` singleton
+(``get_profit_config()``). Import via :func:`get_risk_execution_config` from
+:mod:`core.config`, safety, MDA budget, heartbeat, and execution helpers — do not
+duplicate these constants elsewhere.
 """
 
 from __future__ import annotations
@@ -441,6 +443,11 @@ _risk_execution_config_override: RiskExecutionConfig | None = None
 @lru_cache(maxsize=1)
 def get_risk_execution_config() -> RiskExecutionConfig:
     """Return the process-wide :class:`RiskExecutionConfig` singleton."""
+    from core.profit_config_context import get_thread_risk_config
+
+    thread_cfg = get_thread_risk_config()
+    if thread_cfg is not None:
+        return thread_cfg
     if _risk_execution_config_override is not None:
         return _risk_execution_config_override
     return RiskExecutionConfig()

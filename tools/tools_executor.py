@@ -162,7 +162,7 @@ from tools.tools_options import _normalize_expiration
 
 async def _handle_plan_order(executor, params: dict) -> Any:
     """Wrapper: unpack params dict → ToolExecutor._plan_order(**kw)."""
-    return executor._plan_order(
+    plan = executor._plan_order(
         symbol=params.get("symbol", ""),
         side=params.get("side", "BUY"),
         quantity=int(params.get("quantity", 1)),
@@ -174,6 +174,25 @@ async def _handle_plan_order(executor, params: dict) -> Any:
         order_type=params.get("order_type"),
         limit_price=params.get("limit_price"),
     )
+    if not params.get("execute"):
+        return plan
+    if os.getenv("ABC_SIMULATION") != "1":
+        return plan
+    rec = str(plan.get("recommendation") or "market_order")
+    if rec == "WAIT":
+        return plan
+    if rec in ("adaptive_order", "midprice_order", "relative_order"):
+        rec = "market_order"
+    dispatch = dict(plan.get("suggested_params") or {})
+    dispatch.setdefault("symbol", plan.get("symbol"))
+    dispatch.setdefault("side", plan.get("side"))
+    dispatch.setdefault("quantity", plan.get("quantity"))
+    exec_result = await executor.execute(rec, dispatch)
+    if isinstance(plan, dict):
+        plan["execution"] = (
+            exec_result.to_dict() if hasattr(exec_result, "to_dict") else exec_result
+        )
+    return plan
 
 
 async def _handle_enter_option(executor, params: dict) -> Any:
@@ -737,11 +756,22 @@ class ToolExecutor:
         volume = None
 
         if quote:
-            price = quote.last
-            bid = quote.bid
-            ask = quote.ask
-            volume = quote.volume
-            mid = quote.mid
+            if isinstance(quote, dict):
+                price = quote.get("last") or quote.get("close")
+                bid = quote.get("bid")
+                ask = quote.get("ask")
+                volume = quote.get("volume")
+                mid = (
+                    (float(bid) + float(ask)) / 2.0
+                    if bid and ask
+                    else float(price) if price else None
+                )
+            else:
+                price = quote.last
+                bid = quote.bid
+                ask = quote.ask
+                volume = quote.volume
+                mid = quote.mid
             if bid and ask and bid > 0 and ask > 0 and mid and mid > 0:
                 spread = round(ask - bid, 4)
                 spread_pct = round(spread / mid * 100, 4)
@@ -1911,7 +1941,8 @@ class ToolExecutor:
             # current positions).  Exits/closes/rolls are always allowed.
             # Aliases ``buy``/``sell`` are checked too — same symbol field.
             if (action in _ORDER_ACTIONS or action in ("buy", "sell")) \
-                    and action not in _EXIT_ORDER_ACTIONS:
+                    and action not in _EXIT_ORDER_ACTIONS \
+                    and os.getenv("ABC_SIMULATION") != "1":
                 sym_raw = (params or {}).get("symbol")
                 if isinstance(sym_raw, str) and sym_raw.strip():
                     sym = sym_raw.strip().upper()

@@ -31,6 +31,24 @@ Glossary: [QualityMatrix](plain-english-glossary.md#quality-context-and-working-
 
 ---
 
+## Profitability configuration
+
+| Concern | Module |
+|---------|--------|
+| Master ProfitConfig singleton + `simulate_backtest` | `core/central_profit_config.py` |
+| Built-in / evolved profiles | `core/profit_profiles.py`, `data/evolved_profiles.json` |
+| Profile compose cache (optimizer) | `core/profit_profile_cache.py` |
+| Thread-local composed config (`--parallel`) | `core/profit_config_context.py` |
+| Sub-configs (centralized levers) | `core/risk_execution_config.py`, `loop_config.py`, `memory_config.py`, `prompt_config.py`, `tool_registry.py` |
+| Grid / genetic scoring | `core/profile_optimization.py`, `core/optimizer_backtest.py` |
+| Historical sim runner | `core/simulation/runner.py`, `backtest_llm.py`, `replay_data.py` |
+| Cycle logs + dashboard aggregation | `core/profit_cycle_logger.py`, `core/profit_summary.py` |
+| CLI scripts | `scripts/optimize_profiles.py`, `scripts/dashboard.py` |
+
+Guide: [simulation-and-optimization.md](simulation-and-optimization.md). Glossary: [Profitability configuration](plain-english-glossary.md#profitability-configuration-and-simulation).
+
+---
+
 ## Canonical imports (prefer these)
 
 | Concern | Import from |
@@ -45,6 +63,8 @@ Glossary: [QualityMatrix](plain-english-glossary.md#quality-context-and-working-
 | Tool results | `tools.tool_contract` |
 | Liveness | `core.runtime.heartbeat.is_research_host_alive` |
 | Quality policy | `core.quality.quality_matrix` |
+| ProfitConfig / backtest | `core.central_profit_config.get_profit_config`, `simulate_backtest` |
+| Active sub-config levers | `get_risk_execution_config`, `get_loop_config`, `get_memory_config`, `get_prompt_config`, `get_tool_registry` |
 
 ---
 

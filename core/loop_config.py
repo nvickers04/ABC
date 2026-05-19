@@ -1,5 +1,6 @@
 """Single source for agent loop timing, ReAct limits, quality gates, and JSON parse policy.
 
+Composed into the master :class:`~core.central_profit_config.ProfitConfig` singleton.
 Import via :func:`get_loop_config` from ``core.agent``, ``core.runtime.cycle``,
 ``core.runtime.scheduler``, ``core.quality.quality_matrix``, and ``core.json_parse``.
 """
@@ -424,6 +425,11 @@ _loop_config_override: LoopConfig | None = None
 @lru_cache(maxsize=1)
 def get_loop_config() -> LoopConfig:
     """Return the process-wide :class:`LoopConfig` singleton."""
+    from core.profit_config_context import get_thread_loop_config
+
+    thread_cfg = get_thread_loop_config()
+    if thread_cfg is not None:
+        return thread_cfg
     if _loop_config_override is not None:
         return _loop_config_override
     return LoopConfig()

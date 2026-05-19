@@ -18,6 +18,29 @@ logger = get_logger(__name__)
 # PARAM SANITIZATION — LLM sometimes sends dicts where scalars are expected
 # =============================================================================
 
+def _quote_prices(quote: Any) -> tuple[float | None, float | None, float | None]:
+    """Return (last, bid, ask) from Quote or replay dict."""
+    if quote is None:
+        return None, None, None
+    if isinstance(quote, dict):
+        last = quote.get("last") or quote.get("close")
+        bid = quote.get("bid")
+        ask = quote.get("ask")
+        return (
+            float(last) if last else None,
+            float(bid) if bid else None,
+            float(ask) if ask else None,
+        )
+    last = getattr(quote, "last", None)
+    bid = getattr(quote, "bid", None)
+    ask = getattr(quote, "ask", None)
+    return (
+        float(last) if last else None,
+        float(bid) if bid else None,
+        float(ask) if ask else None,
+    )
+
+
 def _safe_float(val) -> float:
     """Extract float from value, handling dict wrapping from LLM."""
     if isinstance(val, (int, float)):
@@ -126,8 +149,9 @@ def _cost_quote(executor, params, qty_key="quantity"):
         try:
             q = executor.data_provider.get_quote(params.get("symbol"))
             qty = params.get(qty_key)
-            if q and q.ask and qty:
-                return float(q.ask) * int(qty)
+            _last, _bid, ask = _quote_prices(q)
+            if ask and qty:
+                return float(ask) * int(qty)
         except Exception as e:
             logger.debug(f"Cost quote failed: {e}")
         return None
@@ -162,13 +186,14 @@ def _infer_bracket_entry_price(executor, params) -> Optional[float]:
         logger.debug(f"Quote lookup failed for {symbol}: {e}")
         quote = None
 
-    if not quote:
+    last, bid, ask = _quote_prices(quote)
+    if not last and not bid and not ask:
         return None
     if side == "BUY":
-        return quote.ask or quote.last or quote.bid
+        return ask or last or bid
     if side == "SELL":
-        return quote.bid or quote.last or quote.ask
-    return quote.last or quote.ask or quote.bid
+        return bid or last or ask
+    return last or ask or bid
 
 
 # =============================================================================

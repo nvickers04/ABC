@@ -4,6 +4,13 @@ Grok Trader — Entry Point
 Run: ``python __main__.py`` (see ``python __main__.py --help``).
 
 Research scoring and template evolution: ``python -m research``.
+
+Profitability:
+  - ``--config-summary`` / ``--profit-profile`` — inspect master ProfitConfig levers
+  - ``--simulate`` — historical backtest (no live xAI/IBKR); see docs/simulation-and-optimization.md
+  - ``--live-optimize`` — suggest profile from cycle logs only
+
+Production trader on split host: ``--require-research-host`` (see docs/entry-points.md).
 """
 
 from __future__ import annotations
@@ -84,9 +91,9 @@ def _configure_scorer(args) -> None:
         )
         return
 
-    from core.entry_cli import load_profit_config
+    from core.central_profit_config import get_profit_config
 
-    profit = load_profit_config(dotenv=False)
+    profit = get_profit_config().reload(dotenv=False)
     trader_in_process_scorer_never = profit.risk.trader_in_process_scorer_never
     from core.runtime.heartbeat import (
         heartbeat_age_s,
@@ -168,14 +175,57 @@ def _configure_scorer(args) -> None:
 
 def main() -> None:
     """Main entry point."""
-    from core.entry_cli import apply_trader_cli_to_environ, load_profit_config, parse_trader_args
+    from core.central_profit_config import get_profit_config
+    from core.entry_cli import apply_trader_cli_to_environ, parse_trader_args
 
     args = parse_trader_args()
     apply_trader_cli_to_environ(args)
-    profit = load_profit_config(dotenv=not args.test)
+    profit = get_profit_config().reload(dotenv=not args.test)
 
     if getattr(args, "config_summary", False):
         profit.summary()
+        return
+
+    if getattr(args, "live_optimize", False):
+        from core.entry_cli import run_live_optimize_cli
+
+        raise SystemExit(run_live_optimize_cli(args))
+
+    if getattr(args, "simulate", None) is not None:
+        from core.central_profit_config import simulate_backtest, simulate_backtest_compare
+        from core.entry_cli import parse_simulate_profiles
+        from core.simulation.report import format_backtest_comparison, format_backtest_report
+
+        profiles = parse_simulate_profiles(args.simulate)
+        start = getattr(args, "sim_start", None)
+        end = getattr(args, "sim_end", None)
+        if not start or not end:
+            print("Error: --simulate requires --sim-start and --sim-end (YYYY-MM-DD).")
+            sys.exit(2)
+        cash = float(getattr(args, "sim_cash", 100_000.0))
+        from core.profile_optimization import DEFAULT_CYCLES_PER_DAY
+
+        cycles = int(getattr(args, "sim_cycles_per_day", DEFAULT_CYCLES_PER_DAY))
+        print(f"Simulation cycles_per_day={cycles}")
+        if len(profiles) == 1:
+            result = simulate_backtest(profiles[0], start, end, initial_cash=cash, cycles_per_day=cycles)
+            results = [result]
+            print(format_backtest_report(result))
+        else:
+            results = simulate_backtest_compare(
+                profiles, start, end, initial_cash=cash, cycles_per_day=cycles
+            )
+            print(format_backtest_comparison(results))
+
+        if getattr(args, "sim_csv", None) is not None:
+            from core.simulation.csv_export import export_simulation_csv
+
+            csv_path = getattr(args, "sim_csv", None)
+            out = export_simulation_csv(
+                results,
+                path=csv_path if csv_path else None,
+            )
+            print(f"\nTrade log CSV: {out} ({sum(len(r.trade_log) for r in results)} rows)")
         return
 
     setup_logging(verbose=args.verbose)

@@ -67,7 +67,21 @@ MODEL_COSTS = {
     
     # Default fallback (no cached discount — conservative)
     "default": {"input": 2.00, "cached_input": 2.00, "output": 10.00},
+    # Offline backtest shim (same list prices as production reasoning model).
+    "backtest-sim": {"input": 1.25, "cached_input": 0.20, "output": 2.50},
 }
+
+
+def estimate_llm_cost_usd(model: str, tokens_in: int, tokens_out: int) -> float:
+    """USD estimate from prompt/completion counts (same math as :meth:`CostTracker._calculate_cost`)."""
+    costs = MODEL_COSTS.get(model.lower(), MODEL_COSTS["default"])
+    inp = float(costs["input"])
+    cached_rate = float(costs.get("cached_input", inp))
+    out = float(costs["output"])
+    nc = max(0, int(tokens_in))
+    outp = max(0, int(tokens_out))
+    return (nc / 1_000_000) * inp + (outp / 1_000_000) * out
+
 
 # Data kept in-memory only — no daily_store persistence
 

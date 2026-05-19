@@ -15,7 +15,9 @@ TRADER_EPILOG = """\
 examples:
   python __main__.py --test
   python __main__.py --verbose
+  python __main__.py --simulate conservative,balanced,aggressive --sim-start 2024-01-02 --sim-end 2024-03-01
   python __main__.py --require-research-host --verbose
+  python __main__.py --live-optimize
   TRADER_IN_PROCESS_SCORER=never python __main__.py --verbose
 
 scoring policy (pick at most one of --require-research-host / --force-in-process):
@@ -32,13 +34,15 @@ environment:
   IBKR_ACCOUNT_TYPE / --account   paper (default) or live
   XAI_API_KEY or GROK_API_KEY     Required unless --test
 
-See docs/entry-points.md for split-host vs single-machine workflows.
+See docs/entry-points.md and docs/simulation-and-optimization.md for split-host,
+--simulate, and ProfitConfig profiles.
 """
 
 RESEARCH_EPILOG = """\
 examples:
   python -m research
   python -m research --verbose
+  python -m research --profile balanced
   python -m research --no-evolution
 
 notes:
@@ -54,6 +58,21 @@ class _HelpFormatter(
     argparse.RawDescriptionHelpFormatter,
 ):
     """Defaults in help lines plus raw epilog (preserves newlines)."""
+
+
+def add_profit_profile_argument(parser: argparse.ArgumentParser) -> None:
+    """Register ``--profit-profile`` / ``--profile`` (same as trader ``PROFIT_PROFILE``)."""
+    parser.add_argument(
+        "--profit-profile",
+        "--profile",
+        dest="profit_profile",
+        default=None,
+        metavar="PROFILE",
+        help=(
+            "ProfitConfig profile for this process (conservative | balanced | aggressive "
+            "or evolved name in data/evolved_profiles.json). Sets PROFIT_PROFILE before load."
+        ),
+    )
 
 
 def build_trader_parser() -> argparse.ArgumentParser:
@@ -131,14 +150,85 @@ def build_trader_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Print ProfitConfig summary (all levers + P&L notes) and exit.",
     )
+    add_profit_profile_argument(general)
     general.add_argument(
-        "--profit-profile",
-        choices=["conservative", "balanced", "aggressive"],
-        default=None,
-        metavar="PROFILE",
+        "--live-optimize",
+        action="store_true",
         help=(
-            "Apply profitability preset across risk, loop, memory, prompt, and tools "
-            "(conservative | balanced | aggressive). Sets PROFIT_PROFILE."
+            "Analyze last N days of real profit cycle logs and print the best "
+            "PROFIT_PROFILE for tomorrow (lightweight; no backtest). Exits."
+        ),
+    )
+    general.add_argument(
+        "--live-optimize-days",
+        type=int,
+        default=7,
+        metavar="N",
+        help="Lookback for --live-optimize (default: %(default)s calendar days).",
+    )
+    general.add_argument(
+        "--live-optimize-output",
+        metavar="PATH",
+        default=None,
+        help="Write --live-optimize JSON to PATH (default: data/live_profile_suggestion.json).",
+    )
+
+    sim = parser.add_argument_group(
+        "simulation",
+        description="Historical backtest using the real ReAct loop (no IBKR, no live xAI).",
+    )
+    sim.add_argument(
+        "--simulate",
+        nargs="?",
+        const="balanced",
+        metavar="PROFILES",
+        help=(
+            "Run backtest simulation (requires --sim-start/--sim-end). "
+            "PROFILES: one name or comma-separated list, e.g. "
+            "conservative,balanced,aggressive (default with bare --simulate: balanced)."
+        ),
+    )
+    sim.add_argument(
+        "--sim-start",
+        metavar="YYYY-MM-DD",
+        default=None,
+        help="Backtest start date (inclusive).",
+    )
+    sim.add_argument(
+        "--sim-end",
+        metavar="YYYY-MM-DD",
+        default=None,
+        help="Backtest end date (inclusive).",
+    )
+    sim.add_argument(
+        "--sim-cash",
+        type=float,
+        default=100_000.0,
+        metavar="USD",
+        help="Initial simulated equity (default: %(default)s).",
+    )
+    from core.profile_optimization import DEFAULT_CYCLES_PER_DAY
+
+    sim.add_argument(
+        "--sim-cycles-per-day",
+        "--cycles-per-day",
+        type=int,
+        default=DEFAULT_CYCLES_PER_DAY,
+        dest="sim_cycles_per_day",
+        metavar="N",
+        help=(
+            "Agent cycles per trading day, max 4 (default: %(default)s). "
+            "Alias: --cycles-per-day."
+        ),
+    )
+    sim.add_argument(
+        "--sim-csv",
+        nargs="?",
+        const="",
+        metavar="PATH",
+        help=(
+            "Write per-trade CSV (timestamps, ticker, entry/exit, realized R:R, profile). "
+            "Default path: data/sim_exports/backtest_<profiles>_<start>_<end>.csv"
         ),
     )
 
@@ -180,15 +270,41 @@ def build_trader_parser() -> argparse.ArgumentParser:
     return parser
 
 
+def parse_simulate_profiles(simulate_arg: str | None) -> list[str]:
+    """Parse ``--simulate`` value into validated profile names (deduped, stable order)."""
+    from core.profit_profiles import normalize_profit_profile
+
+    raw = (simulate_arg or "balanced").strip()
+    if not raw:
+        raw = "balanced"
+    seen: set[str] = set()
+    profiles: list[str] = []
+    for part in raw.split(","):
+        name = normalize_profit_profile(part.strip())
+        if name not in seen:
+            seen.add(name)
+            profiles.append(name)
+    return profiles
+
+
 def apply_profit_profile_cli_to_environ(args: argparse.Namespace) -> None:
-    """Set ``PROFIT_PROFILE`` when ``--profit-profile`` is passed."""
+    """Set ``PROFIT_PROFILE`` when ``--profit-profile`` or ``--profile`` is passed."""
     import os
 
+    from core.profit_config_state import get_active_profile_label
     from core.profit_profiles import PROFIT_PROFILE_ENV, normalize_profit_profile
 
     profile = getattr(args, "profit_profile", None)
     if profile is not None:
-        os.environ[PROFIT_PROFILE_ENV] = normalize_profit_profile(profile)
+        previous = get_active_profile_label()
+        new_profile = normalize_profit_profile(profile)
+        os.environ[PROFIT_PROFILE_ENV] = new_profile
+        try:
+            from core.profile_rollback import on_profile_applied
+
+            on_profile_applied(previous, str(new_profile))
+        except Exception:
+            pass
 
 
 def apply_trader_cli_to_environ(args: argparse.Namespace) -> None:
@@ -216,6 +332,29 @@ def apply_trader_cli_to_environ(args: argparse.Namespace) -> None:
         os.environ["CASH_ONLY"] = "false"
     if getattr(args, "require_research_host", False):
         os.environ["TRADER_IN_PROCESS_SCORER"] = "never"
+
+
+def run_live_optimize_cli(args: argparse.Namespace) -> int:
+    """Run nightly live-log profile suggestion and print report."""
+    import json
+    from pathlib import Path
+
+    from core.live_profile_optimize import format_live_optimize_report, run_live_optimize
+
+    days = max(1, int(getattr(args, "live_optimize_days", 7) or 7))
+    result = run_live_optimize(days=days)
+    print(format_live_optimize_report(result))
+
+    out = getattr(args, "live_optimize_output", None)
+    if out is None:
+        out = "data/live_profile_suggestion.json"
+    path = Path(out)
+    if not path.is_absolute():
+        path = Path(__file__).resolve().parents[1] / path
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(result, indent=2, default=str), encoding="utf-8")
+    print(f"\nJSON: {path}")
+    return 0
 
 
 def parse_trader_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
@@ -251,25 +390,16 @@ def build_research_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Print ProfitConfig summary (all levers + P&L notes) and exit.",
     )
-    parser.add_argument(
-        "--profit-profile",
-        choices=["conservative", "balanced", "aggressive"],
-        default=None,
-        metavar="PROFILE",
-        help=(
-            "Apply profitability preset (conservative | balanced | aggressive). "
-            "Sets PROFIT_PROFILE before config load."
-        ),
-    )
+    add_profit_profile_argument(parser)
 
     return parser
 
 
 def load_profit_config(*, dotenv: bool = True):
-    """Apply env, reload all sub-configs, sync ``core.config`` — single startup entry."""
-    from core.central_profit_config import load_profit_config as _load
+    """Return the process :class:`ProfitConfig` singleton (reloads from env / CLI)."""
+    from core.central_profit_config import get_profit_config
 
-    return _load(dotenv=dotenv)
+    return get_profit_config().reload(dotenv=dotenv)
 
 
 def parse_research_args(argv: Sequence[str] | None = None) -> argparse.Namespace:

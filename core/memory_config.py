@@ -1,5 +1,6 @@
 """Single source for working memory, prompt budget, context quality, and research cache rules.
 
+Composed into the master :class:`~core.central_profit_config.ProfitConfig` singleton.
 Import via :func:`get_memory_config` from runtime modules, ``memory.working_memory``,
 ``core.agent``, ``core.quality.quality_matrix``, and tools — do not duplicate these constants.
 """
@@ -10,7 +11,7 @@ import os
 from functools import lru_cache
 from typing import Any
 
-from pydantic import BaseModel, Field, model_validator
+from pydantic import AliasChoices, BaseModel, Field, model_validator
 
 # Symbol → sector map for portfolio concentration (state context).
 _SECTOR_MAP_DEFAULT: dict[str, str] = {
@@ -95,6 +96,17 @@ def _env_float(name: str, default: float) -> float:
         return float(raw)
     except ValueError:
         return default
+
+
+def _env_bool(name: str, default: bool) -> bool:
+    raw = os.getenv(name, "").strip().lower()
+    if not raw:
+        return default
+    if raw in ("1", "true", "yes", "on"):
+        return True
+    if raw in ("0", "false", "no", "off"):
+        return False
+    return default
 
 
 class MemoryConfig(BaseModel):
@@ -314,6 +326,160 @@ class MemoryConfig(BaseModel):
         default=3,
         description="Profitability: session-boundary trim for provenance snapshots.",
     )
+    quality_matrix_learn_from_history: bool = Field(
+        default=False,
+        validation_alias=AliasChoices("QUALITY_MATRIX_LEARN_FROM_HISTORY"),
+        description=(
+            "Profitability: when True, QualityMatrix learns from closed trades and "
+            "adjusts scoring weights within ±quality_matrix_learn_max_drift_pct of profile base."
+        ),
+    )
+    quality_matrix_learn_max_drift_pct: float = Field(
+        default=15.0,
+        validation_alias=AliasChoices("QUALITY_MATRIX_LEARN_MAX_DRIFT_PCT"),
+        description="Profitability: max ±%% drift of learnable weights from profile base.",
+    )
+    quality_matrix_learn_refit_interval: int = Field(
+        default=25,
+        validation_alias=AliasChoices("QUALITY_MATRIX_LEARN_REFIT_INTERVAL"),
+        description="Profitability: refit learned weights after this many new trades.",
+    )
+    quality_matrix_learn_history_limit: int = Field(
+        default=200,
+        validation_alias=AliasChoices("QUALITY_MATRIX_LEARN_HISTORY_LIMIT"),
+        description="Profitability: max trade outcomes used per refit.",
+    )
+    quality_matrix_learn_rate: float = Field(
+        default=0.08,
+        validation_alias=AliasChoices("QUALITY_MATRIX_LEARN_RATE"),
+        description="Profitability: step size for weight adjustment from reward signal.",
+    )
+
+    # ── Scorer tiers (research host) ────────────────────────────────────────
+    scorer_tier1_universe_size: int = Field(
+        default=25,
+        description="Profitability: wide cheap scan universe size per scoring round.",
+    )
+    scorer_deep_scan_top_n: int = Field(
+        default=10,
+        description="Profitability: symbols receiving full signal + option chain fetch.",
+    )
+    scorer_trade_rec_top_n: int = Field(
+        default=5,
+        description="Profitability: symbols receiving template selection / trade recs.",
+    )
+    scorer_round_delay_secs: int = Field(
+        default=30,
+        description="Profitability: pause between in-process scorer rounds when cadence off.",
+    )
+
+    # ── Signal combiner (research host) ─────────────────────────────────────
+    combiner_min_shared_periods: int = Field(
+        default=10,
+        description="Profitability: min shared periods before optimized combiner weights.",
+    )
+    combiner_signal_weight_lookback_days: int = Field(
+        default=10,
+        description="Profitability: recent periods for combiner expected-return step.",
+    )
+    combiner_composite_trade_threshold: float = Field(
+        default=0.25,
+        description="Profitability: min |composite| for template/trade recommendation paths.",
+    )
+    combiner_neff_circuit_threshold: float = Field(
+        default=2.5,
+        description="Profitability: N_eff below this increments low-N_eff streak counter.",
+    )
+    combiner_neff_circuit_streak: int = Field(
+        default=3,
+        description="Profitability: consecutive low-N_eff rounds before equal-weight fallback.",
+    )
+    combiner_neff_warn_below: float = Field(
+        default=3.0,
+        description="Profitability: log warning when structural N_eff drops below this.",
+    )
+    combiner_snr_floor: float = Field(
+        default=0.05,
+        description="Profitability: drop signals with SNR below floor from weighting.",
+    )
+    combiner_dead_signal_periods: int = Field(
+        default=100,
+        description="Profitability: constant-score periods before dead-signal warning.",
+    )
+    combiner_ewma_halflife_fraction: float = Field(
+        default=0.25,
+        description="Profitability: EWMA half-life as fraction of history for correlation weights.",
+    )
+    combiner_ewma_halflife_min: int = Field(
+        default=30,
+        description="Profitability: minimum EWMA half-life periods for correlation weights.",
+    )
+    combiner_category_weight_cap: float = Field(
+        default=0.40,
+        description="Profitability: max |weight| sum per signal category after normalization.",
+    )
+    combiner_stratify_by_horizon_bucket: bool = Field(
+        default=True,
+        description="Profitability: run combiner inside horizon buckets before merge.",
+    )
+    combiner_ic_window_days: int = Field(
+        default=60,
+        description="Profitability: rolling window for per-signal IC attribution.",
+    )
+    combiner_ic_min_obs: int = Field(
+        default=30,
+        description="Profitability: min observations before IC counts toward retirement.",
+    )
+    combiner_ic_noise_threshold: float = Field(
+        default=0.02,
+        description="Profitability: |IC| below this on trusted sample is noise.",
+    )
+    combiner_ic_retire_streak: int = Field(
+        default=5,
+        description="Profitability: consecutive noise IC rounds before auto-zero weight.",
+    )
+    combiner_ic_attribution_top_k: int = Field(
+        default=5,
+        description="Profitability: top signals logged per IC attribution round.",
+    )
+    combiner_ir_gate_min: float = Field(
+        default=0.05,
+        description="Profitability: estimated IR below this closes advisory quant gate.",
+    )
+
+    # ── Template evolution (research host) ──────────────────────────────────
+    template_evolution_train_pct: float = Field(
+        default=0.70,
+        description="Profitability: walk-forward train fraction for boundary evolution.",
+    )
+    template_evolution_min_trades: int = Field(
+        default=30,
+        description="Profitability: min matched trades before evolving a template slice.",
+    )
+    template_evolution_cooldown_market_hours: int = Field(
+        default=1800,
+        description="Profitability: seconds between evolution rounds during market hours.",
+    )
+    template_evolution_cooldown_off_hours: int = Field(
+        default=300,
+        description="Profitability: seconds between evolution rounds off hours.",
+    )
+    template_evolution_mutations_per_template: int = Field(
+        default=10,
+        description="Profitability: mutation attempts per template per evolution pass.",
+    )
+    template_evolution_exploration_rate: float = Field(
+        default=0.18,
+        description="Profitability: probability of accepting slightly worse boundary mutation.",
+    )
+    template_evolution_worse_accept_tolerance: float = Field(
+        default=0.07,
+        description="Profitability: relative tolerance for exploratory worse mutations.",
+    )
+    template_evolution_directed_mutation_prob: float = Field(
+        default=0.35,
+        description="Profitability: chance of directed widen/narrow/shift mutation.",
+    )
 
     # ── Research caches ─────────────────────────────────────────────────────
     multi_agent_research_ttl_seconds: int = Field(
@@ -415,6 +581,31 @@ class MemoryConfig(BaseModel):
             self,
             "idle_cash_slack_pct",
             _env_float("MEMORY_IDLE_CASH_PCT", self.idle_cash_slack_pct),
+        )
+        object.__setattr__(
+            self,
+            "quality_matrix_learn_from_history",
+            _env_bool("QUALITY_MATRIX_LEARN_FROM_HISTORY", self.quality_matrix_learn_from_history),
+        )
+        object.__setattr__(
+            self,
+            "quality_matrix_learn_max_drift_pct",
+            _env_float("QUALITY_MATRIX_LEARN_MAX_DRIFT_PCT", self.quality_matrix_learn_max_drift_pct),
+        )
+        object.__setattr__(
+            self,
+            "quality_matrix_learn_refit_interval",
+            _env_int("QUALITY_MATRIX_LEARN_REFIT_INTERVAL", self.quality_matrix_learn_refit_interval),
+        )
+        object.__setattr__(
+            self,
+            "quality_matrix_learn_history_limit",
+            _env_int("QUALITY_MATRIX_LEARN_HISTORY_LIMIT", self.quality_matrix_learn_history_limit),
+        )
+        object.__setattr__(
+            self,
+            "quality_matrix_learn_rate",
+            _env_float("QUALITY_MATRIX_LEARN_RATE", self.quality_matrix_learn_rate),
         )
         return self
 
@@ -557,6 +748,11 @@ _memory_config_override: MemoryConfig | None = None
 @lru_cache(maxsize=1)
 def get_memory_config() -> MemoryConfig:
     """Return the process-wide :class:`MemoryConfig` singleton."""
+    from core.profit_config_context import get_thread_memory_config
+
+    thread_cfg = get_thread_memory_config()
+    if thread_cfg is not None:
+        return thread_cfg
     if _memory_config_override is not None:
         return _memory_config_override
     return MemoryConfig()

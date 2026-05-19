@@ -292,6 +292,12 @@ class MarketHoursProvider:
 _market_hours_provider: Optional[MarketHoursProvider] = None
 
 
+def install_market_hours_provider(provider: MarketHoursProvider | None) -> None:
+    """Pin a market-hours provider (``None`` clears singleton)."""
+    global _market_hours_provider
+    _market_hours_provider = provider
+
+
 def get_market_hours_provider(exchange: str = 'NYSE') -> MarketHoursProvider:
     """Get or create global market hours provider instance."""
     global _market_hours_provider

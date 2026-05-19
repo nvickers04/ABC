@@ -17,6 +17,7 @@ from datetime import datetime as _dt
 from typing import Optional
 
 from core.log_context import get_logger
+from core.memory_config import _SECTOR_MAP_DEFAULT as _SECTOR_MAP
 from core.memory_config import get_memory_config
 from core.runtime.interfaces import BrokerGatewayProtocol, MarketHoursProtocol
 

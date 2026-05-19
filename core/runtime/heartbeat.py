@@ -96,9 +96,14 @@ def publish_research_host_heartbeat(
     ts = write_heartbeat(now=now)
     if ts <= 0.0:
         return 0.0
+    profile_label = "balanced"
     try:
+        from core.central_profit_config import get_research_settings
+        from core.research_settings import RESEARCH_HOST_PROFILE_KEY
         from memory import set_research_config
 
+        settings = get_research_settings()
+        profile_label = settings.profile_label
         set_research_config(
             RESEARCH_HOST_STATUS_KEY, float(status), reason="heartbeat", log=False
         )
@@ -108,6 +113,12 @@ def publish_research_host_heartbeat(
         set_research_config(
             RESEARCH_HOST_USAGE_PCT_KEY, float(usage_pct), reason="heartbeat", log=False
         )
+        set_research_config(
+            RESEARCH_HOST_PROFILE_KEY,
+            profile_label,
+            reason="heartbeat",
+            log=False,
+        )
     except Exception as e:
         logger.debug("research_host_status_publish_failed", error=str(e))
     logger.info(
@@ -115,6 +126,7 @@ def publish_research_host_heartbeat(
         status=status,
         round=round_num,
         usage_pct=round(usage_pct, 1),
+        profit_profile=profile_label,
     )
     return ts
 

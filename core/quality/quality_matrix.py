@@ -503,6 +503,12 @@ class QualityMatrix:
         if len(self.recent_provenance) > max_prov:
             self.recent_provenance = self.recent_provenance[-max_prov:]
 
+    def learn_from_trade(self, outcome: dict[str, Any]) -> dict[str, Any]:
+        """Record trade outcome for optional RL weight updates (see ``ProfitConfig.learn_from_history``)."""
+        from core.quality.quality_learning import record_trade_outcome_and_maybe_refit
+
+        return record_trade_outcome_and_maybe_refit(outcome)
+
 
 class QualityMatrixService:
     """Singleton orchestrator for populate, persist, and record operations.
@@ -606,7 +612,9 @@ class QualityMatrixService:
             total_gap = 0.0
             total_n = 0
 
-            lc = get_loop_config()
+            from core.quality.quality_learning import get_scoring_loop_config
+
+            lc = get_scoring_loop_config()
             for r in rows:
                 sym = r["symbol"]
                 n = int(r["n"] or 0)
@@ -878,6 +886,20 @@ class QualityMatrixService:
     def get_matrix(self) -> QualityMatrix:
         """Return the live in-process matrix (mutated by populate/record)."""
         return self.matrix
+
+    def learn_from_trade(self, outcome: dict[str, Any]) -> dict[str, Any]:
+        """Store a closed-trade outcome and optionally refit bounded scoring weights.
+
+        Expected keys (all optional except realized result): ``symbol``, ``won`` or
+        ``win``, ``realized_rr``, ``profit_profile``, ``pnl_usd``, ``source``.
+
+        Returns:
+            Summary dict from :mod:`core.quality.quality_learning` (refit stats or skip reason).
+        """
+        result = self.matrix.learn_from_trade(outcome)
+        if result.get("refitted"):
+            self.populate()
+        return result
 
 
 def get_quality_matrix_service() -> QualityMatrixService:

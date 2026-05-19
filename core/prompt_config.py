@@ -1,5 +1,6 @@
 """Single source for LLM prompts, model slugs, sampling defaults, and quality thresholds.
 
+Composed into the master :class:`~core.central_profit_config.ProfitConfig` singleton.
 Import via :func:`get_prompt_config` from agent, config, operating_context, and
 quality_matrix only — do not duplicate these constants elsewhere.
 """
@@ -472,6 +473,11 @@ _prompt_config_override: PromptConfig | None = None
 @lru_cache(maxsize=1)
 def get_prompt_config() -> PromptConfig:
     """Return the process-wide :class:`PromptConfig` singleton."""
+    from core.profit_config_context import get_thread_prompt_config
+
+    thread_cfg = get_thread_prompt_config()
+    if thread_cfg is not None:
+        return thread_cfg
     if _prompt_config_override is not None:
         return _prompt_config_override
     return PromptConfig()

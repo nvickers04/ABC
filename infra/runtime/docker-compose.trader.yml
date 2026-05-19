@@ -9,6 +9,7 @@
 #
 # Logs: docker logs -f abc-trader
 # Health: docker inspect --format='{{.State.Health.Status}}' abc-trader
+# Status API (optional): docker compose -f infra/runtime/docker-compose.status.yml up -d
 
 networks:
   postgres_default:

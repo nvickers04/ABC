@@ -8,11 +8,16 @@ Architecture:
 
 Grok chains actions until it signals 'done' to refresh context.
 research() is the primary discovery mechanism.
+
+Profitability levers (risk, loop, memory, prompt, tools) come from the master
+:class:`~core.central_profit_config.ProfitConfig` singleton via ``get_loop_config()``,
+``get_risk_execution_config()``, etc. — not from duplicated constants in this module.
+Cycle logs snapshot the active profile via :func:`core.profit_cycle_logger.log_cycle`.
 """
 
 import time
 from datetime import datetime, timedelta, timezone
-from typing import Callable, Optional, cast
+from typing import Any, Callable, Optional, cast
 
 from xai_sdk.chat import system as sdk_system
 from xai_sdk.chat import user as sdk_user
@@ -21,9 +26,6 @@ from core.async_utils import safe_sleep as _safe_sleep
 from core.config import (
     CYCLE_SLEEP_SECONDS,
     EOD_FLATTEN_MINUTES,
-    INTRADAY_DRAWDOWN_PCT,
-    MAX_DAILY_LLM_COST,
-    MAX_DAILY_LOSS_PCT,
     PAPER_AGGRESSIVE,
     PRESCAN_PROMPT_EXPENSIVE_RESEARCH,
     RISK_PER_TRADE,
@@ -31,6 +33,7 @@ from core.config import (
     _system_prompt_inputs,
 )
 from core.loop_config import get_loop_config
+from core.risk_execution_config import get_risk_execution_config
 from core.grok_llm import get_grok_llm
 from core.json_parse import _parse_json_objects
 from core.log_context import (
@@ -115,12 +118,13 @@ class TradingAgent:
         except Exception as _init_qm:
             logger.debug("QualityMatrix startup populate skipped (non-fatal): %s", _init_qm)
 
+        _risk = get_risk_execution_config()
         self._safety = SafetyController(
             gateway,
             self.cost_tracker,
-            max_daily_loss_pct=MAX_DAILY_LOSS_PCT,
-            intraday_drawdown_pct=INTRADAY_DRAWDOWN_PCT,
-            max_daily_llm_cost=MAX_DAILY_LLM_COST,
+            max_daily_loss_pct=_risk.max_daily_loss_pct,
+            intraday_drawdown_pct=_risk.intraday_drawdown_pct,
+            max_daily_llm_cost=_risk.max_daily_llm_cost,
         )
 
         # Circuit breaker
@@ -145,6 +149,8 @@ class TradingAgent:
         self._current_session: str = "unknown"
         self._daily_review_date: Optional[str] = None  # Track which day we've reviewed
         self._pre_scan_date: Optional[str] = None  # Track which day we've pre-scanned
+        self._profit_log_prev_realized_pnl: Optional[float] = None
+        self._profit_last_tool: dict[str, Any] = {}
 
         logger.info("TradingAgent initialized (minimal ReAct mode)")
 
@@ -330,15 +336,43 @@ class TradingAgent:
         """Delegates to :class:`StateContextBuilder` (see ``tools._state_builder``)."""
         return await self._state_context_builder.build()
 
+    def _profit_log_and_return(
+        self,
+        cooldown: int,
+        outcome: str,
+        *,
+        cycle_actions: list[str] | None = None,
+    ) -> int:
+        """Append profitability cycle log and return cooldown (all ``run_cycle`` exits)."""
+        try:
+            from core.central_profit_config import get_profit_config
+
+            get_profit_config().log_cycle(
+                cycle_id=self._cycle_id,
+                outcome=outcome,
+                cooldown_seconds=int(cooldown),
+                session=self._current_session,
+                cycle_summary=self._last_cycle_summary,
+                cycle_actions=cycle_actions,
+                agent=self,
+            )
+        except Exception as exc:
+            logger.debug("ProfitConfig.log_cycle skipped: %s", exc)
+        return int(cooldown)
+
     async def run_cycle(self) -> int:
         """
         Run one cycle of the ReAct loop.
 
         Returns cooldown seconds.
         """
+        cycle_actions: list[str] = []
         self._cycle_failures = 0
         lc = get_loop_config()
         self._cycle_id += 1
+
+        def _ret(cooldown: int, outcome: str) -> int:
+            return self._profit_log_and_return(cooldown, outcome, cycle_actions=cycle_actions)
         bind_trader_cycle_context(cycle_id=self._cycle_id)
         self._last_step = "detect_session"
         self._last_step_ts = time.time()
@@ -352,6 +386,22 @@ class TradingAgent:
         except Exception:
             pass
         self._prune_research_cache(self._current_session)
+
+        # Live profile rollback: revert trial ProfitConfig if drawdown exceeds threshold
+        try:
+            from core.profile_rollback import check_profile_rollback_live
+
+            rollback_event = check_profile_rollback_live(self.gateway)
+            if rollback_event:
+                cycle_actions.append("profile_rollback")
+                self._last_cycle_summary = (
+                    f"PROFILE ROLLBACK: {rollback_event.get('trial_profile')} -> "
+                    f"{rollback_event.get('known_good_profile')} "
+                    f"({rollback_event.get('drawdown_pct')}% drawdown)"
+                )
+                return _ret(lc.react_halt_cooldown_seconds, "profile_rollback")
+        except Exception as exc:
+            logger.debug("profile_rollback check skipped: %s", exc)
 
         # Daily review: run once when session transitions to postmarket
         if self._current_session == "postmarket":
@@ -394,7 +444,7 @@ class TradingAgent:
         loss_pct = self._check_daily_loss()
         if loss_pct is not None:
             await self._emergency_flatten(f"Daily loss: -{loss_pct:.1f}%")
-            return lc.react_halt_cooldown_seconds
+            return _ret(lc.react_halt_cooldown_seconds, "daily_loss_halt")
 
         # Check intraday drawdown (peak-to-trough)
         dd_pct = self._check_intraday_drawdown()
@@ -402,7 +452,7 @@ class TradingAgent:
             await self._emergency_flatten(
                 f"Intraday drawdown: -{dd_pct:.1f}% from session high"
             )
-            return lc.react_halt_cooldown_seconds
+            return _ret(lc.react_halt_cooldown_seconds, "intraday_drawdown_halt")
 
         # EOD flatten: close all positions N minutes before market close
         if self._current_session == "regular":
@@ -419,28 +469,30 @@ class TradingAgent:
                     )
                     # Don't halt — just flatten and continue (postmarket may follow)
                     self._halted = False
-                    return CYCLE_SLEEP_SECONDS
+                    return _ret(CYCLE_SLEEP_SECONDS, "eod_flatten")
             except Exception:
                 pass
 
         # Check LLM cost
+        _max_llm = get_risk_execution_config().max_daily_llm_cost
         if self._check_llm_cost():
-            logger.warning(f"LLM cost ceiling ${MAX_DAILY_LLM_COST} reached — halting")
+            logger.warning(f"LLM cost ceiling ${_max_llm} reached — halting")
             self._halted = True
-            return lc.react_halt_cooldown_seconds
+            return _ret(lc.react_halt_cooldown_seconds, "llm_cost_halt")
 
         tok_reason = self._check_llm_token_limits()
         if tok_reason:
             logger.warning("LLM token daily limit (%s) reached — halting", tok_reason)
             self._halted = True
-            return lc.react_halt_cooldown_seconds
+            return _ret(lc.react_halt_cooldown_seconds, "llm_token_halt")
 
         # Build context
         cost_line = ""
         try:
             summary = self.cost_tracker.get_budget_summary()
-            cost_pct = summary.today_llm_cost / MAX_DAILY_LLM_COST * 100
-            cost_line = f"\nLLM COST: ${summary.today_llm_cost:.2f} / ${MAX_DAILY_LLM_COST:.2f} ({cost_pct:.0f}%)"
+            _max_llm = get_risk_execution_config().max_daily_llm_cost
+            cost_pct = summary.today_llm_cost / _max_llm * 100 if _max_llm > 0 else 0.0
+            cost_line = f"\nLLM COST: ${summary.today_llm_cost:.2f} / ${_max_llm:.2f} ({cost_pct:.0f}%)"
         except Exception:
             pass
 
@@ -524,7 +576,6 @@ class TradingAgent:
         # ── Inner ReAct loop ────────────────────────────────────
         turn = 0
 
-        cycle_actions = []
         invalid_json_streak = 0
 
         while True:
@@ -534,13 +585,13 @@ class TradingAgent:
                     "ReAct turn cap %d reached — ending cycle",
                     lc.react_max_turns_per_cycle,
                 )
-                return lc.react_circuit_breaker_cooldown_seconds
+                return _ret(lc.react_circuit_breaker_cooldown_seconds, "react_turn_cap")
 
             # Re-check daily loss every turn
             loss_pct = self._check_daily_loss()
             if loss_pct is not None:
                 await self._emergency_flatten(f"Daily loss mid-cycle: -{loss_pct:.1f}%")
-                return lc.react_halt_cooldown_seconds
+                return _ret(lc.react_halt_cooldown_seconds, "daily_loss_mid_cycle")
 
             logger.info(f"Cycle {self._cycle_id} turn {turn}")
 
@@ -556,7 +607,7 @@ class TradingAgent:
                                 lim,
                             )
                             self._halted = True
-                            return lc.react_halt_cooldown_seconds
+                            return _ret(lc.react_halt_cooldown_seconds, "llm_token_mid_cycle")
                         response = await chat.sample()
                         break
                     except Exception as api_err:
@@ -604,7 +655,7 @@ class TradingAgent:
                         lim2,
                     )
                     self._halted = True
-                    return lc.react_halt_cooldown_seconds
+                    return _ret(lc.react_halt_cooldown_seconds, "llm_token_post_sample")
 
                 # Log what the model actually said
                 logger.info(f"Grok -> {(raw or '(empty)')[:lc.react_grok_response_log_chars]}")
@@ -623,7 +674,7 @@ class TradingAgent:
                             "Circuit breaker: repeated invalid JSON responses "
                             f"({invalid_json_streak})"
                         )
-                        return lc.react_circuit_breaker_cooldown_seconds
+                        return _ret(lc.react_circuit_breaker_cooldown_seconds, "invalid_json_circuit")
                     chat.append(sdk_user(
                         "Respond with exactly ONE JSON object and no prose/code fences.\n"
                         "Required shape: {\"action\":\"<tool_or_done>\", ...params}.\n"
@@ -706,12 +757,25 @@ class TradingAgent:
                         except Exception as _prov_err:
                             logger.debug(f"QualityMatrix provenance snapshot skipped: {_prov_err}")
 
-                        return cooldown
+                        return _ret(cooldown, "done")
 
                     else:
                         # ── Execute tool action ────────────────
                         last_result = await self.tools.execute(action, action_data)
                         sym = action_data.get('symbol', '')
+                        self._profit_last_tool = {
+                            "action": action,
+                            "symbol": sym,
+                            "success": getattr(last_result, "success", None),
+                            "error": str(getattr(last_result, "error", "") or "")[:200],
+                        }
+                        if last_result.success:
+                            data = last_result.data if hasattr(last_result, "data") else last_result
+                            if isinstance(data, dict):
+                                self._profit_last_tool["order_id"] = str(
+                                    data.get("order_id", "") or ""
+                                )
+                                self._profit_last_tool["filled"] = data.get("filled")
 
                         # Cache research results for cross-cycle memory
                         if action == 'research' and last_result.success:
@@ -775,10 +839,10 @@ class TradingAgent:
                     # Circuit breaker
                     if self._consecutive_failures >= self._max_consecutive:
                         logger.warning(f"Circuit breaker: {self._consecutive_failures} consecutive failures")
-                        return lc.react_circuit_breaker_cooldown_seconds
+                        return _ret(lc.react_circuit_breaker_cooldown_seconds, "consecutive_failure_circuit")
                     if self._cycle_failures >= self._max_per_cycle:
                         logger.warning(f"Circuit breaker: {self._cycle_failures} failures this cycle")
-                        return lc.react_circuit_breaker_cooldown_seconds
+                        return _ret(lc.react_circuit_breaker_cooldown_seconds, "cycle_failure_circuit")
 
                     chat.append(response)
                     # State is provided once at cycle start; agent calls
@@ -792,7 +856,9 @@ class TradingAgent:
 
             except Exception as e:
                 logger.error(f"Turn error: {e}", exc_info=True)
-                return lc.react_circuit_breaker_cooldown_seconds
+                return _ret(lc.react_circuit_breaker_cooldown_seconds, "turn_error")
+
+        return _ret(CYCLE_SLEEP_SECONDS, "react_exhausted")
 
 
 # ── Entry Point ─────────────────────────────────────────────────
@@ -847,6 +913,12 @@ async def run_agent():
         sum(1 for s in _reg.tools.values() if s.agent_callable),
     )
     agent._capture_start_of_day_cash()
+    try:
+        from core.profile_rollback import initialize_profile_rollback_state
+
+        initialize_profile_rollback_state(gateway=gateway)
+    except Exception as exc:
+        logger.debug("profile_rollback init skipped: %s", exc)
 
     # ── Main loop (delegated to CycleScheduler) ─────────────────
     from core.wake_events import wake_bus

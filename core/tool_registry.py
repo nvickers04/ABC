@@ -1,6 +1,8 @@
 """Central registry for agent tools and underlying data/execution capabilities.
 
-All agent-callable tools register handlers via :func:`tools.register_all.attach_all_handlers`.
+Part of the master :class:`~core.central_profit_config.ProfitConfig` composition
+(``get_tool_registry()``; profile overlays via :mod:`core.profit_profiles`). All
+agent-callable tools register handlers via :func:`tools.register_all.attach_all_handlers`.
 Metadata (schema, profitability weight, validation) lives here so experiments can
 enable/disable or re-weight tools without editing handler modules.
 
@@ -509,6 +511,11 @@ _registry: ToolRegistry | None = None
 
 def get_tool_registry(*, reload: bool = False) -> ToolRegistry:
     """Return the process-wide :class:`ToolRegistry` with handlers attached."""
+    from core.profit_config_context import get_thread_tool_registry
+
+    thread_reg = get_thread_tool_registry()
+    if thread_reg is not None and not reload:
+        return thread_reg
     global _registry
     if _registry is None or reload:
         reg = ToolRegistry.build_default()

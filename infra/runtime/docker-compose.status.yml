@@ -1,0 +1,67 @@
+# Status API + alert watcher (attach to trader or research stack).
+#
+#   docker compose -f infra/runtime/docker-compose.trader.yml \
+#     -f infra/runtime/docker-compose.status.yml --env-file .env up -d
+#
+# Endpoints: http://localhost:8790/status  http://localhost:8790/health/ready
+
+networks:
+  postgres_default:
+    external: true
+
+services:
+  abc-status-api:
+    build:
+      context: ../..
+      dockerfile: infra/status_api/Dockerfile
+    image: abc-status-api:latest
+    container_name: abc-status-api
+    restart: unless-stopped
+    env_file:
+      - ../../.env
+    environment:
+      ABC_HEALTH_ROLE: ${ABC_HEALTH_ROLE:-trader}
+      STATUS_API_PORT: "8790"
+    ports:
+      - "${STATUS_API_PORT:-8790}:8790"
+    networks:
+      - postgres_default
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "python",
+          "-c",
+          "import urllib.request; r=urllib.request.urlopen('http://127.0.0.1:8790/health/ready'); exit(0 if r.status==200 else 1)",
+        ]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 20s
+    logging:
+      driver: json-file
+      options:
+        max-size: "5m"
+        max-file: "3"
+
+  abc-alert-watch:
+    image: abc-status-api:latest
+    container_name: abc-alert-watch
+    restart: unless-stopped
+    env_file:
+      - ../../.env
+    environment:
+      STATUS_API_URL: http://abc-status-api:8790/status
+      ALERT_POLL_SECONDS: ${ALERT_POLL_SECONDS:-60}
+      ALERT_WEBHOOK_URL: ${ALERT_WEBHOOK_URL:-}
+    command: ["python", "scripts/alert_watch.py", "--poll", "60"]
+    depends_on:
+      abc-status-api:
+        condition: service_healthy
+    networks:
+      - postgres_default
+    logging:
+      driver: json-file
+      options:
+        max-size: "5m"
+        max-file: "3"

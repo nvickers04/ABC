@@ -25,6 +25,7 @@ definitions in docs and PRs; link here instead of redefining terms inline.
 | Term | Meaning |
 |------|---------|
 | **QualityMatrix** | In-process policy object (`core/quality/quality_matrix.py`): overall quality tier, risk multiplier, blocked tool categories, LLM temperature/token hints. Populated from Postgres feedback and tool logs; **enforced by the host** (agent/executor), not by individual tools. |
+| **QualityMatrix learning** | Optional offline/live adjustment of execution-scoring weights from closed-trade history (`learn_from_history` / `QUALITY_MATRIX_LEARN_FROM_HISTORY`). Outcomes land in `quality_matrix_trade_outcomes` and `data/quality_matrix_learned.json`; weights stay within ±15% of the active profile base by default and **cannot move in a riskier direction** than the active ProfitConfig profile (profile risk guard). Backtests train via `simulate_backtest`; live trades via `execution_repo.record_trade`; batch replay via `scripts/train_quality_matrix.py` (cycle logs → evolved profile loop patches). |
 | **Operating context** | Singleton (`core/runtime/operating_context.py`) holding mode flags: whether the researcher is available, WM source, risk multiplier, prompt-facing status. Synced from heartbeat each cycle. |
 | **WM routing** | Choosing Postgres vs local JSON for working memory via `get_active_working_memory()` (`core/runtime/working_memory_access.py`). **One writer per mode** — no dual-write. See [operations/independent-mode.md](operations/independent-mode.md). |
 | **Working memory (WM)** | Short-lived theses and notes in five sections: `open_theses`, `recent_verdicts`, `watching_for`, `regime_notes`, `lessons_today`. Postgres when healthy; local file `data/local_working_memory.json` in Independent Mode. |
@@ -61,6 +62,24 @@ definitions in docs and PRs; link here instead of redefining terms inline.
 | **Cycle loop** | Trader: read state → Grok reasoning → tools → wait or trade. |
 | **Cooldown / wake** | Wait between cycles unless a wake event fires early. |
 | **Safety rails** | Daily loss, intraday drawdown, EOD flatten, LLM dollar and token caps (`core/runtime/safety.py`). |
+
+---
+
+## Profitability configuration and simulation
+
+| Term | Meaning |
+|------|---------|
+| **Master ProfitConfig** | Singleton (`get_profit_config()` in `core/central_profit_config.py`) composing risk, loop, memory, prompt, and tool registry. Call `.reload()` after `PROFIT_PROFILE` or `.env` changes. |
+| **ProfitConfig profile** | Named preset: built-in `conservative`, `balanced`, `aggressive`, or evolved entry in `data/evolved_profiles.json`. Set via `PROFIT_PROFILE` or `--profit-profile`. |
+| **Centralized levers** | The five sub-config modules above — avoid duplicating their fields in `core.config` or `core/agent.py`. |
+| **ComposedProfitConfig** | Immutable snapshot of the five levers; used by optimizer candidates and thread-local parallel workers without mutating the singleton. |
+| **ReplayDataProvider** | Loads historical bars once per backtest window; shared across optimizer candidates (`data/archives/`). |
+| **`--simulate`** | Trader CLI historical backtest: real ReAct loop, `BacktestLLM`, no live xAI/IBKR. See [simulation-and-optimization.md](simulation-and-optimization.md). |
+| **Cycle log** | `logs/profit_cycles_YYYY-MM-DD.json` entry per trader cycle with P&L, QualityMatrix, and ProfitConfig snapshot (`log_cycle()`). |
+| **Composite score (optimizer)** | Weighted ranking: Sharpe, profit factor, win rate; normalized when `cycles_per_day` &lt; 4. |
+| **`get_research_settings()`** | Profile-aware view of memory, loop, risk, and tool levers for the research host (scorer, combiner, caches). |
+| **`research_host_profit_profile`** | Postgres `research_config` key: active ProfitConfig profile label written on heartbeat sync. |
+| **Profile rollback** | In **live** mode, if a new trial `PROFIT_PROFILE` draws down ≥10% from its adoption peak, the trader reverts to the previous known-good profile (`data/profile_rollback_state.json`, logs in `logs/profile_rollback_events.jsonl`). |
 
 ---
 

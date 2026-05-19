@@ -1925,6 +1925,12 @@ class DataProvider:
 _provider: Optional[DataProvider] = None
 
 
+def install_data_provider(provider: DataProvider | None) -> None:
+    """Pin a provider instance (``None`` clears for next ``get_data_provider()``)."""
+    global _provider
+    _provider = provider
+
+
 def get_data_provider() -> DataProvider:
     """
     Get the singleton DataProvider instance.

@@ -9,6 +9,9 @@
 #     --env-file .env up -d --build
 #
 # Requires research host already healthy (heartbeat + operational status).
+#
+# Optional observability:
+#   -f infra/runtime/docker-compose.status.yml
 
 services:
   abc-trader:

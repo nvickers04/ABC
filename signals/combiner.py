@@ -14,10 +14,6 @@ from typing import Any
 
 import numpy as np
 
-from research.config import (
-    MIN_SHARED_PERIODS_FOR_COMBINATION,
-    SIGNAL_WEIGHT_LOOKBACK_DAYS,
-)
 from signals.base import SIGNAL_REGISTRY
 from signals.candidate_lifecycle import (
     apply_candidate_weight_caps,
@@ -26,6 +22,14 @@ from signals.candidate_lifecycle import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+def _rs():
+    """Active research-host settings from master ProfitConfig (profile-aware)."""
+    from core.central_profit_config import get_research_settings
+
+    return get_research_settings()
+
 
 # ---------------------------------------------------------------------------
 # Public API
@@ -47,8 +51,8 @@ def combine_signals(
                   | "circuit_breaker_neff",
     }
 
-    Circuit breaker: if N_eff stays below ``_NEFF_CIRCUIT_THRESHOLD`` for
-    ``_NEFF_CIRCUIT_STREAK`` consecutive successful runs we switch to equal
+    Circuit breaker: if N_eff stays below the profile's ``neff_circuit_threshold`` for
+    ``neff_circuit_streak`` consecutive successful runs we switch to equal
     weights (``status = "circuit_breaker_neff"``) — the combination engine
     has lost its structural advantage and equal weights are safer than
     weights derived from highly correlated signals.  The streak counter is
@@ -66,8 +70,9 @@ def combine_signals(
     # Signals with different return cadences/horizons are benchmarked
     # inside their own (resolution, horizon) bucket first, then merged.
     # This avoids a 1h/h=4 stack being penalized against D/h=10 dynamics.
+    rs = _rs()
     try:
-        if _STRATIFY_BY_HORIZON_BUCKET:
+        if rs.stratify_by_horizon_bucket:
             w_dict, combine_status = _run_11_steps_stratified(db_conn, signal_names)
             # Keep structural N_eff measured on the full shared matrix so
             # the existing low-N_eff monitoring/circuit semantics remain
@@ -94,10 +99,11 @@ def combine_signals(
             # Legacy pooled mode (all signals share one return matrix).
             R, _periods = _load_return_matrix(db_conn, signal_names)
             M = R.shape[1] if R.ndim == 2 else 0
-            if M < MIN_SHARED_PERIODS_FOR_COMBINATION:
+            if M < rs.min_shared_periods_for_combination:
                 logger.info(
                     "Insufficient shared periods (%d < %d) — using equal weights",
-                    M, MIN_SHARED_PERIODS_FOR_COMBINATION,
+                    M,
+                    rs.min_shared_periods_for_combination,
                 )
                 weights = {s: 1.0 / N for s in signal_names}
                 try:
@@ -127,16 +133,21 @@ def combine_signals(
     # direction dominates both "price" and "macro"), the realistic N_eff
     # ceiling is ~5-6.  We only warn/trip below ~3 where the combiner has
     # genuinely lost structural advantage.
-    if n_eff < 3:
-        logger.warning("N_eff %.1f < 3 — very few independent dimensions", n_eff)
+    if n_eff < rs.neff_warn_below:
+        logger.warning(
+            "N_eff %.1f < %.1f — very few independent dimensions",
+            n_eff,
+            rs.neff_warn_below,
+        )
 
     streak = _update_neff_streak(db_conn, n_eff)
     status = "ok"
-    if streak >= _NEFF_CIRCUIT_STREAK:
+    if streak >= rs.neff_circuit_streak:
         logger.warning(
             "Circuit breaker tripped: N_eff < %.1f for %d consecutive rounds — "
             "falling back to equal weights",
-            _NEFF_CIRCUIT_THRESHOLD, streak,
+            rs.neff_circuit_threshold,
+            streak,
         )
         w_dict = {s: 1.0 / N for s in signal_names}
         status = "circuit_breaker_neff"
@@ -175,7 +186,8 @@ def combine_signals(
         logger.info(
             "Quant edge currently weak (IR=%.4f < %.4f): advisory — "
             "agent should prefer position management, hedges, and smaller size.",
-            estimated_ir, _IR_GATE_MIN,
+            estimated_ir,
+            rs.ir_gate_min,
         )
 
     _persist_weights(db_conn, w_dict, n_eff)
@@ -188,52 +200,12 @@ def combine_signals(
     }
 
 
-# ── N_eff circuit-breaker tunables ──────────────────────────────
-# Calibrated for a 50-signal / 5-category universe where the realistic
-# N_eff ceiling is ~5-6 (categories themselves share market-direction
-# variance).  Threshold 2.5 = "single factor drowning out everything".
-_NEFF_CIRCUIT_THRESHOLD = 2.5
-_NEFF_CIRCUIT_STREAK = 3
+# ── Persisted keys (not profile-tuned) ──────────────────────────
 _NEFF_STREAK_KEY = "n_eff_low_streak"
-
-# ── Structural tunables (improvements #1-6) ─────────────────────
-# SNR = |mean(R)| / std(R).  Below this, signal × forward-return is
-# pure noise — drop from weighting.
-_SNR_FLOOR = 0.05
-
-# Number of periods a signal must be constant (zero-variance) before
-# it gets flagged as "dead" with a WARNING.
-_DEAD_SIGNAL_PERIODS = 100
-
-# EWMA half-life for correlation weighting (in periods).  Clamped to
-# >= 30 so we don't over-react on thin histories.
-_EWMA_HALFLIFE_FRACTION = 0.25
-_EWMA_HALFLIFE_MIN = 30
-
-# Max |weight| per category (after step-11 normalization).  Prevents a
-# single category (e.g. "price" with 15 correlated signals) from
-# dominating the portfolio.  0.40 allows 2x the equal-category share.
-_CATEGORY_WEIGHT_CAP = 0.40
-
-# Horizon-bucket combiner: run step-1..11 inside each
-# (return_resolution, return_horizon) bucket, then merge.
-_STRATIFY_BY_HORIZON_BUCKET = True
-# Merge mode is read from research_config key
-# ``combiner_horizon_bucket_mass_mode`` (numeric enum):
-#   0 = signal_count (default): mass ∝ number of signals in bucket
-#   1 = equal: equal mass per non-empty bucket
-#   2 = n_eff: mass ∝ bucket effective breadth
 _HORIZON_BUCKET_MASS_MODE_KEY = "combiner_horizon_bucket_mass_mode"
 _HORIZON_BUCKET_MASS_MODE_DEFAULT = 0
 
-# ── IC attribution tunables ─────────────────────────────────────
-# Rolling window for computing per-signal Information Coefficient
-# (Pearson corr between score_at_entry and forward_return).
-_IC_WINDOW_DAYS = 60
-# Minimum observations before IC / t-stat are trusted.  Below this we
-# still log the IC but don't count it toward retirement streaks.
-# DEFAULT for daily-cadence signals; sub-daily signals need more rows
-# because their bars are more autocorrelated -- see _min_obs_for(sig).
+# Per-resolution IC warmup floors (structural; not profile overlays).
 _IC_MIN_OBS = 30
 # Per-resolution minimum observations.  Sub-daily bars are tightly
 # autocorrelated so |IC| stabilises only after many rows -- but we
@@ -260,26 +232,11 @@ def _min_obs_for(sig) -> int:
     the looser daily-bar warmup floor.
     """
     if sig is None:
-        return _IC_MIN_OBS
+        return _rs().ic_min_obs
     res = getattr(sig, "return_resolution", "D")
-    return _MIN_OBS_BY_RES.get(res, _IC_MIN_OBS)
-# A signal whose |IC| falls below this threshold (on a trusted sample)
-# is considered effectively noise. Negative IC is NOT a disqualifier --
-# the weight optimizer can flip the sign. Only |IC| ≈ 0 means no info.
-_IC_NOISE_THRESHOLD = 0.02
-# Consecutive rounds of |IC| < noise threshold (with enough obs) before
-# we emit a RETIRE_CANDIDATE warning.
-_IC_RETIRE_STREAK = 5
-# How many signals to log in top/bottom attribution lists each round.
-_IC_ATTRIBUTION_TOP_K = 5
+    return _MIN_OBS_BY_RES.get(res, _rs().ic_min_obs)
 
-# ── IR gate tunables ────────────────────────────────────────────
-# Minimum estimated IR = mean(positive IC) * sqrt(N_eff) before we
-# consider the signal stack "live".  Below this the briefing exposes
-# ir_gate_open=False and the agent is instructed not to open new
-# positions (existing positions are unaffected).  0.05 matches the
-# article's institutional baseline IC floor.
-_IR_GATE_MIN = 0.05
+
 # Config keys for briefing consumption.
 _IR_ESTIMATE_KEY = "estimated_ir"
 _IR_GATE_OPEN_KEY = "ir_gate_open"
@@ -297,7 +254,8 @@ def _update_neff_streak(db_conn, n_eff: float) -> int:
     try:
         from memory import get_research_config, set_research_config
         prev = int(get_research_config(_NEFF_STREAK_KEY, 0))
-        new = prev + 1 if n_eff < _NEFF_CIRCUIT_THRESHOLD else 0
+        threshold = _rs().neff_circuit_threshold
+        new = prev + 1 if n_eff < threshold else 0
         if new != prev:
             set_research_config(
                 _NEFF_STREAK_KEY,
@@ -307,7 +265,7 @@ def _update_neff_streak(db_conn, n_eff: float) -> int:
         return new
     except Exception as e:
         logger.debug("N_eff streak persistence failed: %s", e)
-        return 1 if n_eff < _NEFF_CIRCUIT_THRESHOLD else 0
+        return 1 if n_eff < _rs().neff_circuit_threshold else 0
 
 
 def compute_composite_scores(
@@ -481,7 +439,7 @@ def _run_11_steps_stratified(
         R_b, _periods_b = _load_return_matrix(db_conn, names)
         M_b = R_b.shape[1] if R_b.ndim == 2 else 0
 
-        if M_b < MIN_SHARED_PERIODS_FOR_COMBINATION:
+        if M_b < _rs().min_shared_periods_for_combination:
             w_b = {s: 1.0 / len(names) for s in names}
             status_b = "insufficient"
             try:
@@ -610,7 +568,7 @@ def _run_11_steps(
     Lambda = Lambda[:, :-1]  # shape (N, M-2)
 
     # Step 8: Forward expected return for each signal
-    d = min(SIGNAL_WEIGHT_LOOKBACK_DAYS, M)
+    d = min(_rs().signal_weight_lookback_days, M)
     E = R[:, -d:].mean(axis=1)  # shape (N,)
     E_normalized = E / sigma  # shape (N,)
 
@@ -636,7 +594,7 @@ def _run_11_steps(
     abs_mean = np.abs(R.mean(axis=1))
     std = np.sqrt(np.maximum(R.var(axis=1), 1e-24))
     snr = abs_mean / std
-    low_snr_mask = (~zero_var_mask) & (snr < _SNR_FLOOR)
+    low_snr_mask = (~zero_var_mask) & (snr < _rs().snr_floor)
     raw_w[low_snr_mask] = 0.0
 
     # Step 11: Normalize so sum|w| = 1
@@ -655,7 +613,8 @@ def _run_11_steps(
 
     if n_active >= 2:
         R_active = R[active_mask]
-        halflife = max(_EWMA_HALFLIFE_MIN, int(M * _EWMA_HALFLIFE_FRACTION))
+        rs = _rs()
+        halflife = max(rs.ewma_halflife_min, int(M * rs.ewma_halflife_fraction))
         C = _ewma_shrunk_correlation(R_active, halflife=halflife)
         eigvals = np.linalg.eigvalsh(C)
         eigvals = np.maximum(eigvals, 0.0)
@@ -674,7 +633,7 @@ def _run_11_steps(
     _log_category_n_eff(R, active_mask, signal_names)
 
     # ── Dead-signal diagnostics (improvement #1) ────────────────
-    if M >= _DEAD_SIGNAL_PERIODS:
+    if M >= _rs().dead_signal_periods:
         dead = [
             signal_names[i] for i in range(N)
             if zero_var_mask[i] and not np.all(np.isnan(R[i]))
@@ -782,7 +741,7 @@ def _apply_category_caps(
     weights: np.ndarray,
     signal_names: list[str],
 ) -> np.ndarray:
-    """Cap |weight| sum per category at `_CATEGORY_WEIGHT_CAP`.
+    """Cap |weight| sum per category at the profile category weight cap.
 
     If a category's total |weight| exceeds the cap, scale all weights in
     that category down proportionally.  After capping, rescale the full
@@ -802,8 +761,9 @@ def _apply_category_caps(
 
     for cat, idx in cat_indices.items():
         cat_sum = abs_w[idx].sum()
-        if cat_sum > _CATEGORY_WEIGHT_CAP:
-            scale = _CATEGORY_WEIGHT_CAP / cat_sum
+        cap = _rs().category_weight_cap
+        if cat_sum > cap:
+            scale = cap / cat_sum
             w[idx] *= scale
 
     abs_total = np.abs(w).sum()
@@ -819,7 +779,7 @@ def _apply_category_caps(
 def _compute_signal_ic(
     db_conn,
     signal_names: list[str],
-    window_days: int = _IC_WINDOW_DAYS,
+    window_days: int | None = None,
     min_symbols_per_period: int = 3,
 ) -> dict[str, dict[str, float]]:
     """Per-signal IC via the institutional cross-sectional method.
@@ -845,6 +805,8 @@ def _compute_signal_ic(
 
     Returns: ``{signal_name: {\"ic\": float, \"t\": float, \"n\": int}}``
     """
+    if window_days is None:
+        window_days = _rs().ic_window_days
     cutoff = time.time() - window_days * 86400.0
     placeholders = ",".join("?" * len(signal_names))
     cur = db_conn.execute(
@@ -910,7 +872,7 @@ def _log_ic_attribution(ic_stats: dict[str, dict[str, float]]) -> None:
         return
 
     trusted.sort(key=lambda x: x[1], reverse=True)
-    k = _IC_ATTRIBUTION_TOP_K
+    k = _rs().ic_attribution_top_k
     top = trusted[:k]
     bot = list(reversed(trusted[-k:]))  # worst first
 
@@ -970,7 +932,8 @@ def _update_ic_retirement(
             continue
         key = f"ic_noise_streak:{name}"
         prev = int(get_research_config(key, 0))
-        new = prev + 1 if abs(d["ic"]) < _IC_NOISE_THRESHOLD else 0
+        noise = _rs().ic_noise_threshold
+        new = prev + 1 if abs(d["ic"]) < noise else 0
         if new != prev:
             try:
                 set_research_config(
@@ -980,11 +943,17 @@ def _update_ic_retirement(
                 )
             except Exception:
                 pass
-        if new >= _IC_RETIRE_STREAK and (new == _IC_RETIRE_STREAK or new % 5 == 0):
+        retire_streak = _rs().ic_retire_streak
+        if new >= retire_streak and (new == retire_streak or new % 5 == 0):
             logger.warning(
                 "RETIRE_CANDIDATE %s -- |IC| < %.3f for %d consecutive rounds "
                 "(ic=%+.4f t=%+.2f n=%d)",
-                name, _IC_NOISE_THRESHOLD, new, d["ic"], d["t"], d["n"],
+                name,
+                noise,
+                new,
+                d["ic"],
+                d["t"],
+                d["n"],
             )
 
 
@@ -1016,7 +985,7 @@ def _safe_update_per_symbol_ic(db_conn, signal_names: list[str]) -> None:
     """
     try:
         from signals.per_symbol_ic import update_per_symbol_ic
-        update_per_symbol_ic(db_conn, signal_names, window_days=_IC_WINDOW_DAYS)
+        update_per_symbol_ic(db_conn, signal_names, window_days=_rs().ic_window_days)
     except Exception as e:  # pragma: no cover — defensive
         logger.debug("per-symbol IC update failed: %s", e)
 
@@ -1043,7 +1012,7 @@ def _apply_ic_retirement_mask(
             streak = int(get_research_config(f"ic_noise_streak:{name}", 0))
         except Exception:
             streak = 0
-        if streak >= _IC_RETIRE_STREAK:
+        if streak >= _rs().ic_retire_streak:
             retired.append(name)
 
     if not retired:
@@ -1051,7 +1020,9 @@ def _apply_ic_retirement_mask(
 
     logger.info(
         "IC_RETIRE zeroing %d signal(s) with ic_neg_streak >= %d: %s",
-        len(retired), _IC_RETIRE_STREAK, ", ".join(sorted(retired)),
+        len(retired),
+        _rs().ic_retire_streak,
+        ", ".join(sorted(retired)),
     )
     new_w = dict(weights)
     for name in retired:
@@ -1124,7 +1095,7 @@ def _publish_ir_snapshot(
     trusted = [
         (name, d) for name, d in ic_stats.items()
         if d["n"] >= _min_obs_for(SIGNAL_REGISTRY.get(name))
-        and abs(d["ic"]) >= _IC_NOISE_THRESHOLD
+        and abs(d["ic"]) >= _rs().ic_noise_threshold
     ]
 
     if signal_names is None:
@@ -1173,7 +1144,7 @@ def _publish_ir_snapshot(
             )
         ]
 
-    gate_open = ir >= _IR_GATE_MIN
+    gate_open = ir >= _rs().ir_gate_min
 
     n_ic = len(ic_stats)
     n_trusted = len(trusted)
@@ -1191,7 +1162,7 @@ def _publish_ir_snapshot(
             1
             for name, d in ic_stats.items()
             if d["n"] >= _min_obs_for(SIGNAL_REGISTRY.get(name))
-            and abs(d["ic"]) < _IC_NOISE_THRESHOLD
+            and abs(d["ic"]) < _rs().ic_noise_threshold
         )
         est_reason = (
             f"no_trusted_ic n_ic={n_ic} below_min_obs={below_min_obs} "
@@ -1205,9 +1176,9 @@ def _publish_ir_snapshot(
         )
 
     if gate_open:
-        gate_reason = f"open_ir={ir:.4f}_meets_min_{_IR_GATE_MIN}"
+        gate_reason = f"open_ir={ir:.4f}_meets_min_{_rs().ir_gate_min}"
     else:
-        gate_reason = f"closed_ir={ir:.4f}_below_gate_min_{_IR_GATE_MIN}"
+        gate_reason = f"closed_ir={ir:.4f}_below_gate_min_{_rs().ir_gate_min}"
 
     try:
         set_research_config(_IR_ESTIMATE_KEY, ir, reason=est_reason)

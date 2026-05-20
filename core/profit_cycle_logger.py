@@ -305,6 +305,14 @@ def append_profit_cycle_log(
     pnl, quality, trade = collect_cycle_metrics(agent)
     label = profile_label or get_active_profile_label()
     snap = snapshot_profit_config(cfg, profile_label=label)
+    try:
+        from core.profile_ab_test import get_ab_log_meta
+
+        ab_meta = get_ab_log_meta()
+        if ab_meta:
+            snap = {**snap, "ab_test": ab_meta}
+    except Exception:
+        pass
     record = ProfitCycleRecord(
         ts=now.isoformat(),
         session_date=session_date,

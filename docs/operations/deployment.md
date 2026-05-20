@@ -58,6 +58,45 @@ is **PostgreSQL only** — no SQLite fallback in current builds.
 
 ---
 
+## One-click deploy (Docker)
+
+`infra/deploy.py` merges an environment profile (`paper`, `live`, or `dev`) with repo `.env` into `.env.deploy`, then runs the correct compose stack.
+
+| Machine | Command |
+|---------|---------|
+| Research + Postgres | `python infra/deploy.py --role research --env paper --with-postgres --build` |
+| Trader (paper prod) | `python infra/deploy.py --role trader --env paper --build` |
+| Trader (live) | `python infra/deploy.py --role trader --env live --build` |
+| Dev (all on one box) | `python infra/deploy.py --role all --env dev --with-postgres --build` |
+| Status API only | `python infra/deploy.py --role trader --env paper --with-status` |
+
+Windows wrapper: `.\infra\deploy.ps1 --role trader --env paper --build`
+
+Profile templates: `infra/runtime/env/paper.env.example`, `live.env.example`, `dev.env.example`.  
+Host secrets templates: `infra/runtime/env/docker.research.env.example`, `docker.trader.env.example`.
+
+Pull CI-built images from GHCR:
+
+```powershell
+python infra/deploy.py --role trader --env paper `
+  --registry ghcr.io/YOUR_ORG/YOUR_REPO --tag latest --pull
+```
+
+## CI/CD (GitHub Actions)
+
+Workflow: `.github/workflows/ci.yml`
+
+| Job | What it runs |
+|-----|----------------|
+| **lint** | `ruff check` on application packages |
+| **test** | Full `pytest` with a Postgres 16 service container |
+| **simulation** | `test_simulation*`, `test_optimizer`, deploy env profile tests |
+| **docker** | Build `trader`, `research`, `status-api` images; **push to GHCR** on `main` / tags |
+
+Images (lowercase repo path): `ghcr.io/<owner>/<repo>/trader`, `/research`, `/status-api` tagged with commit SHA and `latest`.
+
+---
+
 ## Launch commands
 
 | Host | Command |

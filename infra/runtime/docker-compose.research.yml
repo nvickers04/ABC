@@ -22,7 +22,7 @@ services:
     build:
       context: ../..
       dockerfile: infra/runtime/Dockerfile.research
-    image: abc-research:latest
+    image: ${ABC_RESEARCH_IMAGE:-abc-research:latest}
     container_name: abc-research-host
     restart: unless-stopped
     env_file:

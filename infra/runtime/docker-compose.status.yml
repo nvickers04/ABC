@@ -3,7 +3,10 @@
 #   docker compose -f infra/runtime/docker-compose.trader.yml \
 #     -f infra/runtime/docker-compose.status.yml --env-file .env up -d
 #
-# Endpoints: http://localhost:8790/status  http://localhost:8790/health/ready
+# Endpoints:
+#   http://localhost:8790/status
+#   http://localhost:8790/health/ready
+#   http://localhost:8790/dashboard  (HTTP Basic; DASHBOARD_PASSWORD required)
 
 networks:
   postgres_default:
@@ -14,7 +17,7 @@ services:
     build:
       context: ../..
       dockerfile: infra/status_api/Dockerfile
-    image: abc-status-api:latest
+    image: ${ABC_STATUS_IMAGE:-abc-status-api:latest}
     container_name: abc-status-api
     restart: unless-stopped
     env_file:
@@ -22,8 +25,14 @@ services:
     environment:
       ABC_HEALTH_ROLE: ${ABC_HEALTH_ROLE:-trader}
       STATUS_API_PORT: "8790"
+      DASHBOARD_PASSWORD: ${DASHBOARD_PASSWORD:-}
+      DASHBOARD_WINDOW_HOURS: ${DASHBOARD_WINDOW_HOURS:-24}
+      DASHBOARD_CHART_DAYS: ${DASHBOARD_CHART_DAYS:-7}
     ports:
       - "${STATUS_API_PORT:-8790}:8790"
+    volumes:
+      - ../../logs:/app/logs:ro
+      - ../../data:/app/data:ro
     networks:
       - postgres_default
     healthcheck:
@@ -45,7 +54,7 @@ services:
         max-file: "3"
 
   abc-alert-watch:
-    image: abc-status-api:latest
+    image: ${ABC_STATUS_IMAGE:-abc-status-api:latest}
     container_name: abc-alert-watch
     restart: unless-stopped
     env_file:

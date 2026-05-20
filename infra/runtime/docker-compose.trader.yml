@@ -20,7 +20,7 @@ services:
     build:
       context: ../..
       dockerfile: infra/runtime/Dockerfile.trader
-    image: abc-trader:latest
+    image: ${ABC_TRADER_IMAGE:-abc-trader:latest}
     container_name: abc-trader
     restart: unless-stopped
     env_file:

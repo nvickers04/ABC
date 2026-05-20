@@ -9,6 +9,8 @@ from __future__ import annotations
 import argparse
 from typing import Sequence
 
+from core.profile_ab_test import AB_MODES
+
 # ── Help epilogs (shown after option list) ───────────────────────────────────
 
 TRADER_EPILOG = """\
@@ -18,6 +20,7 @@ examples:
   python __main__.py --simulate conservative,balanced,aggressive --sim-start 2024-01-02 --sim-end 2024-03-01
   python __main__.py --require-research-host --verbose
   python __main__.py --live-optimize
+  python __main__.py --ab-test conservative,balanced --ab-duration-days 30
   TRADER_IN_PROCESS_SCORER=never python __main__.py --verbose
 
 scoring policy (pick at most one of --require-research-host / --force-in-process):
@@ -171,6 +174,37 @@ def build_trader_parser() -> argparse.ArgumentParser:
         metavar="PATH",
         default=None,
         help="Write --live-optimize JSON to PATH (default: data/live_profile_suggestion.json).",
+    )
+
+    ab = parser.add_argument_group(
+        "profile a/b test",
+        description=(
+            "Paper-only live comparison of two ProfitConfig profiles. One IBKR connection; "
+            "profiles alternate per cycle (rotation) or per session day (session). "
+            "Comparative P&L via profit cycle logs."
+        ),
+    )
+    ab.add_argument(
+        "--ab-test",
+        metavar="PROFILE_A,PROFILE_B",
+        default=None,
+        help=(
+            "Run paper A/B test between two profiles (comma-separated, exactly two). "
+            "Exits normal single-profile trader mode."
+        ),
+    )
+    ab.add_argument(
+        "--ab-duration-days",
+        type=int,
+        default=30,
+        metavar="N",
+        help="Stop A/B test after N calendar days (default: %(default)s).",
+    )
+    ab.add_argument(
+        "--ab-mode",
+        choices=AB_MODES,
+        default="rotation",
+        help="rotation: switch profile each cycle; session: one profile per calendar day.",
     )
 
     sim = parser.add_argument_group(
@@ -332,6 +366,13 @@ def apply_trader_cli_to_environ(args: argparse.Namespace) -> None:
         os.environ["CASH_ONLY"] = "false"
     if getattr(args, "require_research_host", False):
         os.environ["TRADER_IN_PROCESS_SCORER"] = "never"
+
+
+def run_ab_test_cli_entry(args: argparse.Namespace) -> int:
+    """Run paper A/B profile test loop."""
+    from core.profile_ab_test import run_ab_test_cli
+
+    return run_ab_test_cli(args)
 
 
 def run_live_optimize_cli(args: argparse.Namespace) -> int:

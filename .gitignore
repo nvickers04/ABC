@@ -135,14 +135,18 @@ celerybeat.pid
 
 # Environments (use a single .venv at repo root — see README)
 .env
+.env.deploy
 .envrc
+infra/runtime/env/paper.env
+infra/runtime/env/live.env
+infra/runtime/env/dev.env
 .venv/
 .venv*/
 .venv-*/
 myenv/
-env/
-venv/
-ENV/
+/env/
+/venv/
+/ENV/
 env.bak/
 venv.bak/
 
@@ -254,6 +258,11 @@ data/sim_exports/
 data/quality_matrix_learned.json
 data/live_profile_suggestion.json
 data/e2e_validation_opt.json
+data/profile_ab_test_state.json
+logs/ab_test_daily_*.json
+logs/ab_test_final_*.json
+data/evolve_strategy_*.json
+data/evolve_strategy_*.patch
 .testmondata
 
 # Local Python tooling (repo uses .venv at root)

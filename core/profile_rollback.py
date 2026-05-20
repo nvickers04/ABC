@@ -291,6 +291,13 @@ def execute_profile_rollback(
 
 def check_profile_rollback_live(gateway: Any) -> dict[str, Any] | None:
     """If trial profile drawdown breaches threshold, rollback and return event dict."""
+    try:
+        from core.profile_ab_test import is_ab_test_active
+
+        if is_ab_test_active():
+            return None
+    except Exception:
+        pass
     if not is_live_rollback_enabled():
         return None
 

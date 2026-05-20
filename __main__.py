@@ -9,6 +9,7 @@ Profitability:
   - ``--config-summary`` / ``--profit-profile`` — inspect master ProfitConfig levers
   - ``--simulate`` — historical backtest (no live xAI/IBKR); see docs/simulation-and-optimization.md
   - ``--live-optimize`` — suggest profile from cycle logs only
+  - ``--ab-test`` — paper A/B test of two ProfitConfig profiles (rotation or session mode)
 
 Production trader on split host: ``--require-research-host`` (see docs/entry-points.md).
 """
@@ -190,6 +191,17 @@ def main() -> None:
         from core.entry_cli import run_live_optimize_cli
 
         raise SystemExit(run_live_optimize_cli(args))
+
+    if getattr(args, "ab_test", None):
+        from core.entry_cli import run_ab_test_cli_entry
+
+        if getattr(args, "simulate", None):
+            print("Error: --ab-test cannot be combined with --simulate.")
+            sys.exit(2)
+        setup_logging(verbose=args.verbose)
+        validate_startup()
+        _configure_scorer(args)
+        raise SystemExit(run_ab_test_cli_entry(args))
 
     if getattr(args, "simulate", None) is not None:
         from core.central_profit_config import simulate_backtest, simulate_backtest_compare

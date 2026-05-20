@@ -8,11 +8,15 @@ from typing import Any
 from fastapi import FastAPI
 from fastapi.responses import JSONResponse
 
+from infra.status_api.dashboard import router as dashboard_router
+
 app = FastAPI(
     title="ABC Profit API",
     description="Lightweight ops API for profitability cycle logs and config.",
     version="1.0.0",
 )
+
+app.include_router(dashboard_router)
 
 
 @app.get("/health")

@@ -76,6 +76,9 @@ definitions in docs and PRs; link here instead of redefining terms inline.
 | **ReplayDataProvider** | Loads historical bars once per backtest window; shared across optimizer candidates (`data/archives/`). |
 | **`--simulate`** | Trader CLI historical backtest: real ReAct loop, `BacktestLLM`, no live xAI/IBKR. See [simulation-and-optimization.md](simulation-and-optimization.md). |
 | **Cycle log** | `logs/profit_cycles_YYYY-MM-DD.json` entry per trader cycle with P&L, QualityMatrix, and ProfitConfig snapshot (`log_cycle()`). |
+| **ProfitConfig A/B test** | Paper-only mode (`--ab-test PROFILE_A,PROFILE_B`): one trader process rotates active profile per cycle or per session day, logs each arm via cycle logger (`ab_test` metadata), prints live comparative P&L, and writes daily winner reports (`logs/ab_test_daily_*.json`). |
+| **Ops dashboard** | Password-protected web UI at `GET /dashboard` on the status API (`infra/status_api`, port 8790). Shows active profile, cycle P&L charts, QualityMatrix, research heartbeat, and simulation vs live comparison. Set `DASHBOARD_PASSWORD` in env. |
+| **Strategy evolution** | Optional daily meta-review (`scripts/evolve_strategy.py`): MULTI_AGENT_MODEL analyzes ~7d cycle/trade logs and outputs a **review-only** `.patch` diff for `prompt_config.py` / tool docstrings — never auto-applied. Gate with `EVOLVE_STRATEGY_ENABLED=1`. |
 | **Composite score (optimizer)** | Weighted ranking: Sharpe, profit factor, win rate; normalized when `cycles_per_day` &lt; 4. |
 | **`get_research_settings()`** | Profile-aware view of memory, loop, risk, and tool levers for the research host (scorer, combiner, caches). |
 | **`research_host_profit_profile`** | Postgres `research_config` key: active ProfitConfig profile label written on heartbeat sync. |

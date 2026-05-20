@@ -8,11 +8,15 @@ from typing import Any
 from fastapi import FastAPI, Query
 from fastapi.responses import JSONResponse, PlainTextResponse
 
+from infra.status_api.dashboard import router as dashboard_router
+
 app = FastAPI(
     title="ABC Status API",
     description="Production health and observability (ProfitConfig, safety, alerts).",
     version="1.0.0",
 )
+
+app.include_router(dashboard_router)
 
 
 def _default_role() -> str:

@@ -1,0 +1,173 @@
+# CI: lint, tests (with Postgres), simulation suite, Docker build + GHCR push on main.
+name: CI
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+    branches: [main, master]
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+  packages: write
+
+env:
+  PYTHON_VERSION: "3.11"
+  POSTGRES_USER: postgres
+  POSTGRES_PASSWORD: ci_test_password
+  POSTGRES_DB: abc_ci
+  DATABASE_URL: postgresql://postgres:ci_test_password@localhost:5432/abc_ci
+  # Keep CI deterministic; no remote LLM/IBKR.
+  ABC_CI: "1"
+  QUALITY_MATRIX_LEARN_FROM_HISTORY: "0"
+  XAI_API_KEY: ci-placeholder-not-used
+  MARKETDATA_API_KEY: ci-placeholder-not-used
+
+jobs:
+  lint:
+    name: Lint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+      - name: Install tooling
+        run: pip install -r requirements-dev.txt
+      - name: Ruff
+        run: ruff check core tools scripts tests signals research memory data execution infra
+
+  test:
+    name: Tests
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: ${{ env.POSTGRES_USER }}
+          POSTGRES_PASSWORD: ${{ env.POSTGRES_PASSWORD }}
+          POSTGRES_DB: ${{ env.POSTGRES_DB }}
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres -d abc_ci"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 8
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+      - name: Install dependencies
+        run: pip install -r requirements-dev.txt pytest pytest-asyncio
+      - name: Pytest
+        run: pytest -q --tb=short
+
+  simulation:
+    name: Simulation
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: ${{ env.POSTGRES_USER }}
+          POSTGRES_PASSWORD: ${{ env.POSTGRES_PASSWORD }}
+          POSTGRES_DB: ${{ env.POSTGRES_DB }}
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres -d abc_ci"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 8
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+      - name: Install dependencies
+        run: pip install -r requirements-dev.txt pytest pytest-asyncio
+      - name: Simulation + optimizer tests
+        run: >
+          pytest -q --tb=short
+          tests/test_simulation.py
+          tests/test_simulation_backtest.py
+          tests/test_optimizer.py
+          tests/test_deploy_env_profile.py
+
+  docker:
+    name: Docker build
+    runs-on: ubuntu-latest
+    needs: [lint, test, simulation]
+    if: github.event_name == 'push' || github.event_name == 'pull_request'
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set image prefix (lowercase GHCR)
+        run: |
+          repo="${GITHUB_REPOSITORY,,}"
+          echo "IMAGE_PREFIX=ghcr.io/${repo}" >> "$GITHUB_ENV"
+
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GHCR
+        if: github.event_name == 'push' && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master' || startsWith(github.ref, 'refs/tags/'))
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Metadata
+        id: meta
+        run: |
+          echo "sha_tag=${GITHUB_SHA::12}" >> "$GITHUB_OUTPUT"
+          if [ "${{ github.ref_type }}" = "tag" ]; then
+            echo "version_tag=${GITHUB_REF_NAME}" >> "$GITHUB_OUTPUT"
+          else
+            echo "version_tag=latest" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Build and push trader image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: infra/runtime/Dockerfile.trader
+          push: ${{ github.event_name == 'push' && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master' || startsWith(github.ref, 'refs/tags/')) }}
+          tags: |
+            ${{ env.IMAGE_PREFIX }}/trader:${{ steps.meta.outputs.sha_tag }}
+            ${{ env.IMAGE_PREFIX }}/trader:${{ steps.meta.outputs.version_tag }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Build and push research image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: infra/runtime/Dockerfile.research
+          push: ${{ github.event_name == 'push' && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master' || startsWith(github.ref, 'refs/tags/')) }}
+          tags: |
+            ${{ env.IMAGE_PREFIX }}/research:${{ steps.meta.outputs.sha_tag }}
+            ${{ env.IMAGE_PREFIX }}/research:${{ steps.meta.outputs.version_tag }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Build and push status-api image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: infra/status_api/Dockerfile
+          push: ${{ github.event_name == 'push' && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master' || startsWith(github.ref, 'refs/tags/')) }}
+          tags: |
+            ${{ env.IMAGE_PREFIX }}/status-api:${{ steps.meta.outputs.sha_tag }}
+            ${{ env.IMAGE_PREFIX }}/status-api:${{ steps.meta.outputs.version_tag }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max

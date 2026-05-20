@@ -156,6 +156,7 @@ Typical local loop: terminal 1 → `python -m research --verbose`; terminal 2 �
 | `python scripts/health.py --json` | Full JSON health report (ProfitConfig + alerts) |
 | `python scripts/alert_watch.py` | Poll status API; optional `ALERT_WEBHOOK_URL` |
 | `python scripts/daily_summary.py` | Daily dashboard + optimizer → tomorrow's `PROFIT_PROFILE` |
+| `python scripts/evolve_strategy.py` | Optional: MULTI_AGENT_MODEL reviews 7d logs → review-only `.patch` for prompts/tools |
 
 **Live profile rollback:** when `TRADING_MODE=live`, a new trial profile that draws down ≥10% from its adoption peak is auto-reverted to the previous known-good profile (see `core/profile_rollback.py`, `ABC_PROFILE_ROLLBACK_DRAWDOWN_PCT`).
 
